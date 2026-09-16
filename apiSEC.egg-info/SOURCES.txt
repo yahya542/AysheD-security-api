@@ -1,0 +1,6 @@
+README.md
+pyproject.toml
+apiSEC.egg-info/PKG-INFO
+apiSEC.egg-info/SOURCES.txt
+apiSEC.egg-info/dependency_links.txt
+apiSEC.egg-info/top_level.txt
