@@ -4,10 +4,12 @@ from pydantic_settings import BaseSettings
 from pydantic import Field
 from typing import Optional
 
+BASE_DIR = Path(__file__).resolve().parent
+
 class Settings(BaseSettings):
     # Database
     database_url: str = Field(
-        default="sqlite+aiosqlite:///./ayshe_auth.db",
+        default=f"sqlite+aiosqlite:///{BASE_DIR / 'ayshed_auth.db'}",
         alias="DATABASE_URL"
     )
     

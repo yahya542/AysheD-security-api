@@ -49,7 +49,26 @@ class LoginResponse(BaseModel):
                 "token_type": "bearer"
             }
         }
+class LogoutResponse(BaseModel):
+    message: str = "Logged out successfully"
 
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "message": "Logged out successfully"
+            }
+        }
+
+class LogoutRequest(BaseModel):
+    token: str = Field(description="JWT access token to invalidate")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+            }
+        }   
+        
 class TokenData(BaseModel):
     sub: str
     role: UserRole
@@ -141,3 +160,16 @@ class SuspendUserResponse(BaseModel):
                 "user_id": "550e8400-e29b-41d4-a716-446655440000"
             }
         }
+
+
+class LoginLogResponse(BaseModel):
+    id: int
+    email: str
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    success: bool
+    failure_reason: Optional[str] = None
+    timestamp: datetime
+    
+    class Config:
+        from_attributes = True
