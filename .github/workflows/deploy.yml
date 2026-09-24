@@ -22,4 +22,3 @@ jobs:
             cd /path/to/your/project on vps
             git pull origin main
             # Tambahkan perintah build/restart service di sini (misal: npm install & pm2 restart app)
-
