@@ -3,7 +3,7 @@ name: kalinanas
 on:
   push:
     branches:
-      - main  # Berjalan otomatis saat ada push ke branch main
+      - main
 
 jobs:
   deploy:
@@ -13,12 +13,23 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up SSH
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VPS_IP }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /path/to/your/project on vps
+            cd /var/www/AysheD/apiSEC
+            
+            # 1. Tarik kode terbaru dari GitHub
             git pull origin main
-            # Tambahkan perintah build/restart service di sini (misal: npm install & pm2 restart app)
+            
+            # 2. Build ulang image Docker dengan nama apisec-api
+            docker build -t apisec-api .
+            
+            # 3. Hentikan dan hapus container lama jika sedang berjalan
+            docker stop ayshe_api || true
+            docker rm ayshe_api || true
+            
+            # 4. Jalankan container baru dengan port yang sama (8069)
+            docker run -d --name ayshe_api -p 8069:8000 apisec-api
