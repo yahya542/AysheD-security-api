@@ -7,28 +7,17 @@
 
 from __future__ import annotations
 
-import typing
 from typing import Any
 from typing import Callable
 from typing import Optional
+from typing import Protocol
 from typing import TypeVar
 
+from ._util_cy import _distill_params_20 as _distill_params_20  # noqa: F401
+from ._util_cy import _distill_raw_params as _distill_raw_params  # noqa: F401
 from .. import exc
 from .. import util
-from ..util._has_cy import HAS_CYEXTENSION
-from ..util.typing import Protocol
 from ..util.typing import Self
-
-if typing.TYPE_CHECKING or not HAS_CYEXTENSION:
-    from ._py_util import _distill_params_20 as _distill_params_20
-    from ._py_util import _distill_raw_params as _distill_raw_params
-else:
-    from sqlalchemy.cyextension.util import (  # noqa: F401
-        _distill_params_20 as _distill_params_20,
-    )
-    from sqlalchemy.cyextension.util import (  # noqa: F401
-        _distill_raw_params as _distill_raw_params,
-    )
 
 _C = TypeVar("_C", bound=Callable[[], Any])
 
@@ -41,7 +30,7 @@ def connection_memoize(key: str) -> Callable[[_C], _C]:
     """
 
     @util.decorator
-    def decorated(fn, self, connection):  # type: ignore
+    def decorated(fn, self, connection):  # type: ignore[no-untyped-def]
         connection = connection.connect()
         try:
             return connection.info[key]
@@ -67,6 +56,7 @@ class TransactionalContext:
     __slots__ = ("_outer_trans_ctx", "_trans_subject", "__weakref__")
 
     _trans_subject: Optional[_TConsSubject]
+    _rollback_exception: Optional[BaseException] = None
 
     def _transaction_is_active(self) -> bool:
         raise NotImplementedError()
@@ -106,13 +96,20 @@ class TransactionalContext:
     @classmethod
     def _trans_ctx_check(cls, subject: _TConsSubject) -> None:
         trans_context = subject._trans_context_manager
-        if trans_context:
-            if not trans_context._transaction_is_active():
-                raise exc.InvalidRequestError(
-                    "Can't operate on closed transaction inside context "
-                    "manager.  Please complete the context manager "
-                    "before emitting further commands."
+        if trans_context and not trans_context._transaction_is_active():
+            rollback_exc = trans_context._rollback_exception
+            raise exc.InvalidRequestError(
+                "Can't operate on closed transaction inside context "
+                "manager.  "
+                + (
+                    "The transaction was rolled back due to an "
+                    f"exception: {rollback_exc}.  "
+                    if rollback_exc is not None
+                    else ""
                 )
+                + "Please complete the context manager before "
+                "emitting further commands."
+            )
 
     def __enter__(self) -> Self:
         subject = self._get_subject()

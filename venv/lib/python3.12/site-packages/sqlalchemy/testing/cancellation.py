@@ -38,10 +38,7 @@ import gc
 from unittest import mock
 
 from .. import exc
-from ..util.concurrency import have_greenlet
-
-if have_greenlet:
-    from ..util._concurrency_py3k import _AsyncIoGreenlet
+from ..util import concurrency
 
 
 class _InstrumentedAwaitable:
@@ -91,8 +88,9 @@ def await_points(cancel_at=None):
     running task at ``cancel_at`` if given."""
 
     points = AwaitPoints(cancel_at)
-    real_switch = _AsyncIoGreenlet.switch
-    real_throw = _AsyncIoGreenlet.throw
+    greenlet_cls = concurrency._concurrency_shim._AsyncIoGreenlet
+    real_switch = greenlet_cls.switch
+    real_throw = greenlet_cls.throw
 
     def instrument(greenlet, result):
         # a greenlet that has ended hands back the return value of the
@@ -107,9 +105,10 @@ def await_points(cancel_at=None):
     def throw(self, *arg):
         return instrument(self, real_throw(self, *arg))
 
-    with mock.patch.object(
-        _AsyncIoGreenlet, "switch", switch
-    ), mock.patch.object(_AsyncIoGreenlet, "throw", throw):
+    with (
+        mock.patch.object(greenlet_cls, "switch", switch),
+        mock.patch.object(greenlet_cls, "throw", throw),
+    ):
         yield points
 
 
@@ -152,9 +151,10 @@ def connection_accounting(engine):
         real_close(dbapi_connection, terminate=terminate)
         accounting.closed.add(dbapi_connection)
 
-    with mock.patch.object(
-        pool, "_invoke_creator", _invoke_creator
-    ), mock.patch.object(pool, "_close_connection", _close_connection):
+    with (
+        mock.patch.object(pool, "_invoke_creator", _invoke_creator),
+        mock.patch.object(pool, "_close_connection", _close_connection),
+    ):
         yield accounting
 
 

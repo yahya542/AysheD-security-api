@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import sys
 from typing import Any
+from typing import Literal
 from typing import Optional
 from typing import overload
 from typing import Set
@@ -30,18 +31,8 @@ from typing import Type
 from typing import TypeVar
 from typing import Union
 
-from .util import py311
-from .util import py38
-from .util.typing import Literal
-
-if py38:
-    STACKLEVEL = True
-    # needed as of py3.11.0b1
-    # #8019
-    STACKLEVEL_OFFSET = 2 if py311 else 1
-else:
-    STACKLEVEL = False
-    STACKLEVEL_OFFSET = 0
+STACKLEVEL = True
+STACKLEVEL_OFFSET = 2
 
 _IT = TypeVar("_IT", bound="Identified")
 
@@ -238,7 +229,7 @@ def instance_logger(
     else:
         name = _qual_logger_name_for_cls(instance.__class__)
 
-    instance._echo = echoflag  # type: ignore
+    instance._echo = echoflag  # type: ignore[misc]
 
     logger: Union[logging.Logger, InstanceLogger]
 
@@ -252,7 +243,7 @@ def instance_logger(
         # levels by calling logger._log()
         logger = InstanceLogger(echoflag, name)
 
-    instance.logger = logger  # type: ignore
+    instance.logger = logger  # type: ignore[misc]
 
 
 class echo_property:

@@ -89,6 +89,12 @@ def expect_deprecated(*messages, **kw):
     )
 
 
+def expect_noload_deprecation():
+    return expect_deprecated(
+        r"The (?:``noload`` loader strategy|noload\(\) option) is deprecated."
+    )
+
+
 def expect_deprecated_20(*messages, **kw):
     return _expect_warnings_sqla_only(
         sa_exc.Base20DeprecationWarning, messages, **kw
@@ -667,7 +673,14 @@ class AssertsCompiledSQL:
 
         cc = re.sub(r"[\n\t]", "", str(c))
 
-        eq_(cc, result, "%r != %r on dialect %r" % (cc, result, dialect))
+        if isinstance(result, re.Pattern):
+            assert result.match(cc), "%r !~ %r on dialect %r" % (
+                cc,
+                result,
+                dialect,
+            )
+        else:
+            eq_(cc, result, "%r != %r on dialect %r" % (cc, result, dialect))
 
         if checkparams is not None:
             if render_postcompile:

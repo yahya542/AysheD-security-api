@@ -12,23 +12,25 @@ from __future__ import annotations
 import asyncio
 import collections
 import sys
+import types
 from typing import Any
 from typing import AsyncIterator
+from typing import Awaitable
 from typing import Deque
 from typing import Iterator
 from typing import NoReturn
 from typing import Optional
+from typing import Protocol
 from typing import Sequence
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
 
 from ..engine import AdaptedConnection
+from ..exc import EmulatedDBAPIException
 from ..util import EMPTY_DICT
-from ..util.concurrency import await_fallback
-from ..util.concurrency import await_only
+from ..util.concurrency import await_
 from ..util.concurrency import in_greenlet
-from ..util.typing import Protocol
 
 if TYPE_CHECKING:
     from ..engine.interfaces import _DBAPICursorDescription
@@ -124,13 +126,38 @@ class AsyncAdapt_dbapi_module:
 
         def __getattr__(self, key: str) -> Any: ...
 
+    def __init__(
+        self,
+        driver: types.ModuleType,
+        *,
+        dbapi_module: types.ModuleType | None = None,
+    ):
+        self.driver = driver
+        self.dbapi_module = dbapi_module
+
+    @property
+    def exceptions_module(self) -> types.ModuleType:
+        """Return the module which we think will have the exception hierarchy.
+
+        For an asyncio driver that wraps a plain DBAPI like aiomysql,
+        aioodbc, aiosqlite, etc. these exceptions will be from the
+        dbapi_module.  For a "pure" driver like asyncpg these will come
+        from the driver module.
+
+        .. versionadded:: 2.1
+
+        """
+        if self.dbapi_module is not None:
+            return self.dbapi_module
+        else:
+            return self.driver
+
 
 class AsyncAdapt_dbapi_cursor:
     server_side = False
     __slots__ = (
         "_adapt_connection",
         "_connection",
-        "await_",
         "_cursor",
         "_rows",
         "_soft_closed_memoized",
@@ -147,8 +174,6 @@ class AsyncAdapt_dbapi_cursor:
         self._adapt_connection = adapt_connection
         self._connection = adapt_connection._connection
 
-        self.await_ = adapt_connection.await_
-
         cursor = self._make_new_cursor(self._connection)
         self._cursor = self._aenter_cursor(cursor)
         self._soft_closed_memoized = EMPTY_DICT
@@ -156,7 +181,10 @@ class AsyncAdapt_dbapi_cursor:
             self._rows = collections.deque()
 
     def _aenter_cursor(self, cursor: AsyncIODBAPICursor) -> AsyncIODBAPICursor:
-        return self.await_(cursor.__aenter__())  # type: ignore[no-any-return]
+        try:
+            return await_(cursor.__aenter__())  # type: ignore[no-any-return]
+        except Exception as error:
+            self._adapt_connection._handle_exception(error)
 
     def _make_new_cursor(
         self, connection: AsyncIODBAPIConnection
@@ -217,7 +245,7 @@ class AsyncAdapt_dbapi_cursor:
         if not self._awaitable_cursor_close:
             self._cursor.close()  # type: ignore[unused-coroutine]
         elif in_greenlet():
-            self.await_(self._cursor.close())
+            await_(self._cursor.close())
 
     def execute(
         self,
@@ -225,7 +253,7 @@ class AsyncAdapt_dbapi_cursor:
         parameters: Optional[_DBAPISingleExecuteParams] = None,
     ) -> Any:
         try:
-            return self.await_(self._execute_async(operation, parameters))
+            return await_(self._execute_async(operation, parameters))
         except Exception as error:
             self._adapt_connection._handle_exception(error)
 
@@ -235,7 +263,7 @@ class AsyncAdapt_dbapi_cursor:
         seq_of_parameters: _DBAPIMultiExecuteParams,
     ) -> Any:
         try:
-            return self.await_(
+            return await_(
                 self._executemany_async(operation, seq_of_parameters)
             )
         except Exception as error:
@@ -263,18 +291,16 @@ class AsyncAdapt_dbapi_cursor:
             return await self._cursor.executemany(operation, seq_of_parameters)
 
     def nextset(self) -> None:
-        self.await_(self._cursor.nextset())
+        await_(self._cursor.nextset())
         if self._cursor.description and not self.server_side:
-            self._rows = collections.deque(
-                self.await_(self._cursor.fetchall())
-            )
+            self._rows = collections.deque(await_(self._cursor.fetchall()))
 
     def setinputsizes(self, *inputsizes: Any) -> None:
         # NOTE: this is overridden in aioodbc due to
         # see https://github.com/aio-libs/aioodbc/issues/451
         # right now
 
-        return self.await_(self._cursor.setinputsizes(*inputsizes))
+        return await_(self._cursor.setinputsizes(*inputsizes))
 
     def __enter__(self) -> Self:
         return self
@@ -310,23 +336,23 @@ class AsyncAdapt_dbapi_ss_cursor(AsyncAdapt_dbapi_cursor):
 
     def close(self) -> None:
         if self._cursor is not None:
-            self.await_(self._cursor.close())
-            self._cursor = None  # type: ignore
+            await_(self._cursor.close())
+            self._cursor = None  # type: ignore[assignment]
 
     def fetchone(self) -> Optional[Any]:
-        return self.await_(self._cursor.fetchone())
+        return await_(self._cursor.fetchone())
 
     def fetchmany(self, size: Optional[int] = None) -> Any:
-        return self.await_(self._cursor.fetchmany(size=size))
+        return await_(self._cursor.fetchmany(size=size))
 
     def fetchall(self) -> Sequence[Any]:
-        return self.await_(self._cursor.fetchall())
+        return await_(self._cursor.fetchall())
 
     def __iter__(self) -> Iterator[Any]:
         iterator = self._cursor.__aiter__()
         while True:
             try:
-                yield self.await_(iterator.__anext__())
+                yield await_(iterator.__anext__())
             except StopAsyncIteration:
                 break
 
@@ -335,11 +361,23 @@ class AsyncAdapt_dbapi_connection(AdaptedConnection):
     _cursor_cls = AsyncAdapt_dbapi_cursor
     _ss_cursor_cls = AsyncAdapt_dbapi_ss_cursor
 
-    await_ = staticmethod(await_only)
-
     __slots__ = ("dbapi", "_execute_mutex")
 
     _connection: AsyncIODBAPIConnection
+
+    @classmethod
+    async def create(
+        cls,
+        dbapi: Any,
+        connection_awaitable: Awaitable[AsyncIODBAPIConnection],
+        **kw: Any,
+    ) -> Self:
+        try:
+            connection = await connection_awaitable
+        except Exception as error:
+            cls._handle_exception_no_connection(dbapi, error)
+        else:
+            return cls(dbapi, connection, **kw)
 
     def __init__(self, dbapi: Any, connection: AsyncIODBAPIConnection):
         self.dbapi = dbapi
@@ -362,31 +400,31 @@ class AsyncAdapt_dbapi_connection(AdaptedConnection):
         cursor.execute(operation, parameters)
         return cursor
 
-    def _handle_exception(self, error: Exception) -> NoReturn:
+    @classmethod
+    def _handle_exception_no_connection(
+        cls, dbapi: Any, error: Exception
+    ) -> NoReturn:
         exc_info = sys.exc_info()
 
         raise error.with_traceback(exc_info[2])
 
+    def _handle_exception(self, error: Exception) -> NoReturn:
+        self._handle_exception_no_connection(self.dbapi, error)
+
     def rollback(self) -> None:
         try:
-            self.await_(self._connection.rollback())
+            await_(self._connection.rollback())
         except Exception as error:
             self._handle_exception(error)
 
     def commit(self) -> None:
         try:
-            self.await_(self._connection.commit())
+            await_(self._connection.commit())
         except Exception as error:
             self._handle_exception(error)
 
     def close(self) -> None:
-        self.await_(self._connection.close())
-
-
-class AsyncAdaptFallback_dbapi_connection(AsyncAdapt_dbapi_connection):
-    __slots__ = ()
-
-    await_ = staticmethod(await_fallback)
+        await_(self._connection.close())
 
 
 class AsyncAdapt_terminate:
@@ -399,7 +437,7 @@ class AsyncAdapt_terminate:
             # in a greenlet; this is the connection was invalidated case.
             try:
                 # try to gracefully close; see #10717
-                self.await_(asyncio.shield(self._terminate_graceful_close()))  # type: ignore[attr-defined] # noqa: E501
+                await_(asyncio.shield(self._terminate_graceful_close()))
             except self._terminate_handled_exceptions() as e:
                 # in the case where we are recycling an old connection
                 # that may have already been disconnected, close() will
@@ -427,3 +465,12 @@ class AsyncAdapt_terminate:
     def _terminate_force_close(self) -> None:
         """Terminate the connection"""
         raise NotImplementedError
+
+
+class AsyncAdapt_Error(EmulatedDBAPIException):
+    """Provide for the base of DBAPI ``Error`` base class for dialects
+    that need to emulate the DBAPI exception hierarchy.
+
+    .. versionadded:: 2.1
+
+    """

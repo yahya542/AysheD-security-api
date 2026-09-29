@@ -74,6 +74,7 @@ _pg_cat = func.pg_catalog
 quote_ident = _pg_cat.quote_ident
 pg_table_is_visible = _pg_cat.pg_table_is_visible
 pg_type_is_visible = _pg_cat.pg_type_is_visible
+pg_collation_is_visible = _pg_cat.pg_collation_is_visible
 pg_get_viewdef = _pg_cat.pg_get_viewdef
 pg_get_serial_sequence = _pg_cat.pg_get_serial_sequence
 format_type = _pg_cat.format_type
@@ -323,4 +324,22 @@ pg_opclass = Table(
     Column("opcintype", OID),
     Column("opcdefault", Boolean),
     Column("opckeytype", OID),
+)
+
+pg_inherits = Table(
+    "pg_inherits",
+    pg_catalog_meta,
+    Column("inhrelid", OID),
+    Column("inhparent", OID),
+    Column("inhseqno", Integer),
+    Column("inhdetachpending", Boolean, info={"server_version": (14,)}),
+)
+
+pg_tablespace = Table(
+    "pg_tablespace",
+    pg_catalog_meta,
+    Column("oid", OID),
+    Column("spcname", NAME),
+    Column("spcowner", OID),
+    Column("spcoptions", ARRAY(Text)),
 )

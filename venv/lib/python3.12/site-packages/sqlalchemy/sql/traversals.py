@@ -98,7 +98,7 @@ class HasShallowCopy(HasTraverseInternals):
             for attrname, _ in internal_dispatch
         )
         meth_text = f"def {method_name}(self, other):\n{code}\n"
-        return langhelpers._exec_code_in_env(meth_text, {}, method_name)
+        return langhelpers.exec_code_in_env(meth_text, {}, method_name)
 
     @classmethod
     def _generate_shallow_to_dict(
@@ -111,7 +111,7 @@ class HasShallowCopy(HasTraverseInternals):
             for attrname, _ in internal_dispatch
         )
         meth_text = f"def {method_name}(self):\n    return {{{code}}}\n"
-        return langhelpers._exec_code_in_env(meth_text, {}, method_name)
+        return langhelpers.exec_code_in_env(meth_text, {}, method_name)
 
     @classmethod
     def _generate_shallow_from_dict(
@@ -124,7 +124,7 @@ class HasShallowCopy(HasTraverseInternals):
             for attrname, _ in internal_dispatch
         )
         meth_text = f"def {method_name}(self, d):\n{code}\n"
-        return langhelpers._exec_code_in_env(meth_text, {}, method_name)
+        return langhelpers.exec_code_in_env(meth_text, {}, method_name)
 
     def _shallow_from_dict(self, d: Dict[str, Any]) -> None:
         cls = self.__class__
@@ -140,7 +140,7 @@ class HasShallowCopy(HasTraverseInternals):
                 "_generated_shallow_from_dict_traversal",
             )
 
-            cls._generated_shallow_from_dict_traversal = shallow_from_dict  # type: ignore  # noqa: E501
+            cls._generated_shallow_from_dict_traversal = shallow_from_dict  # type: ignore[assignment, method-assign]  # noqa: E501
 
         shallow_from_dict(self, d)
 
@@ -158,7 +158,7 @@ class HasShallowCopy(HasTraverseInternals):
                 cls._traverse_internals, "_generated_shallow_to_dict_traversal"
             )
 
-            cls._generated_shallow_to_dict_traversal = shallow_to_dict  # type: ignore  # noqa: E501
+            cls._generated_shallow_to_dict_traversal = shallow_to_dict  # type: ignore[assignment, method-assign]  # noqa: E501
         return shallow_to_dict(self)
 
     def _shallow_copy_to(self, other: Self) -> None:
@@ -172,7 +172,7 @@ class HasShallowCopy(HasTraverseInternals):
                 cls._traverse_internals, "_generated_shallow_copy_traversal"
             )
 
-            cls._generated_shallow_copy_traversal = shallow_copy  # type: ignore  # noqa: E501
+            cls._generated_shallow_copy_traversal = shallow_copy  # type: ignore[assignment, method-assign]  # noqa: E501
         shallow_copy(self, other)
 
     def _clone(self, **kw: Any) -> Self:
@@ -667,6 +667,19 @@ class TraversalComparatorStrategy(HasTraversalDispatch, util.MemoizedSlots):
             for l, r in zip_longest(ltup, rtup, fillvalue=None):
                 self.stack.append((l, r))
 
+    def visit_multi_list(
+        self, attrname, left_parent, left, right_parent, right, **kw
+    ):
+        for l, r in zip_longest(left, right, fillvalue=None):
+            if isinstance(l, str):
+                if not isinstance(r, str) or l != r:
+                    return COMPARE_FAILED
+            elif isinstance(r, str):
+                if not isinstance(l, str) or l != r:
+                    return COMPARE_FAILED
+            else:
+                self.stack.append((l, r))
+
     def visit_clauseelement_list(
         self, attrname, left_parent, left, right_parent, right, **kw
     ):
@@ -795,7 +808,7 @@ class TraversalComparatorStrategy(HasTraversalDispatch, util.MemoizedSlots):
         else:
             return left == right
 
-    def visit_with_context_options(
+    def visit_compile_state_funcs(
         self, attrname, left_parent, left, right_parent, right, **kw
     ):
         return tuple((fn.__code__, c_key) for fn, c_key in left) == tuple(
@@ -938,6 +951,11 @@ class TraversalComparatorStrategy(HasTraversalDispatch, util.MemoizedSlots):
                     is COMPARE_FAILED
                 ):
                     return COMPARE_FAILED
+
+    def visit_params(
+        self, attrname, left_parent, left, right_parent, right, **kw
+    ):
+        return left == right
 
     def compare_expression_clauselist(self, left, right, **kw):
         if left.operator is right.operator:

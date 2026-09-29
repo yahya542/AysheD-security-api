@@ -21,11 +21,14 @@ from typing import cast
 from typing import Dict
 from typing import FrozenSet
 from typing import Generic
+from typing import get_origin
 from typing import Iterable
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import Match
 from typing import Optional
+from typing import Protocol
 from typing import Sequence
 from typing import Tuple
 from typing import Type
@@ -35,7 +38,6 @@ from typing import Union
 import weakref
 
 from . import attributes  # noqa
-from . import exc
 from . import exc as orm_exc
 from ._typing import _O
 from ._typing import insp_is_aliased_class
@@ -80,21 +82,22 @@ from ..sql import util as sql_util
 from ..sql import visitors
 from ..sql._typing import is_selectable
 from ..sql.annotation import SupportsCloneAnnotations
-from ..sql.base import ColumnCollection
+from ..sql.base import WriteableColumnCollection
 from ..sql.cache_key import HasCacheKey
 from ..sql.cache_key import MemoizedHasCacheKey
 from ..sql.elements import ColumnElement
 from ..sql.elements import KeyedColumnElement
+from ..sql.schema import MetaData
 from ..sql.selectable import FromClause
 from ..sql.selectable import GenerativeSelect
 from ..util.langhelpers import MemoizedSlots
 from ..util.typing import de_stringify_annotation as _de_stringify_annotation
 from ..util.typing import eval_name_only as _eval_name_only
 from ..util.typing import fixup_container_fwd_refs
-from ..util.typing import get_origin
+from ..util.typing import GenericProtocol
 from ..util.typing import is_origin_of_cls
-from ..util.typing import Literal
-from ..util.typing import Protocol
+from ..util.typing import TupleAny
+from ..util.typing import Unpack
 
 if typing.TYPE_CHECKING:
     from ._typing import _EntityType
@@ -102,9 +105,10 @@ if typing.TYPE_CHECKING:
     from ._typing import _InternalEntityType
     from ._typing import _ORMCOLEXPR
     from .context import _MapperEntity
-    from .context import ORMCompileState
+    from .context import _ORMCompileState
+    from .decl_api import RegistryType
     from .mapper import Mapper
-    from .path_registry import AbstractEntityRegistry
+    from .path_registry import _AbstractEntityRegistry
     from .query import Query
     from .relationships import RelationshipProperty
     from ..engine import Row
@@ -123,6 +127,7 @@ if typing.TYPE_CHECKING:
     from ..sql.selectable import Selectable
     from ..sql.visitors import anon_map
     from ..util.typing import _AnnotationScanType
+    from ..util.typing import _MatchedOnType
 
 _T = TypeVar("_T", bound=Any)
 
@@ -163,7 +168,7 @@ class _DeStringifyAnnotation(Protocol):
         *,
         str_cleanup_fn: Optional[Callable[[str, str], str]] = None,
         include_generic: bool = False,
-    ) -> Type[Any]: ...
+    ) -> _MatchedOnType: ...
 
 
 de_stringify_annotation = cast(
@@ -209,7 +214,7 @@ class CascadeOptions(FrozenSet[str]):
         cls, value_list: Optional[Union[Iterable[str], str]]
     ) -> CascadeOptions:
         if isinstance(value_list, str) or value_list is None:
-            return cls.from_string(value_list)  # type: ignore
+            return cls.from_string(value_list)  # type: ignore[no-any-return]
         values = set(value_list)
         if values.difference(cls._allowed_cascades):
             raise sa_exc.ArgumentError(
@@ -249,6 +254,13 @@ class CascadeOptions(FrozenSet[str]):
     def from_string(cls, arg):
         values = [c for c in re.split(r"\s*,\s*", arg or "") if c]
         return cls(values)
+
+
+def _metadata_for_cls(cls: Type[Any], registry: RegistryType) -> MetaData:
+    meta = getattr(cls, "metadata", None)
+    if meta is not None and isinstance(meta, MetaData):
+        return meta
+    return registry.metadata
 
 
 def _validator_events(desc, key, validator, include_removes, include_backrefs):
@@ -345,9 +357,7 @@ def polymorphic_union(
     for key in table_map:
         table = table_map[key]
 
-        table = coercions.expect(
-            roles.StrictFromClauseRole, table, allow_select=True
-        )
+        table = coercions.expect(roles.FromClauseRole, table)
         table_map[key] = table
 
         m = {}
@@ -404,7 +414,7 @@ def identity_key(
     ident: Union[Any, Tuple[Any, ...]] = None,
     *,
     instance: Optional[_T] = None,
-    row: Optional[Union[Row[Any], RowMapping]] = None,
+    row: Optional[Union[Row[Unpack[TupleAny]], RowMapping]] = None,
     identity_token: Optional[Any] = None,
 ) -> _IdentityKeyType[_T]:
     r"""Generate "identity key" tuples, as are used as keys in the
@@ -425,9 +435,6 @@ def identity_key(
       :param class: mapped class (must be a positional argument)
       :param ident: primary key, may be a scalar or tuple argument.
       :param identity_token: optional identity token
-
-        .. versionadded:: 1.2 added identity_token
-
 
     * ``identity_key(instance=instance)``
 
@@ -464,8 +471,6 @@ def identity_key(
       :param row: :class:`.Row` row returned by a :class:`_engine.CursorResult`
        (must be given as a keyword arg)
       :param identity_token: optional identity token
-
-        .. versionadded:: 1.2 added identity_token
 
     """  # noqa: E501
     if class_ is not None:
@@ -1097,7 +1102,10 @@ class AliasedInsp(
             if name:
                 return element.alias(name=name, flat=flat)
             else:
-                return coercions.expect(
+                # see selectable.py->Alias._factory() for similar
+                # mypy issue.   Cannot get the overload to see this
+                # in mypy (works fine in pyright)
+                return coercions.expect(  # type: ignore[no-any-return]
                     roles.AnonymizedFromClauseRole, element, flat=flat
                 )
         else:
@@ -1188,7 +1196,7 @@ class AliasedInsp(
         return self.mapper.class_
 
     @property
-    def _path_registry(self) -> AbstractEntityRegistry:
+    def _path_registry(self) -> _AbstractEntityRegistry:
         if self._use_mapper_path:
             return self.mapper._path_registry
         else:
@@ -1210,7 +1218,7 @@ class AliasedInsp(
         }
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
-        self.__init__(  # type: ignore
+        self.__init__(  # type: ignore[misc]
             state["entity"],
             state["mapper"],
             state["alias"],
@@ -1265,14 +1273,27 @@ class AliasedInsp(
         if key:
             d["proxy_key"] = key
 
-        # IMO mypy should see this one also as returning the same type
-        # we put into it, but it's not
-        return (
-            self._adapter.traverse(expr)
-            ._annotate(d)
-            ._set_propagate_attrs(
-                {"compile_state_plugin": "orm", "plugin_subject": self}
-            )
+        # userspace adapt of an attribute from AliasedClass; validate that
+        # it actually was present
+        adapted = self._adapter.adapt_check_present(expr)
+        if adapted is None:
+            adapted = expr
+            if self._adapter.adapt_on_names:
+                util.warn_limited(
+                    "Did not locate an expression in selectable for "
+                    "attribute %r; ensure name is correct in expression",
+                    (key,),
+                )
+            else:
+                util.warn_limited(
+                    "Did not locate an expression in selectable for "
+                    "attribute %r; to match by name, use the "
+                    "adapt_on_names parameter",
+                    (key,),
+                )
+
+        return adapted._annotate(d)._set_propagate_attrs(
+            {"compile_state_plugin": "orm", "plugin_subject": self}
         )
 
     if TYPE_CHECKING:
@@ -1327,7 +1348,7 @@ class AliasedInsp(
             (key, self._adapt_element(col)) for key, col in cols_plus_keys
         ]
 
-        return ColumnCollection(cols_plus_keys)
+        return WriteableColumnCollection(cols_plus_keys)
 
     def _memo(self, key, callable_, *args, **kw):
         if key in self._memoized_values:
@@ -1350,6 +1371,13 @@ class AliasedInsp(
         )
 
     def __str__(self):
+        return self.path_string()
+
+    def path_string(self) -> str:
+        """Return a user-facing name for this :class:`.AliasedInsp`,
+        for use in a :class:`_orm.PathRegistry` string representation.
+
+        """
         if self._is_with_polymorphic:
             return "with_polymorphic(%s, [%s])" % (
                 self._target.__name__,
@@ -1518,7 +1546,7 @@ class LoaderCriteriaOption(CriteriaOption):
                 else:
                     stack.extend(subclass.__subclasses__())
 
-    def _should_include(self, compile_state: ORMCompileState) -> bool:
+    def _should_include(self, compile_state: _ORMCompileState) -> bool:
         if (
             compile_state.select_statement._annotations.get(
                 "for_loader_criteria", None
@@ -1537,7 +1565,7 @@ class LoaderCriteriaOption(CriteriaOption):
                 self.where_criteria._resolve_with_args(ext_info.entity),
             )
         else:
-            crit = self.where_criteria  # type: ignore
+            crit = self.where_criteria  # type: ignore[assignment]
         assert isinstance(crit, ColumnElement)
         return sql_util._deep_annotate(
             crit,
@@ -1548,12 +1576,12 @@ class LoaderCriteriaOption(CriteriaOption):
 
     def process_compile_state_replaced_entities(
         self,
-        compile_state: ORMCompileState,
+        compile_state: _ORMCompileState,
         mapper_entities: Iterable[_MapperEntity],
     ) -> None:
         self.process_compile_state(compile_state)
 
-    def process_compile_state(self, compile_state: ORMCompileState) -> None:
+    def process_compile_state(self, compile_state: _ORMCompileState) -> None:
         """Apply a modification to a given :class:`.CompileState`."""
 
         # if options to limit the criteria to immediate query only,
@@ -1582,7 +1610,7 @@ def _inspect_mc(
         if class_manager is None or not class_manager.is_mapped:
             return None
         mapper = class_manager.mapper
-    except exc.NO_STATE:
+    except orm_exc.NO_STATE:
         return None
     else:
         return mapper
@@ -1622,6 +1650,7 @@ class Bundle(
 
         :ref:`bundles`
 
+        :class:`.DictBundle`
 
     """
 
@@ -1645,7 +1674,7 @@ class Bundle(
 
     def __init__(
         self, name: str, *exprs: _ColumnExpressionArgument[Any], **kw: Any
-    ):
+    ) -> None:
         r"""Construct a new :class:`.Bundle`.
 
         e.g.::
@@ -1671,7 +1700,7 @@ class Bundle(
         ]
         self.exprs = coerced_exprs
 
-        self.c = self.columns = ColumnCollection(
+        self.c = self.columns = WriteableColumnCollection(
             (getattr(col, "key", col._label), col)
             for col in [e._annotations.get("bundle", e) for e in coerced_exprs]
         ).as_readonly()
@@ -1776,10 +1805,10 @@ class Bundle(
 
     def create_row_processor(
         self,
-        query: Select[Any],
-        procs: Sequence[Callable[[Row[Any]], Any]],
+        query: Select[Unpack[TupleAny]],
+        procs: Sequence[Callable[[Row[Unpack[TupleAny]]], Any]],
         labels: Sequence[str],
-    ) -> Callable[[Row[Any]], Any]:
+    ) -> Callable[[Row[Unpack[TupleAny]]], Any]:
         """Produce the "row processing" function for this :class:`.Bundle`.
 
         May be overridden by subclasses to provide custom behaviors when
@@ -1811,37 +1840,60 @@ class Bundle(
             for row in session.execute(select(bn)).where(bn.c.data1 == "d1"):
                 print(row.mybundle["data1"], row.mybundle["data2"])
 
+        The above example is available natively using :class:`.DictBundle`
+
+        .. seealso::
+
+            :class:`.DictBundle`
+
         """  # noqa: E501
         keyed_tuple = result_tuple(labels, [() for l in labels])
 
-        def proc(row: Row[Any]) -> Any:
+        def proc(row: Row[Unpack[TupleAny]]) -> Any:
             return keyed_tuple([proc(row) for proc in procs])
 
         return proc
 
 
-def _orm_annotate(element: _SA, exclude: Optional[Any] = None) -> _SA:
-    """Deep copy the given ClauseElement, annotating each element with the
-    "_orm_adapt" flag.
+class DictBundle(Bundle[_T]):
+    """Like :class:`.Bundle` but returns ``dict`` instances instead of
+    named tuple like objects::
 
-    Elements within the exclude collection will be cloned but not annotated.
+        bn = DictBundle("mybundle", MyClass.data1, MyClass.data2)
+        for row in session.execute(select(bn)).where(bn.c.data1 == "d1"):
+            print(row.mybundle["data1"], row.mybundle["data2"])
 
+    Differently from :class:`.Bundle`, multiple columns with the same name are
+    not supported.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :ref:`bundles`
+
+        :class:`.Bundle`
     """
-    return sql_util._deep_annotate(element, {"_orm_adapt": True}, exclude)
 
+    def __init__(
+        self, name: str, *exprs: _ColumnExpressionArgument[Any], **kw: Any
+    ) -> None:
+        super().__init__(name, *exprs, **kw)
+        if len(set(self.c.keys())) != len(self.c):
+            raise sa_exc.ArgumentError(
+                "DictBundle does not support duplicate column names"
+            )
 
-def _orm_deannotate(element: _SA) -> _SA:
-    """Remove annotations that link a column to a particular mapping.
+    def create_row_processor(
+        self,
+        query: Select[Unpack[TupleAny]],
+        procs: Sequence[Callable[[Row[Unpack[TupleAny]]], Any]],
+        labels: Sequence[str],
+    ) -> Callable[[Row[Unpack[TupleAny]]], dict[str, Any]]:
+        def proc(row: Row[Unpack[TupleAny]]) -> dict[str, Any]:
+            return dict(zip(labels, (proc(row) for proc in procs)))
 
-    Note this doesn't affect "remote" and "foreign" annotations
-    passed by the :func:`_orm.foreign` and :func:`_orm.remote`
-    annotators.
-
-    """
-
-    return sql_util._deep_deannotate(
-        element, values=("_orm_adapt", "parententity")
-    )
+        return proc
 
 
 def _orm_full_deannotate(element: _SA) -> _SA:
@@ -1964,7 +2016,7 @@ class _ORMJoin(expression.Join):
         if (
             not prop
             and getattr(right_info, "mapper", None)
-            and right_info.mapper.single  # type: ignore
+            and right_info.mapper.single  # type: ignore[union-attr]
         ):
             right_info = cast("_InternalEntityType[Any]", right_info)
             # if single inheritance target and we are using a manual
@@ -2071,8 +2123,6 @@ def with_parent(
     :param from_entity:
       Entity in which to consider as the left side.  This defaults to the
       "zero" entity of the :class:`_query.Query` itself.
-
-      .. versionadded:: 1.2
 
     """  # noqa: E501
     prop_t: RelationshipProperty[Any]
@@ -2360,6 +2410,29 @@ def _cleanup_mapped_str_annotation(
     return annotation
 
 
+def _unresolved_annotation_is_mapped(
+    raw_annotation: _AnnotationScanType,
+) -> bool:
+    """given an un-resolvable annotation, guess if it's ``Mapped[]``.
+
+    Used only to decide whether a ``NameError`` raised while de-stringifying
+    is worth reporting as a mapping error.  The annotation may be a plain
+    string (``__future__`` annotations / explicitly quoted), a ``ForwardRef``
+    (:pep:`649` deferred annotations on Python 3.14 and above), or an
+    already-resolved object.
+
+    """
+    if isinstance(raw_annotation, str):
+        return "Mapped[" in raw_annotation
+    elif isinstance(raw_annotation, typing.ForwardRef):
+        return "Mapped[" in raw_annotation.__forward_arg__
+    else:
+        origin = typing.get_origin(raw_annotation)
+        return isinstance(origin, type) and issubclass(
+            origin, _MappedAnnotationBase
+        )
+
+
 def _extract_mapped_subtype(
     raw_annotation: Optional[_AnnotationScanType],
     cls: type,
@@ -2406,14 +2479,14 @@ def _extract_mapped_subtype(
             "module level. See chained stack trace for more hints."
         ) from ce
     except NameError as ne:
-        if raiseerr and "Mapped[" in raw_annotation:  # type: ignore
+        if raiseerr and _unresolved_annotation_is_mapped(raw_annotation):
             raise orm_exc.MappedAnnotationError(
                 f"Could not interpret annotation {raw_annotation}.  "
                 "Check that it uses names that are correctly imported at the "
                 "module level. See chained stack trace for more hints."
             ) from ne
 
-        annotated = raw_annotation  # type: ignore
+        annotated = raw_annotation  # type: ignore[assignment]
 
     if is_dataclass_field:
         return annotated, None
@@ -2456,15 +2529,16 @@ def _extract_mapped_subtype(
             else:
                 return annotated, None
 
-        if len(annotated.__args__) != 1:
+        generic_annotated = cast(GenericProtocol[Any], annotated)
+        if len(generic_annotated.__args__) != 1:
             raise orm_exc.MappedAnnotationError(
                 "Expected sub-type for Mapped[] annotation"
             )
 
         return (
             # fix dict/list/set args to be ForwardRef, see #11814
-            fixup_container_fwd_refs(annotated.__args__[0]),
-            annotated.__origin__,
+            fixup_container_fwd_refs(generic_annotated.__args__[0]),
+            generic_annotated.__origin__,
         )
 
 

@@ -48,16 +48,13 @@ charset/collation will allow connectivity.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 from typing import cast
 from typing import Optional
 from typing import Sequence
-from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import Union
 
-from .base import MariaDBIdentifierPreparer
 from .base import MySQLCompiler
 from .base import MySQLDialect
 from .base import MySQLExecutionContext
@@ -79,6 +76,8 @@ if TYPE_CHECKING:
     from ...engine.row import Row
     from ...engine.url import URL
     from ...sql.elements import BinaryExpression
+    from ...util.typing import TupleAny
+    from ...util.typing import Unpack
 
 
 class MySQLExecutionContext_mysqlconnector(MySQLExecutionContext):
@@ -119,12 +118,6 @@ class IdentifierPreparerCommon_mysqlconnector:
 
 class MySQLIdentifierPreparer_mysqlconnector(
     IdentifierPreparerCommon_mysqlconnector, MySQLIdentifierPreparer
-):
-    pass
-
-
-class MariaDBIdentifierPreparer_mysqlconnector(
-    IdentifierPreparerCommon_mysqlconnector, MariaDBIdentifierPreparer
 ):
     pass
 
@@ -204,7 +197,7 @@ class MySQLDialect_mysqlconnector(MySQLDialect):
         # supports_sane_rowcount.
         if self.dbapi is not None:
             try:
-                from mysql.connector import constants  # type: ignore
+                from mysql.connector import constants  # type: ignore[import-not-found]  # noqa: E501
 
                 ClientFlag = constants.ClientFlag
 
@@ -218,19 +211,14 @@ class MySQLDialect_mysqlconnector(MySQLDialect):
 
         return [], opts
 
-    @util.memoized_property
-    def _mysqlconnector_version_info(self) -> Optional[Tuple[int, ...]]:
-        if self.dbapi and hasattr(self.dbapi, "__version__"):
-            m = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", self.dbapi.__version__)
-            if m:
-                return tuple(int(x) for x in m.group(1, 2, 3) if x is not None)
-        return None
+    def retrieve_dbapi_version(self, dbapi: DBAPIModule) -> util.VersionInfo:
+        return util.parse_version_string(getattr(dbapi, "__version__", None))
 
     def _detect_charset(self, connection: Connection) -> str:
-        return connection.connection.charset  # type: ignore
+        return connection.connection.charset  # type: ignore[no-any-return]
 
     def _extract_error_code(self, exception: BaseException) -> int:
-        return exception.errno  # type: ignore
+        return exception.errno  # type: ignore[attr-defined, no-any-return]
 
     def is_disconnect(
         self,
@@ -255,16 +243,16 @@ class MySQLDialect_mysqlconnector(MySQLDialect):
 
     def _compat_fetchall(
         self,
-        rp: CursorResult[Tuple[Any, ...]],
+        rp: CursorResult[Unpack[TupleAny]],
         charset: Optional[str] = None,
-    ) -> Sequence[Row[Tuple[Any, ...]]]:
+    ) -> Sequence[Row[Unpack[TupleAny]]]:
         return rp.fetchall()
 
     def _compat_fetchone(
         self,
-        rp: CursorResult[Tuple[Any, ...]],
+        rp: CursorResult[Unpack[TupleAny]],
         charset: Optional[str] = None,
-    ) -> Optional[Row[Tuple[Any, ...]]]:
+    ) -> Optional[Row[Unpack[TupleAny]]]:
         return rp.fetchone()
 
     def get_isolation_level_values(
@@ -296,7 +284,7 @@ class MariaDBDialect_mysqlconnector(
 ):
     supports_statement_cache = True
     _allows_uuid_binds = False
-    preparer = MariaDBIdentifierPreparer_mysqlconnector
+    preparer = MySQLIdentifierPreparer_mysqlconnector
 
 
 dialect = MySQLDialect_mysqlconnector

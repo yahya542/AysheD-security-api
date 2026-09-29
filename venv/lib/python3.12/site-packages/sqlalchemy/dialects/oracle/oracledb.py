@@ -412,12 +412,6 @@ set, the two options are to use the :class:`_types.NCHAR` and
 the SQLAlchemy dialect to use NCHAR/NCLOB for the :class:`.Unicode` /
 :class:`.UnicodeText` datatypes instead of VARCHAR/CLOB.
 
-.. versionchanged:: 1.3 The :class:`.Unicode` and :class:`.UnicodeText`
-   datatypes now correspond to the ``VARCHAR2`` and ``CLOB`` Oracle Database
-   datatypes unless the ``use_nchar_for_unicode=True`` is passed to the dialect
-   when :func:`_sa.create_engine` is called.
-
-
 .. _oracledb_unicode_encoding_errors:
 
 Encoding Errors
@@ -431,9 +425,6 @@ handled.  The value is ultimately consumed by the Python `decode
 is passed both via python-oracledb's ``encodingErrors`` parameter consumed by
 ``Cursor.var()``, as well as SQLAlchemy's own decoding function, as the
 python-oracledb dialect makes use of both under different circumstances.
-
-.. versionadded:: 1.3.11
-
 
 .. _oracledb_setinputsizes:
 
@@ -460,9 +451,6 @@ On the SQLAlchemy side, the :meth:`.DialectEvents.do_setinputsizes` event can
 be used both for runtime visibility (e.g. logging) of the setinputsizes step as
 well as to fully control how ``setinputsizes()`` is used on a per-statement
 basis.
-
-.. versionadded:: 1.2.9 Added :meth:`.DialectEvents.setinputsizes`
-
 
 Example 1 - logging all setinputsizes calls
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -581,33 +569,40 @@ The ``coerce_to_decimal`` flag only impacts the results of plain string
 SQL statements that are not otherwise associated with a :class:`.Numeric`
 SQLAlchemy type (or a subclass of such).
 
-.. versionchanged:: 1.2 The numeric handling system for the oracle dialects has
-   been reworked to take advantage of newer driver features as well as better
-   integration of outputtypehandlers.
-
 .. versionadded:: 2.0.0 added support for the python-oracledb driver.
+
+.. _oracledb_json:
+
+JSON Support
+------------
+
+Oracle Database supports a native JSON datatype as of version 21c, as well as
+support for JSON functions on character and BLOB columns as of version 12c. The
+SQLAlchemy :class:`_sqltypes.JSON` datatype may be used with the oracledb
+backend in the same way it works with any other backend, with some slight
+behavioral changes particularly when using the native JSON datatype.  See
+:class:`_oracle.JSON` for platform-specific notes.
+
+.. versionadded:: 2.1  added JSON support for the Oracle backend.
+
 
 """  # noqa
 
 from __future__ import annotations
 
 import collections
-import re
 from typing import Any
 from typing import TYPE_CHECKING
 
 from . import cx_oracle as _cx_oracle
-from ... import exc
-from ... import pool
+from ... import util
 from ...connectors.asyncio import AsyncAdapt_dbapi_connection
 from ...connectors.asyncio import AsyncAdapt_dbapi_cursor
+from ...connectors.asyncio import AsyncAdapt_dbapi_module
 from ...connectors.asyncio import AsyncAdapt_dbapi_ss_cursor
 from ...connectors.asyncio import AsyncAdapt_terminate
-from ...connectors.asyncio import AsyncAdaptFallback_dbapi_connection
 from ...engine import default
-from ...util import asbool
-from ...util import await_fallback
-from ...util import await_only
+from ...util import await_
 
 if TYPE_CHECKING:
     from oracledb import AsyncConnection
@@ -625,7 +620,8 @@ class OracleDialect_oracledb(_cx_oracle.OracleDialect_cx_oracle):
     execution_ctx_cls = OracleExecutionContext_oracledb
 
     driver = "oracledb"
-    _min_version = (1,)
+
+    minimum_dbapi_version = util.VersionInfo((1,))
 
     def __init__(
         self,
@@ -664,22 +660,16 @@ class OracleDialect_oracledb(_cx_oracle.OracleDialect_cx_oracle):
     def get_async_dialect_cls(cls, url):
         return OracleDialectAsync_oracledb
 
-    def _load_version(self, dbapi_module):
-        version = (0, 0, 0)
-        if dbapi_module is not None:
-            m = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", dbapi_module.version)
-            if m:
-                version = tuple(
-                    int(x) for x in m.group(1, 2, 3) if x is not None
-                )
-        self.oracledb_ver = version
-        if (
-            self.oracledb_ver > (0, 0, 0)
-            and self.oracledb_ver < self._min_version
-        ):
-            raise exc.InvalidRequestError(
-                f"oracledb version {self._min_version} and above are supported"
-            )
+    @property
+    def oracledb_ver(self):
+        """Legacy accessor for :attr:`.Dialect.dbapi_version`.
+
+        Retained for backwards compatibility; ``(0, 0, 0)`` is returned
+        when no version can be determined.
+
+        """
+        version = self._dbapi_version_or_none
+        return version if version is not None else util.VersionInfo((0, 0, 0))
 
     def do_begin_twophase(self, connection, xid):
         conn_xis = connection.connection.xid(*xid)
@@ -725,7 +715,7 @@ class OracleDialect_oracledb(_cx_oracle.OracleDialect_cx_oracle):
         ]
 
     def _check_max_identifier_length(self, connection):
-        if self.oracledb_ver >= (2, 5):
+        if self.dbapi_version >= (2, 5):
             max_len = connection.connection.max_identifier_length
             if max_len is not None:
                 return max_len
@@ -752,12 +742,6 @@ class AsyncAdapt_oracledb_cursor(AsyncAdapt_dbapi_cursor):
     def setinputsizes(self, *args: Any, **kwargs: Any) -> Any:
         return self._cursor.setinputsizes(*args, **kwargs)
 
-    def _aenter_cursor(self, cursor: AsyncCursor) -> AsyncCursor:
-        try:
-            return cursor.__enter__()
-        except Exception as error:
-            self._adapt_connection._handle_exception(error)
-
     async def _execute_async(self, operation, parameters):
         # override to not use mutex, oracledb already has a mutex
 
@@ -777,12 +761,6 @@ class AsyncAdapt_oracledb_cursor(AsyncAdapt_dbapi_cursor):
     ):
         # override to not use mutex, oracledb already has a mutex
         return await self._cursor.executemany(operation, seq_of_parameters)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, type_: Any, value: Any, traceback: Any) -> None:
-        self.close()
 
 
 class AsyncAdapt_oracledb_ss_cursor(
@@ -849,19 +827,19 @@ class AsyncAdapt_oracledb_connection(
         return self._connection.xid(*args, **kwargs)
 
     def tpc_begin(self, *args: Any, **kwargs: Any) -> Any:
-        return self.await_(self._connection.tpc_begin(*args, **kwargs))
+        return await_(self._connection.tpc_begin(*args, **kwargs))
 
     def tpc_commit(self, *args: Any, **kwargs: Any) -> Any:
-        return self.await_(self._connection.tpc_commit(*args, **kwargs))
+        return await_(self._connection.tpc_commit(*args, **kwargs))
 
     def tpc_prepare(self, *args: Any, **kwargs: Any) -> Any:
-        return self.await_(self._connection.tpc_prepare(*args, **kwargs))
+        return await_(self._connection.tpc_prepare(*args, **kwargs))
 
     def tpc_recover(self, *args: Any, **kwargs: Any) -> Any:
-        return self.await_(self._connection.tpc_recover(*args, **kwargs))
+        return await_(self._connection.tpc_recover(*args, **kwargs))
 
     def tpc_rollback(self, *args: Any, **kwargs: Any) -> Any:
-        return self.await_(self._connection.tpc_rollback(*args, **kwargs))
+        return await_(self._connection.tpc_rollback(*args, **kwargs))
 
     async def _terminate_graceful_close(self) -> None:
         await self._connection.close()
@@ -870,14 +848,9 @@ class AsyncAdapt_oracledb_connection(
         self._connection.terminate()
 
 
-class AsyncAdaptFallback_oracledb_connection(
-    AsyncAdaptFallback_dbapi_connection, AsyncAdapt_oracledb_connection
-):
-    __slots__ = ()
-
-
-class OracledbAdaptDBAPI:
+class OracledbAdaptDBAPI(AsyncAdapt_dbapi_module):
     def __init__(self, oracledb) -> None:
+        super().__init__(oracledb)
         self.oracledb = oracledb
 
         for k, v in self.oracledb.__dict__.items():
@@ -885,18 +858,10 @@ class OracledbAdaptDBAPI:
                 self.__dict__[k] = v
 
     def connect(self, *arg, **kw):
-        async_fallback = kw.pop("async_fallback", False)
         creator_fn = kw.pop("async_creator_fn", self.oracledb.connect_async)
-
-        if asbool(async_fallback):
-            return AsyncAdaptFallback_oracledb_connection(
-                self, await_fallback(creator_fn(*arg, **kw))
-            )
-
-        else:
-            return AsyncAdapt_oracledb_connection(
-                self, await_only(creator_fn(*arg, **kw))
-            )
+        return await_(
+            AsyncAdapt_oracledb_connection.create(self, creator_fn(*arg, **kw))
+        )
 
 
 class OracleExecutionContextAsync_oracledb(OracleExecutionContext_oracledb):
@@ -925,12 +890,15 @@ class OracleDialectAsync_oracledb(OracleDialect_oracledb):
     supports_statement_cache = True
     execution_ctx_cls = OracleExecutionContextAsync_oracledb
 
-    _min_version = (2,)
+    minimum_dbapi_version = util.VersionInfo((2, 0, 1))
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self.has_terminate = self.oracledb_ver >= (26, 0, 0)
+        self.has_terminate = (
+            self._dbapi_version_or_none is not None
+            and self._dbapi_version_or_none >= (26, 0, 0)
+        )
 
     # thick_mode mode is not supported by asyncio, oracledb will raise
     @classmethod
@@ -938,15 +906,6 @@ class OracleDialectAsync_oracledb(OracleDialect_oracledb):
         import oracledb
 
         return OracledbAdaptDBAPI(oracledb)
-
-    @classmethod
-    def get_pool_class(cls, url):
-        async_fallback = url.query.get("async_fallback", False)
-
-        if asbool(async_fallback):
-            return pool.FallbackAsyncAdaptedQueuePool
-        else:
-            return pool.AsyncAdaptedQueuePool
 
     def get_driver_connection(self, connection):
         return connection._connection

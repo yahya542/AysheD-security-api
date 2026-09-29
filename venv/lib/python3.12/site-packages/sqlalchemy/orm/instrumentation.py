@@ -21,13 +21,6 @@ or global basis using the :mod:`sqlalchemy.ext.instrumentation`
 module, which provides the means to build and specify
 alternate instrumentation forms.
 
-.. versionchanged: 0.8
-   The instrumentation extension system was moved out of the
-   ORM and into the external :mod:`sqlalchemy.ext.instrumentation`
-   package.  When that package is imported, it installs
-   itself within sqlalchemy.orm so that its more comprehensive
-   resolution mechanics take effect.
-
 """
 
 from __future__ import annotations
@@ -40,7 +33,9 @@ from typing import Dict
 from typing import Generic
 from typing import Iterable
 from typing import List
+from typing import Literal
 from typing import Optional
+from typing import Protocol
 from typing import Set
 from typing import Tuple
 from typing import Type
@@ -59,12 +54,10 @@ from .attributes import _is_collection_attribute_impl
 from .. import util
 from ..event import EventTarget
 from ..util import HasMemoized
-from ..util.typing import Literal
-from ..util.typing import Protocol
 
 if TYPE_CHECKING:
     from ._typing import _RegistryType
-    from .attributes import AttributeImpl
+    from .attributes import _AttributeImpl
     from .attributes import QueryableAttribute
     from .collections import _AdaptedCollectionProtocol
     from .collections import _CollectionFactoryType
@@ -344,7 +337,6 @@ class ClassManager(
 
     @util.memoized_property
     def _state_constructor(self) -> Type[state.InstanceState[_O]]:
-        self.dispatch.first_init(self, self.class_)
         return state.InstanceState
 
     def manage(self):
@@ -426,7 +418,7 @@ class ClassManager(
             self.uninstall_member(key)
 
         self.mapper = None
-        self.dispatch = None  # type: ignore
+        self.dispatch = None  # type: ignore[assignment]
         self.new_init = None
         self.info.clear()
 
@@ -469,7 +461,7 @@ class ClassManager(
     def instrument_collection_class(
         self, key: str, collection_class: Type[Collection[Any]]
     ) -> _CollectionFactoryType:
-        return collections.prepare_instrumentation(collection_class)
+        return collections._prepare_instrumentation(collection_class)
 
     def initialize_collection(
         self,
@@ -489,7 +481,7 @@ class ClassManager(
         else:
             return key in self.local_attrs
 
-    def get_impl(self, key: str) -> AttributeImpl:
+    def get_impl(self, key: str) -> _AttributeImpl:
         return self[key].impl
 
     @property
@@ -740,8 +732,12 @@ def __init__(%(apply_pos)s):
 
     env = locals().copy()
     env["__name__"] = __name__
-    exec(func_text, env)
-    __init__ = env["__init__"]
+    __init__: Any = util.exec_code_in_env(
+        func_text,
+        env,
+        "__init__",
+        f"__init__ for class {class_.__module__}.{class_.__qualname__}",
+    )
     __init__.__doc__ = original_init.__doc__
     __init__._sa_original_init = original_init
 

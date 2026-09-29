@@ -13,12 +13,9 @@ from typing import TYPE_CHECKING
 from .asyncio import AsyncAdapt_dbapi_connection
 from .asyncio import AsyncAdapt_dbapi_cursor
 from .asyncio import AsyncAdapt_dbapi_ss_cursor
-from .asyncio import AsyncAdaptFallback_dbapi_connection
 from .pyodbc import PyODBCConnector
-from .. import pool
-from .. import util
-from ..util.concurrency import await_fallback
-from ..util.concurrency import await_only
+from ..connectors.asyncio import AsyncAdapt_dbapi_module
+from ..util.concurrency import await_
 
 if TYPE_CHECKING:
     from ..engine.interfaces import ConnectArgsType
@@ -33,7 +30,7 @@ class AsyncAdapt_aioodbc_cursor(AsyncAdapt_dbapi_cursor):
         return self._cursor._impl.setinputsizes(*inputsizes)
 
         # how it's supposed to work
-        # return self.await_(self._cursor.setinputsizes(*inputsizes))
+        # return await_(self._cursor.setinputsizes(*inputsizes))
 
     @property
     def fast_executemany(self):
@@ -67,7 +64,7 @@ class AsyncAdapt_aioodbc_connection(AsyncAdapt_dbapi_connection):
         self._connection._conn.autocommit = value
 
     def ping(self, reconnect):
-        return self.await_(self._connection.ping(reconnect))
+        return await_(self._connection.ping(reconnect))
 
     def add_output_converter(self, *arg, **kw):
         self._connection.add_output_converter(*arg, **kw)
@@ -104,14 +101,9 @@ class AsyncAdapt_aioodbc_connection(AsyncAdapt_dbapi_connection):
             super().close()
 
 
-class AsyncAdaptFallback_aioodbc_connection(
-    AsyncAdaptFallback_dbapi_connection, AsyncAdapt_aioodbc_connection
-):
-    __slots__ = ()
-
-
-class AsyncAdapt_aioodbc_dbapi:
+class AsyncAdapt_aioodbc_dbapi(AsyncAdapt_dbapi_module):
     def __init__(self, aioodbc, pyodbc):
+        super().__init__(aioodbc, dbapi_module=pyodbc)
         self.aioodbc = aioodbc
         self.pyodbc = pyodbc
         self.paramstyle = pyodbc.paramstyle
@@ -146,19 +138,14 @@ class AsyncAdapt_aioodbc_dbapi:
             setattr(self, name, getattr(self.pyodbc, name))
 
     def connect(self, *arg, **kw):
-        async_fallback = kw.pop("async_fallback", False)
         creator_fn = kw.pop("async_creator_fn", self.aioodbc.connect)
 
-        if util.asbool(async_fallback):
-            return AsyncAdaptFallback_aioodbc_connection(
+        return await_(
+            AsyncAdapt_aioodbc_connection.create(
                 self,
-                await_fallback(creator_fn(*arg, **kw)),
+                creator_fn(*arg, **kw),
             )
-        else:
-            return AsyncAdapt_aioodbc_connection(
-                self,
-                await_only(creator_fn(*arg, **kw)),
-            )
+        )
 
 
 class aiodbcConnector(PyODBCConnector):
@@ -179,15 +166,6 @@ class aiodbcConnector(PyODBCConnector):
             kw["dsn"] = arg[0]
 
         return (), kw
-
-    @classmethod
-    def get_pool_class(cls, url):
-        async_fallback = url.query.get("async_fallback", False)
-
-        if util.asbool(async_fallback):
-            return pool.FallbackAsyncAdaptedQueuePool
-        else:
-            return pool.AsyncAdaptedQueuePool
 
     def get_driver_connection(self, connection):
         return connection._connection

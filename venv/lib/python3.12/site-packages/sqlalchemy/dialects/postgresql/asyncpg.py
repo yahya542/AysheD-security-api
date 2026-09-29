@@ -183,6 +183,16 @@ import decimal
 import json as _py_json
 import re
 import time
+from types import NoneType
+from typing import Any
+from typing import Awaitable
+from typing import Callable
+from typing import NoReturn
+from typing import Optional
+from typing import Protocol
+from typing import Sequence
+from typing import Tuple
+from typing import TYPE_CHECKING
 
 from . import json
 from . import ranges
@@ -199,19 +209,24 @@ from .base import PGExecutionContext
 from .base import PGIdentifierPreparer
 from .base import REGCLASS
 from .base import REGCONFIG
+from .bitstring import BitString
 from .types import BIT
 from .types import BYTEA
 from .types import CITEXT
 from ... import exc
-from ... import pool
 from ... import util
+from ...connectors.asyncio import AsyncAdapt_dbapi_connection
+from ...connectors.asyncio import AsyncAdapt_dbapi_cursor
+from ...connectors.asyncio import AsyncAdapt_dbapi_module
+from ...connectors.asyncio import AsyncAdapt_dbapi_ss_cursor
+from ...connectors.asyncio import AsyncAdapt_Error
 from ...connectors.asyncio import AsyncAdapt_terminate
-from ...engine import AdaptedConnection
 from ...engine import processors
 from ...sql import sqltypes
-from ...util.concurrency import asyncio
-from ...util.concurrency import await_fallback
-from ...util.concurrency import await_only
+from ...util.concurrency import await_
+
+if TYPE_CHECKING:
+    from ...engine.interfaces import _DBAPICursorDescription
 
 
 class AsyncpgARRAY(PGARRAY):
@@ -232,6 +247,25 @@ class AsyncpgTime(sqltypes.Time):
 
 class AsyncpgBit(BIT):
     render_bind_cast = True
+
+    def bind_processor(self, dialect):
+        asyncpg_BitString = dialect.dbapi.asyncpg.BitString
+
+        def to_bind(value):
+            if isinstance(value, str):
+                value = BitString(value)
+                value = asyncpg_BitString.from_int(int(value), len(value))
+            return value
+
+        return to_bind
+
+    def result_processor(self, dialect, coltype):
+        def to_result(value):
+            if value is not None:
+                value = BitString.from_int(value.to_int(), length=len(value))
+            return value
+
+        return to_result
 
 
 class AsyncpgByteA(BYTEA):
@@ -274,16 +308,6 @@ class AsyncpgBigInteger(sqltypes.BigInteger):
     render_bind_cast = True
 
 
-class AsyncpgJSON(json.JSON):
-    def result_processor(self, dialect, coltype):
-        return None
-
-
-class AsyncpgJSONB(json.JSONB):
-    def result_processor(self, dialect, coltype):
-        return None
-
-
 class AsyncpgJSONIndexType(sqltypes.JSON.JSONIndexType):
     pass
 
@@ -316,7 +340,7 @@ class AsyncpgJSONPathType(json.JSONPathType):
         return process
 
 
-class AsyncpgNumeric(sqltypes.Numeric):
+class _AsyncpgNumericCommon(sqltypes.NumericCommon):
     render_bind_cast = True
 
     def bind_processor(self, dialect):
@@ -347,9 +371,12 @@ class AsyncpgNumeric(sqltypes.Numeric):
                 )
 
 
-class AsyncpgFloat(AsyncpgNumeric, sqltypes.Float):
-    __visit_name__ = "float"
-    render_bind_cast = True
+class AsyncpgNumeric(_AsyncpgNumericCommon, sqltypes.Numeric):
+    pass
+
+
+class AsyncpgFloat(_AsyncpgNumericCommon, sqltypes.Float):
+    pass
 
 
 class AsyncpgREGCLASS(REGCLASS):
@@ -400,8 +427,6 @@ class _AsyncpgRange(ranges.AbstractSingleRangeImpl):
 class _AsyncpgMultiRange(ranges.AbstractMultiRangeImpl):
     def bind_processor(self, dialect):
         asyncpg_Range = dialect.dbapi.asyncpg.Range
-
-        NoneType = type(None)
 
         def to_range(value):
             if isinstance(value, (str, NoneType)):
@@ -478,36 +503,66 @@ class PGIdentifierPreparer_asyncpg(PGIdentifierPreparer):
     pass
 
 
-class AsyncAdapt_asyncpg_cursor:
+class _AsyncpgTransaction(Protocol):
+    async def start(self) -> None: ...
+    async def commit(self) -> None: ...
+    async def rollback(self) -> None: ...
+
+
+class _AsyncpgConnection(Protocol):
+    async def executemany(
+        self, operation: Any, seq_of_parameters: Sequence[Tuple[Any, ...]]
+    ) -> Any: ...
+
+    async def reload_schema_state(self) -> None: ...
+
+    async def prepare(
+        self, operation: Any, *, name: Optional[str] = None
+    ) -> Any: ...
+
+    def is_closed(self) -> bool: ...
+
+    def transaction(
+        self,
+        *,
+        isolation: Optional[str] = None,
+        readonly: bool = False,
+        deferrable: bool = False,
+    ) -> _AsyncpgTransaction: ...
+
+    def fetchrow(self, operation: str) -> Any: ...
+
+    async def close(self, timeout: int = ...) -> None: ...
+
+    def terminate(self) -> None: ...
+
+
+class _AsyncpgCursor(Protocol):
+    def fetch(self, size: int) -> Any: ...
+
+
+class AsyncAdapt_asyncpg_cursor(AsyncAdapt_dbapi_cursor):
     __slots__ = (
-        "_adapt_connection",
-        "_connection",
-        "_rows",
-        "description",
-        "arraysize",
-        "rowcount",
-        "_cursor",
+        "_description",
+        "_arraysize",
+        "_rowcount",
         "_invalidate_schema_cache_asof",
     )
 
-    server_side = False
+    _adapt_connection: AsyncAdapt_asyncpg_connection
+    _connection: _AsyncpgConnection
+    _cursor: Optional[_AsyncpgCursor]
     _awaitable_cursor_close: bool = False
 
-    def __init__(self, adapt_connection):
+    def __init__(self, adapt_connection: AsyncAdapt_asyncpg_connection):
         self._adapt_connection = adapt_connection
         self._connection = adapt_connection._connection
-        self._rows = deque()
         self._cursor = None
-        self.description = None
-        self.arraysize = 1
-        self.rowcount = -1
+        self._rows = deque()
+        self._description = None
+        self._arraysize = 1
+        self._rowcount = -1
         self._invalidate_schema_cache_asof = 0
-
-    async def _async_soft_close(self) -> None:
-        return
-
-    def close(self):
-        self._rows.clear()
 
     def _handle_exception(self, error):
         self._adapt_connection._handle_exception(error)
@@ -516,7 +571,7 @@ class AsyncAdapt_asyncpg_cursor:
         adapt_connection = self._adapt_connection
 
         async with adapt_connection._execute_mutex:
-            if not adapt_connection._started:
+            if adapt_connection._transaction is None:
                 await adapt_connection._start_transaction()
 
             if parameters is None:
@@ -528,7 +583,7 @@ class AsyncAdapt_asyncpg_cursor:
                 )
 
                 if attributes:
-                    self.description = [
+                    self._description = [
                         (
                             attr.name,
                             attr.type.oid,
@@ -541,11 +596,11 @@ class AsyncAdapt_asyncpg_cursor:
                         for attr in attributes
                     ]
                 else:
-                    self.description = None
+                    self._description = None
 
                 if self.server_side:
                     self._cursor = await prepared_stmt.cursor(*parameters)
-                    self.rowcount = -1
+                    self._rowcount = -1
                 else:
                     self._rows = deque(await prepared_stmt.fetch(*parameters))
                     status = prepared_stmt.get_statusmsg()
@@ -555,23 +610,39 @@ class AsyncAdapt_asyncpg_cursor:
                         status or "",
                     )
                     if reg:
-                        self.rowcount = int(reg.group(1))
+                        self._rowcount = int(reg.group(1))
                     else:
-                        self.rowcount = -1
+                        self._rowcount = -1
 
             except Exception as error:
                 self._handle_exception(error)
 
+    @property
+    def description(self) -> Optional[_DBAPICursorDescription]:
+        return self._description
+
+    @property
+    def rowcount(self) -> int:
+        return self._rowcount
+
+    @property
+    def arraysize(self) -> int:
+        return self._arraysize
+
+    @arraysize.setter
+    def arraysize(self, value: int) -> None:
+        self._arraysize = value
+
     async def _executemany(self, operation, seq_of_parameters):
         adapt_connection = self._adapt_connection
 
-        self.description = None
+        self._description = None
         async with adapt_connection._execute_mutex:
             await adapt_connection._check_type_cache_invalidation(
                 self._invalidate_schema_cache_asof
             )
 
-            if not adapt_connection._started:
+            if adapt_connection._transaction is None:
                 await adapt_connection._start_transaction()
 
             try:
@@ -582,43 +653,18 @@ class AsyncAdapt_asyncpg_cursor:
                 self._handle_exception(error)
 
     def execute(self, operation, parameters=None):
-        self._adapt_connection.await_(
-            self._prepare_and_execute(operation, parameters)
-        )
+        await_(self._prepare_and_execute(operation, parameters))
 
     def executemany(self, operation, seq_of_parameters):
-        return self._adapt_connection.await_(
-            self._executemany(operation, seq_of_parameters)
-        )
+        return await_(self._executemany(operation, seq_of_parameters))
 
     def setinputsizes(self, *inputsizes):
         raise NotImplementedError()
 
-    def __iter__(self):
-        while self._rows:
-            yield self._rows.popleft()
 
-    def fetchone(self):
-        if self._rows:
-            return self._rows.popleft()
-        else:
-            return None
-
-    def fetchmany(self, size=None):
-        if size is None:
-            size = self.arraysize
-
-        rr = self._rows
-        return [rr.popleft() for _ in range(min(size, len(rr)))]
-
-    def fetchall(self):
-        retval = list(self._rows)
-        self._rows.clear()
-        return retval
-
-
-class AsyncAdapt_asyncpg_ss_cursor(AsyncAdapt_asyncpg_cursor):
-    server_side = True
+class AsyncAdapt_asyncpg_ss_cursor(
+    AsyncAdapt_dbapi_ss_cursor, AsyncAdapt_asyncpg_cursor
+):
     __slots__ = ("_rowbuffer",)
 
     def __init__(self, adapt_connection):
@@ -631,7 +677,7 @@ class AsyncAdapt_asyncpg_ss_cursor(AsyncAdapt_asyncpg_cursor):
 
     def _buffer_rows(self):
         assert self._cursor is not None
-        new_rows = self._adapt_connection.await_(self._cursor.fetch(50))
+        new_rows = await_(self._cursor.fetch(50))
         self._rowbuffer.extend(new_rows)
 
     def __aiter__(self):
@@ -664,20 +710,20 @@ class AsyncAdapt_asyncpg_ss_cursor(AsyncAdapt_asyncpg_cursor):
         rb = self._rowbuffer
         lb = len(rb)
         if size > lb:
-            rb.extend(
-                self._adapt_connection.await_(self._cursor.fetch(size - lb))
-            )
+            rb.extend(await_(self._cursor.fetch(size - lb)))
 
         return [rb.popleft() for _ in range(min(size, len(rb)))]
 
     def fetchall(self):
         ret = list(self._rowbuffer)
-        ret.extend(self._adapt_connection.await_(self._all()))
+        ret.extend(await_(self._all()))
         self._rowbuffer.clear()
         return ret
 
     async def _all(self):
         rows = []
+
+        assert self._cursor is not None
 
         # TODO: looks like we have to hand-roll some kind of batching here.
         # hardcoding for the moment but this should be improved.
@@ -696,22 +742,25 @@ class AsyncAdapt_asyncpg_ss_cursor(AsyncAdapt_asyncpg_cursor):
         )
 
 
-class AsyncAdapt_asyncpg_connection(AsyncAdapt_terminate, AdaptedConnection):
+class AsyncAdapt_asyncpg_connection(
+    AsyncAdapt_terminate, AsyncAdapt_dbapi_connection
+):
+    _cursor_cls = AsyncAdapt_asyncpg_cursor
+    _ss_cursor_cls = AsyncAdapt_asyncpg_ss_cursor
+
+    _connection: _AsyncpgConnection
+    _transaction: Optional[_AsyncpgTransaction]
+
     __slots__ = (
-        "dbapi",
         "isolation_level",
         "_isolation_setting",
         "readonly",
         "deferrable",
         "_transaction",
-        "_started",
         "_prepared_statement_cache",
         "_prepared_statement_name_func",
         "_invalidate_schema_cache_asof",
-        "_execute_mutex",
     )
-
-    await_ = staticmethod(await_only)
 
     def __init__(
         self,
@@ -720,15 +769,12 @@ class AsyncAdapt_asyncpg_connection(AsyncAdapt_terminate, AdaptedConnection):
         prepared_statement_cache_size=100,
         prepared_statement_name_func=None,
     ):
-        self.dbapi = dbapi
-        self._connection = connection
+        super().__init__(dbapi, connection)
         self.isolation_level = self._isolation_setting = None
         self.readonly = False
         self.deferrable = False
         self._transaction = None
-        self._started = False
         self._invalidate_schema_cache_asof = time.time()
-        self._execute_mutex = asyncio.Lock()
 
         if prepared_statement_cache_size:
             self._prepared_statement_cache = util.LRUCache(
@@ -778,27 +824,27 @@ class AsyncAdapt_asyncpg_connection(AsyncAdapt_terminate, AdaptedConnection):
 
         return prepared_stmt, attributes
 
-    def _handle_exception(self, error):
-        if self._connection.is_closed():
-            self._transaction = None
-            self._started = False
-
+    @classmethod
+    def _handle_exception_no_connection(
+        cls, dbapi: Any, error: Exception
+    ) -> NoReturn:
         if not isinstance(error, AsyncAdapt_asyncpg_dbapi.Error):
-            exception_mapping = self.dbapi._asyncpg_error_translate
+            exception_mapping = dbapi._asyncpg_error_translate
 
             for super_ in type(error).__mro__:
                 if super_ in exception_mapping:
+                    message = error.args[0]
                     translated_error = exception_mapping[super_](
-                        "%s: %s" % (type(error), error)
-                    )
-                    translated_error.pgcode = translated_error.sqlstate = (
-                        getattr(error, "sqlstate", None)
+                        message, error
                     )
                     raise translated_error from error
-            else:
-                raise error
-        else:
-            raise error
+        super()._handle_exception_no_connection(dbapi, error)
+
+    def _handle_exception(self, error: Exception) -> NoReturn:
+        if self._connection.is_closed():
+            self._transaction = None
+
+        super()._handle_exception(error)
 
     @property
     def autocommit(self):
@@ -813,7 +859,7 @@ class AsyncAdapt_asyncpg_connection(AsyncAdapt_terminate, AdaptedConnection):
 
     def ping(self):
         try:
-            _ = self.await_(self._async_ping())
+            _ = await_(self._async_ping())
         except Exception as error:
             self._handle_exception(error)
 
@@ -831,14 +877,14 @@ class AsyncAdapt_asyncpg_connection(AsyncAdapt_terminate, AdaptedConnection):
             await self._connection.fetchrow(";")
 
     def set_isolation_level(self, level):
-        if self._started:
-            self.rollback()
+        self.rollback()
         self.isolation_level = self._isolation_setting = level
 
     async def _start_transaction(self):
         if self.isolation_level == "autocommit":
             return
 
+        assert self._transaction is None
         try:
             self._transaction = self._connection.transaction(
                 isolation=self.isolation_level,
@@ -848,50 +894,28 @@ class AsyncAdapt_asyncpg_connection(AsyncAdapt_terminate, AdaptedConnection):
             await self._transaction.start()
         except Exception as error:
             self._handle_exception(error)
-        else:
-            self._started = True
 
-    def cursor(self, server_side=False):
-        if server_side:
-            return AsyncAdapt_asyncpg_ss_cursor(self)
-        else:
-            return AsyncAdapt_asyncpg_cursor(self)
-
-    async def _rollback_and_discard(self):
+    async def _call_and_discard(self, fn: Callable[[], Awaitable[Any]]):
         try:
-            await self._transaction.rollback()
+            await fn()
         finally:
-            # if asyncpg .rollback() was actually called, then whether or
-            # not it raised or succeeded, the transation is done, discard it
+            # if asyncpg fn was actually called, then whether or
+            # not it raised or succeeded, the transaction is done, discard it
             self._transaction = None
-            self._started = False
-
-    async def _commit_and_discard(self):
-        try:
-            await self._transaction.commit()
-        finally:
-            # if asyncpg .commit() was actually called, then whether or
-            # not it raised or succeeded, the transation is done, discard it
-            self._transaction = None
-            self._started = False
 
     def rollback(self):
-        if self._started:
+        if self._transaction is not None:
             try:
-                self.await_(self._rollback_and_discard())
-                self._transaction = None
-                self._started = False
+                await_(self._call_and_discard(self._transaction.rollback))
             except Exception as error:
                 # don't dereference asyncpg transaction if we didn't
                 # actually try to call rollback() on it
                 self._handle_exception(error)
 
     def commit(self):
-        if self._started:
+        if self._transaction is not None:
             try:
-                self.await_(self._commit_and_discard())
-                self._transaction = None
-                self._started = False
+                await_(self._call_and_discard(self._transaction.commit))
             except Exception as error:
                 # don't dereference asyncpg transaction if we didn't
                 # actually try to call commit() on it
@@ -900,7 +924,7 @@ class AsyncAdapt_asyncpg_connection(AsyncAdapt_terminate, AdaptedConnection):
     def close(self):
         self.rollback()
 
-        self.await_(self._connection.close())
+        await_(self._connection.close())
 
     def _terminate_handled_exceptions(self):
         return super()._terminate_handled_exceptions() + (
@@ -910,30 +934,24 @@ class AsyncAdapt_asyncpg_connection(AsyncAdapt_terminate, AdaptedConnection):
     async def _terminate_graceful_close(self) -> None:
         # timeout added in asyncpg 0.14.0 December 2017
         await self._connection.close(timeout=2)
-        self._started = False
+        self._transaction = None
 
     def _terminate_force_close(self) -> None:
         self._connection.terminate()
-        self._started = False
+        self._transaction = None
 
     @staticmethod
     def _default_name_func():
         return None
 
 
-class AsyncAdaptFallback_asyncpg_connection(AsyncAdapt_asyncpg_connection):
-    __slots__ = ()
-
-    await_ = staticmethod(await_fallback)
-
-
-class AsyncAdapt_asyncpg_dbapi:
+class AsyncAdapt_asyncpg_dbapi(AsyncAdapt_dbapi_module):
     def __init__(self, asyncpg):
+        super().__init__(asyncpg)
         self.asyncpg = asyncpg
         self.paramstyle = "numeric_dollar"
 
     def connect(self, *arg, **kw):
-        async_fallback = kw.pop("async_fallback", False)
         creator_fn = kw.pop("async_creator_fn", self.asyncpg.connect)
         prepared_statement_cache_size = kw.pop(
             "prepared_statement_cache_size", 100
@@ -942,25 +960,29 @@ class AsyncAdapt_asyncpg_dbapi:
             "prepared_statement_name_func", None
         )
 
-        if util.asbool(async_fallback):
-            return AsyncAdaptFallback_asyncpg_connection(
+        return await_(
+            AsyncAdapt_asyncpg_connection.create(
                 self,
-                await_fallback(creator_fn(*arg, **kw)),
+                creator_fn(*arg, **kw),
                 prepared_statement_cache_size=prepared_statement_cache_size,
                 prepared_statement_name_func=prepared_statement_name_func,
             )
-        else:
-            return AsyncAdapt_asyncpg_connection(
-                self,
-                await_only(creator_fn(*arg, **kw)),
-                prepared_statement_cache_size=prepared_statement_cache_size,
-                prepared_statement_name_func=prepared_statement_name_func,
-            )
+        )
 
-    class Error(Exception):
-        pass
+    class Error(AsyncAdapt_Error):
 
-    class Warning(Exception):  # noqa
+        pgcode: str | None
+
+        sqlstate: str | None
+
+        detail: str | None
+
+        def __init__(self, message, error=None):
+            super().__init__(message, error)
+            self.detail = getattr(error, "detail", None)
+            self.pgcode = self.sqlstate = getattr(error, "sqlstate", None)
+
+    class Warning(AsyncAdapt_Error):  # noqa
         pass
 
     class InterfaceError(Error):
@@ -981,6 +1003,24 @@ class AsyncAdapt_asyncpg_dbapi:
     class IntegrityError(DatabaseError):
         pass
 
+    class RestrictViolationError(IntegrityError):
+        pass
+
+    class NotNullViolationError(IntegrityError):
+        pass
+
+    class ForeignKeyViolationError(IntegrityError):
+        pass
+
+    class UniqueViolationError(IntegrityError):
+        pass
+
+    class CheckViolationError(IntegrityError):
+        pass
+
+    class ExclusionViolationError(IntegrityError):
+        pass
+
     class DataError(DatabaseError):
         pass
 
@@ -994,7 +1034,7 @@ class AsyncAdapt_asyncpg_dbapi:
         pass
 
     class InvalidCachedStatementError(NotSupportedError):
-        def __init__(self, message):
+        def __init__(self, message, error=None):
             super().__init__(
                 message + " (SQLAlchemy asyncpg dialect will now invalidate "
                 "all prepared caches in response to this exception)",
@@ -1017,6 +1057,12 @@ class AsyncAdapt_asyncpg_dbapi:
             asyncpg.exceptions.InterfaceError: self.InterfaceError,
             asyncpg.exceptions.InvalidCachedStatementError: self.InvalidCachedStatementError,  # noqa: E501
             asyncpg.exceptions.InternalServerError: self.InternalServerError,
+            asyncpg.exceptions.RestrictViolationError: self.RestrictViolationError,  # noqa: E501
+            asyncpg.exceptions.NotNullViolationError: self.NotNullViolationError,  # noqa: E501
+            asyncpg.exceptions.ForeignKeyViolationError: self.ForeignKeyViolationError,  # noqa: E501
+            asyncpg.exceptions.UniqueViolationError: self.UniqueViolationError,
+            asyncpg.exceptions.CheckViolationError: self.CheckViolationError,
+            asyncpg.exceptions.ExclusionViolationError: self.ExclusionViolationError,  # noqa: E501
             asyncpg.exceptions.InternalClientError: self.InternalClientError,
         }
 
@@ -1039,6 +1085,10 @@ class PGDialect_asyncpg(PGDialect):
     statement_compiler = PGCompiler_asyncpg
     preparer = PGIdentifierPreparer_asyncpg
 
+    supports_native_json_serialization = False
+    supports_native_json_deserialization = True
+    dialect_injects_custom_json_deserializer = True
+
     colspecs = util.update_copy(
         PGDialect.colspecs,
         {
@@ -1058,9 +1108,7 @@ class PGDialect_asyncpg(PGDialect):
             sqltypes.BigInteger: AsyncpgBigInteger,
             sqltypes.Numeric: AsyncpgNumeric,
             sqltypes.Float: AsyncpgFloat,
-            sqltypes.JSON: AsyncpgJSON,
             sqltypes.LargeBinary: AsyncpgByteA,
-            json.JSONB: AsyncpgJSONB,
             sqltypes.JSON.JSONPathType: AsyncpgJSONPathType,
             sqltypes.JSON.JSONIndexType: AsyncpgJSONIndexType,
             sqltypes.JSON.JSONIntIndexType: AsyncpgJSONIntIndexType,
@@ -1079,19 +1127,11 @@ class PGDialect_asyncpg(PGDialect):
     def _invalidate_schema_cache(self):
         self._invalidate_schema_cache_asof = time.time()
 
-    @util.memoized_property
-    def _dbapi_version(self):
-        if self.dbapi and hasattr(self.dbapi, "__version__"):
-            return tuple(
-                [
-                    int(x)
-                    for x in re.findall(
-                        r"(\d+)(?:[-\.]?|$)", self.dbapi.__version__
-                    )
-                ]
-            )
-        else:
-            return (99, 99, 99)
+    def retrieve_dbapi_version(self, dbapi):
+        # dbapi is the AsyncAdapt_asyncpg_dbapi wrapper; the version is on
+        # the asyncpg module itself, which is ``.driver``
+        driver = getattr(dbapi, "driver", None)
+        return util.parse_version_string(getattr(driver, "__version__", None))
 
     @classmethod
     def import_dbapi(cls):
@@ -1163,15 +1203,6 @@ class PGDialect_asyncpg(PGDialect):
     def do_ping(self, dbapi_connection):
         dbapi_connection.ping()
         return True
-
-    @classmethod
-    def get_pool_class(cls, url):
-        async_fallback = url.query.get("async_fallback", False)
-
-        if util.asbool(async_fallback):
-            return pool.FallbackAsyncAdaptedQueuePool
-        else:
-            return pool.AsyncAdaptedQueuePool
 
     def is_disconnect(self, e, connection, cursor):
         if connection:
@@ -1270,11 +1301,11 @@ class PGDialect_asyncpg(PGDialect):
         super_connect = super().on_connect()
 
         def connect(conn):
-            conn.await_(self.setup_asyncpg_json_codec(conn))
-            conn.await_(self.setup_asyncpg_jsonb_codec(conn))
+            await_(self.setup_asyncpg_json_codec(conn))
+            await_(self.setup_asyncpg_jsonb_codec(conn))
 
             if self._native_inet_types is False:
-                conn.await_(self._disable_asyncpg_inet_codecs(conn))
+                await_(self._disable_asyncpg_inet_codecs(conn))
             if super_connect is not None:
                 super_connect(conn)
 

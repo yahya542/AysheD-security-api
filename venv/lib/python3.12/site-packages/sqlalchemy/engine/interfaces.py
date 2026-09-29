@@ -19,14 +19,17 @@ from typing import Dict
 from typing import Iterable
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import Mapping
 from typing import MutableMapping
 from typing import Optional
+from typing import Protocol
 from typing import Sequence
 from typing import Set
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
+from typing import TypedDict
 from typing import TypeVar
 from typing import Union
 
@@ -39,11 +42,8 @@ from ..sql.compiler import Compiled  # noqa
 from ..sql.compiler import TypeCompiler as TypeCompiler
 from ..sql.compiler import TypeCompiler  # noqa
 from ..util import immutabledict
-from ..util.concurrency import await_only
-from ..util.typing import Literal
+from ..util.concurrency import await_
 from ..util.typing import NotRequired
-from ..util.typing import Protocol
-from ..util.typing import TypedDict
 
 if TYPE_CHECKING:
     from .base import Connection
@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from ..exc import StatementError
     from ..sql import Executable
     from ..sql.compiler import _InsertManyValuesBatch
+    from ..sql.compiler import AggregateOrderByStyle
     from ..sql.compiler import DDLCompiler
     from ..sql.compiler import IdentifierPreparer
     from ..sql.compiler import InsertmanyvaluesSentinelOpts
@@ -67,6 +68,7 @@ if TYPE_CHECKING:
     from ..sql.schema import DefaultGenerator
     from ..sql.schema import SchemaItem
     from ..sql.schema import Sequence as Sequence_SchemaItem
+    from ..sql.sqltypes import _JSON_VALUE
     from ..sql.sqltypes import Integer
     from ..sql.type_api import _TypeMemoDict
     from ..sql.type_api import TypeEngine
@@ -290,6 +292,7 @@ class _CoreKnownExecutionOptions(TypedDict, total=False):
     insertmanyvalues_page_size: int
     schema_translate_map: Optional[SchemaTranslateMapType]
     preserve_rowcount: bool
+    driver_column_names: bool
 
 
 _ExecuteOptions = immutabledict[str, Any]
@@ -404,8 +407,6 @@ class ReflectedColumn(TypedDict):
     computed: NotRequired[ReflectedComputed]
     """indicates that this column is computed by the database.
     Only some dialects return this key.
-
-    .. versionadded:: 1.3.16 - added support for computed reflection.
     """
 
     identity: NotRequired[ReflectedIdentity]
@@ -448,8 +449,6 @@ class ReflectedCheckConstraint(ReflectedConstraint):
 
     dialect_options: NotRequired[Dict[str, Any]]
     """Additional dialect-specific options detected for this check constraint
-
-    .. versionadded:: 1.3.8
     """
 
 
@@ -558,12 +557,10 @@ class ReflectedIndex(TypedDict):
     """optional dict mapping column names or expressions to tuple of sort
     keywords, which may include ``asc``, ``desc``, ``nulls_first``,
     ``nulls_last``.
-
-    .. versionadded:: 1.3.5
     """
 
     dialect_options: NotRequired[Dict[str, Any]]
-    """Additional dialect-specific options detected for this index"""
+    """Additional dialect-specific options detected for this index."""
 
 
 class ReflectedTableComment(TypedDict):
@@ -639,7 +636,18 @@ class BindTyping(Enum):
     """
 
 
-VersionInfoType = Tuple[Union[int, str], ...]
+ServerVersionInfoType = Tuple[Union[int, str], ...]
+"""The type of :attr:`.Dialect.server_version_info`.
+
+.. versionadded:: 2.1  Renamed from ``VersionInfoType``, which remains
+   present as a synonym.  The version of the DBAPI, as opposed to that of
+   the database server, is instead a ``sqlalchemy.util.VersionInfo``; see
+   :attr:`.Dialect.dbapi_version`.
+
+"""
+
+VersionInfoType = ServerVersionInfoType
+
 TableKey = Tuple[Optional[str], str]
 
 
@@ -760,12 +768,118 @@ class Dialect(EventTarget):
 
     """
 
-    server_version_info: Optional[Tuple[Any, ...]]
+    server_version_info: Optional[ServerVersionInfoType]
     """a tuple containing a version number for the DB backend in use.
 
     This value is only available for supporting dialects, and is
     typically populated during the initial connection to the database.
     """
+
+    minimum_dbapi_version: Optional[util.VersionInfo] = None
+    """The minimum version of the DBAPI which this dialect supports.
+
+    When present, :class:`.DefaultDialect` compares this against
+    :attr:`.Dialect.dbapi_version` as the dialect is constructed, raising
+    :class:`.exc.InvalidRequestError` if the DBAPI in use is older.  A
+    dialect therefore does not need to implement this check itself::
+
+        class MyDialect(DefaultDialect):
+            minimum_dbapi_version = util.VersionInfo((2, 5))
+
+    No check takes place if the version of the DBAPI is not available, as
+    described at :attr:`.Dialect.dbapi_version`.
+
+    .. versionadded:: 2.1
+
+    """
+
+    @property
+    def dbapi_version(self) -> util.VersionInfo:
+        """the version number of the DBAPI in use.
+
+        In contrast to :attr:`.Dialect.server_version_info`, which refers to
+        the database server itself, this attribute refers to the version of
+        the Python DBAPI module which the dialect makes use of, and is
+        available without any database connection being established.
+
+        The value is a ``sqlalchemy.util.VersionInfo``, a tuple of integers
+        which additionally sorts pre-release versions such as ``2.0.0rc1``
+        as preceding the final release ``(2, 0, 0)``.  It may be compared
+        against a plain tuple of integers directly::
+
+            if dialect.dbapi_version >= (2, 5):
+                ...
+
+        Dialects should implement
+        :meth:`.Dialect.retrieve_dbapi_version` only in order to provide
+        this value; this method in turn is used by the
+        :class:`.DefaultDialect` implementation of
+        :attr:`.DefaultDialect.dbapi_version`.
+
+        Two distinct conditions prevent a version from being available:
+
+        * :class:`.exc.NoDBAPILoaded` is raised if the dialect has no DBAPI
+          module loaded, as is the case for a dialect used only to compile
+          statements, or if its DBAPI publishes no version of its own.
+          Neither is an error on the part of the dialect.
+
+        * ``NotImplementedError`` is raised if the dialect does not
+          implement :meth:`.Dialect.retrieve_dbapi_version` at all.  This
+          indicates the dialect itself needs to be fixed.
+
+        Consuming code which tolerates a dialect that has not loaded a
+        DBAPI should accommodate the former only, so that a dialect in need
+        of fixing continues to make itself known::
+
+            try:
+                dbapi_version = dialect.dbapi_version
+            except exc.NoDBAPILoaded:
+                dbapi_version = None
+
+        Note that ``hasattr()`` may **not** be used to test for support, as
+        it does not intercept ``NotImplementedError``.  Note also that
+        reading this attribute does not cause a DBAPI module to be
+        imported; it reports upon the module already in use, if any.
+
+        A version, once determined, is memoized.  As no memoization takes
+        place while the version remains unavailable, a DBAPI which is
+        established after the dialect was constructed is still detected.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :meth:`.Dialect.retrieve_dbapi_version`
+
+        """
+        raise NotImplementedError()
+
+    def retrieve_dbapi_version(self, dbapi: DBAPIModule) -> util.VersionInfo:
+        """Return the version of the given DBAPI module.
+
+        This is the dialect-implemented hook behind
+        :attr:`.Dialect.dbapi_version`.  A dialect is responsible only for
+        locating where its particular DBAPI publishes a version and parsing
+        it, typically using ``sqlalchemy.util.parse_version_string()``::
+
+            def retrieve_dbapi_version(self, dbapi):
+                return util.parse_version_string(dbapi.__version__)
+
+        The ``dbapi`` argument is the module returned by
+        :meth:`.Dialect.import_dbapi`, which for asyncio dialects is
+        typically a wrapper object rather than the driver module itself.
+
+        This method is only invoked with a DBAPI actually loaded, and only
+        until a version has been determined; the surrounding conditions,
+        including memoization, are handled by :class:`.DefaultDialect`.  An
+        empty version may be returned to indicate that no version could be
+        located, which :attr:`.Dialect.dbapi_version` translates into
+        :class:`.exc.NoDBAPILoaded`.
+
+        .. versionadded:: 2.1
+
+        """
+        raise NotImplementedError()
 
     default_schema_name: Optional[str]
     """the name of the default schema.  This value is only available for
@@ -866,6 +980,42 @@ class Dialect(EventTarget):
     supports_multivalues_insert: bool
     """Target database supports INSERT...VALUES with multiple value
     sets, i.e. INSERT INTO table (cols) VALUES (...), (...), (...), ...
+
+    """
+
+    _json_serializer: Callable[[_JSON_VALUE], str] | None
+
+    _json_deserializer: Callable[[str], _JSON_VALUE] | None
+
+    supports_native_json_serialization: bool
+    """target dialect includes a native JSON serializer, eliminating
+    the need to use json.dumps() for JSON data
+
+    .. versionadded:: 2.1
+
+    """
+
+    supports_native_json_deserialization: bool
+    """target dialect includes a native JSON deserializer, eliminating
+    the need to use json.loads() for JSON data
+
+    .. versionadded:: 2.1
+
+    """
+
+    dialect_injects_custom_json_deserializer: bool
+    """target dialect, when given a custom _json_deserializer, needs to
+    inject this handler at the connection/cursor level, rather than
+    having JSON data returned as a string to be handled by the type
+
+    ..versionadded:: 2.1
+
+    """
+
+    aggregate_order_by_style: AggregateOrderByStyle
+    """Style of ORDER BY supported for arbitrary aggregate functions
+
+    .. versionadded:: 2.1
 
     """
 
@@ -1108,6 +1258,17 @@ class Dialect(EventTarget):
     the namespace of arguments prefixed with that dialect name.  The rationale
     here is so that third-party dialects that haven't yet implemented this
     feature continue to function in the old way.
+
+    Arguments that represent database state without any corresponding DDL,
+    but may nonetheless appear in a reflected set of arguments that should
+    be ignored by the construct, may make use of the
+    :attr:`.DialectKWArgConst.REFLECTED_ONLY` token as the default value.
+    Arguments passed to the schema object on such a key will be passed along
+    into the separate read-only collection
+    :attr:`.DialectKWArgs.reflect_only_elements` and should be omitted from
+    DDL rendering.
+
+    .. versionadded:: 2.1 Added :class:`.DialectKWArgConst`.
 
     .. seealso::
 
@@ -1787,8 +1948,6 @@ class Dialect(EventTarget):
         :raise: ``NotImplementedError`` for dialects that don't support
          comments.
 
-        .. versionadded:: 1.2
-
         """
 
         raise NotImplementedError()
@@ -1877,6 +2036,30 @@ class Dialect(EventTarget):
            and dialects to the degree that the backing database supports views
            or temporary tables should seek to support locating these objects
            for full compliance.
+
+        """
+
+        raise NotImplementedError()
+
+    def has_multi_table(
+        self,
+        connection: Connection,
+        table_names: Sequence[str],
+        schema: Optional[str] = None,
+        **kw: Any,
+    ) -> Iterable[Tuple[TableKey, bool]]:
+        """For internal dialect use, check the existence of a particular list
+        of tables or views in the database.
+
+        This is an internal dialect method. Applications should use
+        :meth:`.Inspector.has_multi_table`.
+
+        .. note:: The :class:`_engine.DefaultDialect` provides a default
+          implementation that will call the single table method for
+          each table name provided. Dialects that want to support a faster
+          implementation should implement this method.
+
+        .. versionadded:: 2.1
 
         """
 
@@ -2537,8 +2720,6 @@ class Dialect(EventTarget):
         The method defaults to using the :meth:`.Dialect.get_isolation_level`
         method unless overridden by a dialect.
 
-        .. versionadded:: 1.3.22
-
         """
         raise NotImplementedError()
 
@@ -2648,8 +2829,6 @@ class Dialect(EventTarget):
                     __import__(package + ".provision")
                 except ImportError:
                     pass
-
-        .. versionadded:: 1.3.14
 
         """
 
@@ -2811,9 +2990,6 @@ class CreateEnginePlugin:
         engine = create_engine(
             "mysql+pymysql://scott:tiger@localhost/test", plugins=["myplugin"]
         )
-
-    .. versionadded:: 1.2.3  plugin names can also be specified
-       to :func:`_sa.create_engine` as a list
 
     A plugin may consume plugin-specific arguments from the
     :class:`_engine.URL` object as well as the ``kwargs`` dictionary, which is
@@ -3465,7 +3641,7 @@ class AdaptedConnection:
             :ref:`asyncio_events_run_async`
 
         """
-        return await_only(fn(self._connection))
+        return await_(fn(self._connection))
 
     def __repr__(self) -> str:
         return "<AdaptedConnection %s>" % self._connection

@@ -13,9 +13,9 @@ implementations, and related MapperOptions."""
 from __future__ import annotations
 
 import collections
-import itertools
 from typing import Any
 from typing import Dict
+from typing import Literal
 from typing import Optional
 from typing import Tuple
 from typing import TYPE_CHECKING
@@ -39,8 +39,8 @@ from .base import LoaderCallableStatus
 from .base import PASSIVE_OFF
 from .base import PassiveFlag
 from .context import _column_descriptions
-from .context import ORMCompileState
-from .context import ORMSelectCompileState
+from .context import _ORMCompileState
+from .context import _ORMSelectCompileState
 from .context import QueryContext
 from .interfaces import LoaderStrategy
 from .interfaces import StrategizedProperty
@@ -59,7 +59,6 @@ from ..sql import util as sql_util
 from ..sql import visitors
 from ..sql.selectable import LABEL_STYLE_TABLENAME_PLUS_COL
 from ..sql.selectable import Select
-from ..util.typing import Literal
 
 if TYPE_CHECKING:
     from .mapper import Mapper
@@ -84,33 +83,36 @@ def _register_attribute(
     proxy_property=None,
     active_history=False,
     impl_class=None,
+    default_scalar_value=None,
     **kw,
 ):
-    listen_hooks = []
+
+    # event-hook registration functions organized into "pre validate" and "post
+    # validate" collections.  Each hook registration function generates a new
+    # AttributeEvents registration for this attribute.  What we are controlling
+    # here is the order in which these attribute events are established. Hook
+    # registration functions invoked in the order of first pre-validate, then
+    # user-specific validation i.e. `@validates`, then post-validate.
+    # within `@validates` we are scanning for hooks from child-most classes
+    # first (this suits the feature added in #2943).
+    pre_validate_hooks = []
+    post_validate_hooks = []
 
     uselist = useobject and prop.uselist
 
     if useobject and prop.single_parent:
-        listen_hooks.append(single_parent_validator)
-
-    if prop.key in prop.parent.validators:
-        fn, opts = prop.parent.validators[prop.key]
-        listen_hooks.append(
-            lambda desc, prop: orm_util._validator_events(
-                desc, prop.key, fn, **opts
-            )
-        )
+        pre_validate_hooks.append(_single_parent_validator)
 
     if useobject:
-        listen_hooks.append(unitofwork.track_cascade_events)
+        post_validate_hooks.append(unitofwork._track_cascade_events)
 
     # need to assemble backref listeners
     # after the singleparentvalidator, mapper validator
     if useobject:
         backref = prop.back_populates
         if backref and prop._effective_sync_backref:
-            listen_hooks.append(
-                lambda desc, prop: attributes.backref_listeners(
+            post_validate_hooks.append(
+                lambda desc, prop: attributes._backref_listeners(
                     desc, backref, uselist
                 )
             )
@@ -130,7 +132,7 @@ def _register_attribute(
         if prop is m._props.get(
             prop.key
         ) and not m.class_manager._attr_has_impl(prop.key):
-            desc = attributes.register_attribute_impl(
+            desc = attributes._register_attribute_impl(
                 m.class_,
                 prop.key,
                 parent_token=prop,
@@ -145,18 +147,28 @@ def _register_attribute(
                 typecallable=typecallable,
                 callable_=callable_,
                 active_history=active_history,
+                default_scalar_value=default_scalar_value,
                 impl_class=impl_class,
                 send_modified_events=not useobject or not prop.viewonly,
                 doc=prop.doc,
                 **kw,
             )
 
-            for hook in listen_hooks:
+            for hook in pre_validate_hooks:
+                hook(desc, prop)
+
+            for super_m in m.iterate_to_root():
+                if prop.key in super_m.validators:
+                    fn, opts = super_m.validators[prop.key]
+                    orm_util._validator_events(desc, prop.key, fn, **opts)
+                    break
+
+            for hook in post_validate_hooks:
                 hook(desc, prop)
 
 
 @properties.ColumnProperty.strategy_for(instrument=False, deferred=False)
-class UninstrumentedColumnLoader(LoaderStrategy):
+class _UninstrumentedColumnLoader(LoaderStrategy):
     """Represent a non-instrumented MapperProperty.
 
     The polymorphic_on argument of mapper() often results in this,
@@ -201,7 +213,7 @@ class UninstrumentedColumnLoader(LoaderStrategy):
 
 @log.class_logger
 @properties.ColumnProperty.strategy_for(instrument=True, deferred=False)
-class ColumnLoader(LoaderStrategy):
+class _ColumnLoader(LoaderStrategy):
     """Provide loading behavior for a :class:`.ColumnProperty`."""
 
     __slots__ = "columns", "is_composite"
@@ -264,6 +276,7 @@ class ColumnLoader(LoaderStrategy):
             useobject=False,
             compare_function=coltype.compare_values,
             active_history=active_history,
+            default_scalar_value=self.parent_property._default_scalar_value,
         )
 
     def create_row_processor(
@@ -293,7 +306,7 @@ class ColumnLoader(LoaderStrategy):
 
 @log.class_logger
 @properties.ColumnProperty.strategy_for(query_expression=True)
-class ExpressionColumnLoader(ColumnLoader):
+class _ExpressionColumnLoader(_ColumnLoader):
     def __init__(self, parent, strategy_key):
         super().__init__(parent, strategy_key)
 
@@ -342,6 +355,17 @@ class ExpressionColumnLoader(ColumnLoader):
 
         memoized_populators[self.parent_property] = fetch
 
+        # if the column being loaded is the polymorphic discriminator,
+        # and we have a with_expression() providing the actual column,
+        # update the query_entity to use the actual column instead of
+        # the default expression
+        if (
+            query_entity._polymorphic_discriminator is self.columns[0]
+            and loadopt
+            and loadopt._extra_criteria
+        ):
+            query_entity._polymorphic_discriminator = columns[0]
+
     def create_row_processor(
         self,
         context,
@@ -377,6 +401,7 @@ class ExpressionColumnLoader(ColumnLoader):
             useobject=False,
             compare_function=self.columns[0].type.compare_values,
             accepts_scalar_loader=False,
+            default_scalar_value=self.parent_property._default_scalar_value,
         )
 
 
@@ -386,7 +411,7 @@ class ExpressionColumnLoader(ColumnLoader):
     deferred=True, instrument=True, raiseload=True
 )
 @properties.ColumnProperty.strategy_for(do_nothing=True)
-class DeferredColumnLoader(LoaderStrategy):
+class _DeferredColumnLoader(LoaderStrategy):
     """Provide loading behavior for a deferred :class:`.ColumnProperty`."""
 
     __slots__ = "columns", "group", "raiseload"
@@ -462,6 +487,7 @@ class DeferredColumnLoader(LoaderStrategy):
             compare_function=self.columns[0].type.compare_values,
             callable_=self._load_for_state,
             load_on_unexpire=False,
+            default_scalar_value=self.parent_property._default_scalar_value,
         )
 
     def setup_query(
@@ -529,7 +555,7 @@ class DeferredColumnLoader(LoaderStrategy):
                 p.key
                 for p in localparent.iterate_properties
                 if isinstance(p, StrategizedProperty)
-                and isinstance(p.strategy, DeferredColumnLoader)
+                and isinstance(p.strategy, _DeferredColumnLoader)
                 and p.group == self.group
             ]
         else:
@@ -549,7 +575,7 @@ class DeferredColumnLoader(LoaderStrategy):
         if self.raiseload:
             self._invoke_raise_load(state, passive, "raise")
 
-        loading.load_scalar_attributes(
+        loading._load_scalar_attributes(
             state.mapper, state, set(group), PASSIVE_OFF
         )
 
@@ -561,7 +587,7 @@ class DeferredColumnLoader(LoaderStrategy):
         )
 
 
-class LoadDeferredColumns:
+class _LoadDeferredColumns:
     """serializable loader object used by DeferredColumnLoader"""
 
     def __init__(self, key: str, raiseload: bool = False):
@@ -585,7 +611,7 @@ class LoadDeferredColumns:
         return strategy._load_for_state(state, passive)
 
 
-class AbstractRelationshipLoader(LoaderStrategy):
+class _AbstractRelationshipLoader(LoaderStrategy):
     """LoaderStratgies which deal with related objects."""
 
     __slots__ = "mapper", "target", "uselist", "entity"
@@ -624,7 +650,7 @@ class AbstractRelationshipLoader(LoaderStrategy):
 
 @log.class_logger
 @relationships.RelationshipProperty.strategy_for(do_nothing=True)
-class DoNothingLoader(LoaderStrategy):
+class _DoNothingLoader(LoaderStrategy):
     """Relationship loader that makes no change to the object's state.
 
     Compared to NoLoader, this loader does not initialize the
@@ -637,7 +663,7 @@ class DoNothingLoader(LoaderStrategy):
 @log.class_logger
 @relationships.RelationshipProperty.strategy_for(lazy="noload")
 @relationships.RelationshipProperty.strategy_for(lazy=None)
-class NoLoader(AbstractRelationshipLoader):
+class _NoLoader(_AbstractRelationshipLoader):
     """Provide loading behavior for a :class:`.Relationship`
     with "lazy=None".
 
@@ -645,6 +671,13 @@ class NoLoader(AbstractRelationshipLoader):
 
     __slots__ = ()
 
+    @util.deprecated(
+        "2.1",
+        "The ``noload`` loader strategy is deprecated and will be removed "
+        "in a future release.  This option "
+        "produces incorrect results by returning ``None`` for related "
+        "items.",
+    )
     def init_class_attribute(self, mapper):
         self.is_class_level = True
 
@@ -681,8 +714,8 @@ class NoLoader(AbstractRelationshipLoader):
 @relationships.RelationshipProperty.strategy_for(lazy="raise")
 @relationships.RelationshipProperty.strategy_for(lazy="raise_on_sql")
 @relationships.RelationshipProperty.strategy_for(lazy="baked_select")
-class LazyLoader(
-    AbstractRelationshipLoader, util.MemoizedSlots, log.Identified
+class _LazyLoader(
+    _AbstractRelationshipLoader, util.MemoizedSlots, log.Identified
 ):
     """Provide loading behavior for a :class:`.Relationship`
     with "lazy=True", that is loads when first accessed.
@@ -735,10 +768,7 @@ class LazyLoader(
         ) = join_condition.create_lazy_clause(reverse_direction=True)
 
         if self.parent_property.order_by:
-            self._order_by = [
-                sql_util._deep_annotate(elem, {"_orm_adapt": True})
-                for elem in util.to_list(self.parent_property.order_by)
-            ]
+            self._order_by = util.to_list(self.parent_property.order_by)
         else:
             self._order_by = None
 
@@ -807,9 +837,7 @@ class LazyLoader(
         )
 
     def _memoized_attr__simple_lazy_clause(self):
-        lazywhere = sql_util._deep_annotate(
-            self._lazywhere, {"_orm_adapt": True}
-        )
+        lazywhere = self._lazywhere
 
         criterion, bind_to_col = (lazywhere, self._bind_to_col)
 
@@ -1028,8 +1056,7 @@ class LazyLoader(
         stmt = Select._create_raw_select(
             _raw_columns=[clauseelement],
             _propagate_attrs=clauseelement._propagate_attrs,
-            _label_style=LABEL_STYLE_TABLENAME_PLUS_COL,
-            _compile_options=ORMCompileState.default_compile_options,
+            _compile_options=_ORMCompileState.default_compile_options,
         )
         load_options = QueryContext.default_load_options
 
@@ -1083,7 +1110,7 @@ class LazyLoader(
             if self._raise_on_sql and not passive & PassiveFlag.NO_RAISE:
                 self._invoke_raise_load(state, passive, "raise_on_sql")
 
-            return loading.load_on_pk_identity(
+            return loading._load_on_pk_identity(
                 session,
                 stmt,
                 primary_key_identity,
@@ -1101,7 +1128,7 @@ class LazyLoader(
                 if (
                     rev.direction is interfaces.MANYTOONE
                     and rev._use_get
-                    and not isinstance(rev.strategy, LazyLoader)
+                    and not isinstance(rev.strategy, _LazyLoader)
                 ):
                     strategy_options.Load._construct_for_existing_path(
                         compile_context.compile_options._current_path[
@@ -1109,18 +1136,15 @@ class LazyLoader(
                         ]
                     ).lazyload(rev).process_compile_state(compile_context)
 
-        stmt._with_context_options += (
-            (_lazyload_reverse, self.parent_property),
+        stmt = stmt._add_compile_state_func(
+            _lazyload_reverse, self.parent_property
         )
 
         lazy_clause, params = self._generate_lazy_clause(state, passive)
 
         if execution_options:
             execution_options = util.EMPTY_DICT.merge_with(
-                execution_options,
-                {
-                    "_sa_orm_load_options": load_options,
-                },
+                execution_options, {"_sa_orm_load_options": load_options}
             )
         else:
             execution_options = {
@@ -1209,7 +1233,7 @@ class LazyLoader(
                 InstanceState._instance_level_callable_processor
             )(
                 mapper.class_manager,
-                LoadLazyAttribute(
+                _LoadLazyAttribute(
                     key,
                     self,
                     loadopt,
@@ -1239,7 +1263,7 @@ class LazyLoader(
             populators["new"].append((self.key, reset_for_lazy_callable))
 
 
-class LoadLazyAttribute:
+class _LoadLazyAttribute:
     """semi-serializable loader object used by LazyLoader
 
     Historically, this object would be carried along with instances that
@@ -1291,7 +1315,7 @@ class LoadLazyAttribute:
         )
 
 
-class PostLoader(AbstractRelationshipLoader):
+class _PostLoader(_AbstractRelationshipLoader):
     """A relationship loader that emits a second SELECT statement."""
 
     __slots__ = ()
@@ -1339,7 +1363,7 @@ class PostLoader(AbstractRelationshipLoader):
                     }
                 )
 
-        if loading.PostLoad.path_exists(
+        if loading._PostLoad.path_exists(
             context, effective_path, self.parent_property
         ):
             return effective_path, False, execution_options, recursion_depth
@@ -1368,7 +1392,7 @@ class PostLoader(AbstractRelationshipLoader):
 
 
 @relationships.RelationshipProperty.strategy_for(lazy="immediate")
-class ImmediateLoader(PostLoader):
+class _ImmediateLoader(_PostLoader):
     __slots__ = ("join_depth",)
 
     def __init__(self, parent, strategy_key):
@@ -1410,7 +1434,7 @@ class ImmediateLoader(PostLoader):
         else:
             flags = attributes.PASSIVE_OFF | PassiveFlag.NO_RAISE
 
-        loading.PostLoad.callable_for_path(
+        loading._PostLoad.callable_for_path(
             context,
             effective_path,
             self.parent,
@@ -1469,7 +1493,7 @@ class ImmediateLoader(PostLoader):
 
 @log.class_logger
 @relationships.RelationshipProperty.strategy_for(lazy="subquery")
-class SubqueryLoader(PostLoader):
+class _SubqueryLoader(_PostLoader):
     __slots__ = ("join_depth",)
 
     def __init__(self, parent, strategy_key):
@@ -1773,7 +1797,7 @@ class SubqueryLoader(PostLoader):
                     util.to_list(self.parent_property.order_by)
                 )
 
-            q = q._add_context_option(
+            q = q._add_compile_state_func(
                 _setup_outermost_orderby, self.parent_property
             )
 
@@ -1823,9 +1847,12 @@ class SubqueryLoader(PostLoader):
             # to work with baked query, the parameters may have been
             # updated since this query was created, so take these into account
 
-            rows = list(q.params(self.params))
-            for k, v in itertools.groupby(rows, lambda x: x[1:]):
-                self._data[k].extend(vv[0] for vv in v)
+            data = self._data
+            for row in q.params(self.params):
+                # group plain tuples rather than Row slices, which would
+                # incur Row construction and Row.__eq__ per row
+                tup = row._to_tuple_instance()
+                data[tup[1:]].append(tup[0])
 
         def loader(self, state, dict_, row):
             if self._data is None:
@@ -1877,12 +1904,12 @@ class SubqueryLoader(PostLoader):
         # compiled query but swapping the params, seems only marginally
         # less time spent but more complicated
         orig_query = context.query._execution_options.get(
-            ("orig_query", SubqueryLoader), context.query
+            ("orig_query", _SubqueryLoader), context.query
         )
 
         # make a new compile_state for the query that's probably cached, but
         # we're sort of undoing a bit of that caching :(
-        compile_state_cls = ORMCompileState._get_plugin_class_for_plugin(
+        compile_state_cls = _ORMCompileState._get_plugin_class_for_plugin(
             orig_query, "orm"
         )
 
@@ -1939,7 +1966,7 @@ class SubqueryLoader(PostLoader):
         q._execution_options = context.query._execution_options.merge_with(
             context.execution_options,
             {
-                ("orig_query", SubqueryLoader): orig_query,
+                ("orig_query", _SubqueryLoader): orig_query,
                 ("subquery_paths", None): (subq_path, rewritten_path),
             },
         )
@@ -2008,7 +2035,7 @@ class SubqueryLoader(PostLoader):
         if not run_loader:
             return
 
-        if not isinstance(context.compile_state, ORMSelectCompileState):
+        if not isinstance(context.compile_state, _ORMSelectCompileState):
             # issue 7505 - subqueryload() in 1.3 and previous would silently
             # degrade for from_statement() without warning. this behavior
             # is restored here
@@ -2127,7 +2154,7 @@ class SubqueryLoader(PostLoader):
 @log.class_logger
 @relationships.RelationshipProperty.strategy_for(lazy="joined")
 @relationships.RelationshipProperty.strategy_for(lazy=False)
-class JoinedLoader(AbstractRelationshipLoader):
+class _JoinedLoader(_AbstractRelationshipLoader):
     """Provide loading behavior for a :class:`.Relationship`
     using joined eager loading.
 
@@ -2453,10 +2480,7 @@ class JoinedLoader(AbstractRelationshipLoader):
         # whether or not the Query will wrap the selectable in a subquery,
         # and then attach eager load joins to that (i.e., in the case of
         # LIMIT/OFFSET etc.)
-        should_nest_selectable = (
-            compile_state.multi_row_eager_loaders
-            and compile_state._should_nest_selectable
-        )
+        should_nest_selectable = compile_state._should_nest_selectable
 
         query_entity_key = None
 
@@ -2950,7 +2974,7 @@ class JoinedLoader(AbstractRelationshipLoader):
 
 @log.class_logger
 @relationships.RelationshipProperty.strategy_for(lazy="selectin")
-class SelectInLoader(PostLoader, util.MemoizedSlots):
+class _SelectInLoader(_PostLoader, util.MemoizedSlots):
     __slots__ = (
         "join_depth",
         "omit_join",
@@ -2967,16 +2991,33 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
             "in_expr",
             "pk_cols",
             "zero_idx",
+            "n_pk",
             "child_lookup_cols",
         ],
     )
 
     _chunksize = 500
 
+    @classmethod
+    def _set_chunksize(cls, loadopt) -> int:
+        if loadopt is None or hasattr(loadopt, "local_opts") is None:
+            return cls._chunksize
+
+        user_input = loadopt.local_opts.get("chunksize", None)
+        if user_input is None:
+            return cls._chunksize
+        elif not isinstance(user_input, int) or user_input < 1:
+            raise sa_exc.ArgumentError(
+                f"'chunksize={user_input}' is not an appropriate input, "
+                f"please use a positive non-zero integer."
+            )
+        return user_input
+
     def __init__(self, parent, strategy_key):
         super().__init__(parent, strategy_key)
         self.join_depth = self.parent_property.join_depth
         is_m2o = self.parent_property.direction is interfaces.MANYTOONE
+        is_m2m = self.parent_property.direction is interfaces.MANYTOMANY
 
         if self.parent_property.omit_join is not None:
             self.omit_join = self.parent_property.omit_join
@@ -2986,6 +3027,9 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
             )
             if is_m2o:
                 self.omit_join = lazyloader.use_get
+            elif is_m2m and not self.parent_property._is_self_referential:
+                join_cond = self.parent_property._join_condition
+                self.omit_join = join_cond.secondary_covers_parent_primary_key
             else:
                 self.omit_join = self.parent._get_clause[0].compare(
                     lazyloader._rev_lazywhere,
@@ -3023,7 +3067,9 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
             in_expr = fk_cols[0]
             zero_idx = True
 
-        return self.query_info(False, False, in_expr, pk_cols, zero_idx, None)
+        return self.query_info(
+            False, False, in_expr, pk_cols, zero_idx, len(pk_cols), None
+        )
 
     def _init_for_omit_join_m2o(self):
         pk_cols = self.mapper.primary_key
@@ -3038,7 +3084,7 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
         lookup_cols = [lazyloader._equated_columns[pk] for pk in pk_cols]
 
         return self.query_info(
-            True, False, in_expr, pk_cols, zero_idx, lookup_cols
+            True, False, in_expr, pk_cols, zero_idx, len(pk_cols), lookup_cols
         )
 
     def _init_for_join(self):
@@ -3053,7 +3099,9 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
         else:
             in_expr = pk_cols[0]
             zero_idx = True
-        return self.query_info(False, True, in_expr, pk_cols, zero_idx, None)
+        return self.query_info(
+            False, True, in_expr, pk_cols, zero_idx, len(pk_cols), None
+        )
 
     def init_class_attribute(self, mapper):
         self.parent_property._get_strategy(
@@ -3135,7 +3183,7 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
         else:
             effective_entity = self.entity
 
-        loading.PostLoad.callable_for_path(
+        loading._PostLoad.callable_for_path(
             context,
             selectin_path,
             self.parent,
@@ -3169,17 +3217,20 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
 
             mapper = self.parent
 
+            # attribute keys for the lookup columns; when these are
+            # present in a state's dict, reading them directly is
+            # equivalent to the PASSIVE_NO_FETCH attribute lookup below.
+            # whether or not a key is present can vary per state, e.g.
+            # individual instances may have the attribute expired or
+            # deferred, so this is determined state-by-state
+            get_related_ident = mapper._state_ident_getter(
+                query_info.child_lookup_cols,
+                passive=attributes.PASSIVE_NO_FETCH,
+            )
+
             for state, overwrite in states:
                 state_dict = state.dict
-                related_ident = tuple(
-                    mapper._get_state_attr_by_column(
-                        state,
-                        state_dict,
-                        lk,
-                        passive=attributes.PASSIVE_NO_FETCH,
-                    )
-                    for lk in query_info.child_lookup_cols
-                )
+                related_ident = get_related_ident(state, state_dict)
                 # if the loaded parent objects do not have the foreign key
                 # to the related item loaded, then degrade into the joined
                 # version of selectinload
@@ -3221,31 +3272,37 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
                 ]
                 in_expr = effective_entity._adapt_element(in_expr)
 
-        bundle_ent = orm_util.Bundle("pk", *pk_cols)
-        bundle_sql = bundle_ent.__clause_element__()
-
         entity_sql = effective_entity.__clause_element__()
         q = Select._create_raw_select(
-            _raw_columns=[bundle_sql, entity_sql],
-            _label_style=LABEL_STYLE_TABLENAME_PLUS_COL,
-            _compile_options=ORMCompileState.default_compile_options,
+            _raw_columns=[*pk_cols, entity_sql],
+            _compile_options=_ORMCompileState.default_compile_options,
             _propagate_attrs={
                 "compile_state_plugin": "orm",
                 "plugin_subject": effective_entity,
             },
         )
 
-        if not query_info.load_with_join:
-            # the Bundle we have in the "omit_join" case is against raw, non
-            # annotated columns, so to ensure the Query knows its primary
-            # entity, we add it explicitly.  If we made the Bundle against
-            # annotated columns, we hit a performance issue in this specific
-            # case, which is detailed in issue #4347.
+        if (
+            self.parent_property.secondary is not None
+            and self.omit_join is True
+        ):
+            # The secondaryjoin condition is used to connect the
+            # secondary table to the related entity,
+            # and is required for composite foreign keys where SQLAlchemy
+            # cannot determine the join condition.
+            q = q.select_from(self.parent_property.secondary).join(
+                entity_sql, self.parent_property._join_condition.secondaryjoin
+            )
+        elif not query_info.load_with_join:
+            # the pk columns in the "omit_join" case are raw, non-annotated
+            # columns, so to ensure the Query knows its primary entity, we
+            # add it explicitly.  Using annotated columns here would hit a
+            # performance issue detailed in issue #4347.
             q = q.select_from(effective_entity)
         else:
-            # in the non-omit_join case, the Bundle is against the annotated/
-            # mapped column of the parent entity, but the #4347 issue does not
-            # occur in this case.
+            # in the non-omit_join case, the pk columns are against the
+            # annotated/mapped column of the parent entity, but the #4347
+            # issue does not occur in this case.
             q = q.select_from(self._parent_alias).join(
                 getattr(self._parent_alias, self.parent_property.key).of_type(
                     effective_entity
@@ -3340,9 +3397,11 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
                         util.to_list(self.parent_property.order_by)
                     )
 
-                q = q._add_context_option(
+                q = q._add_compile_state_func(
                     _setup_outermost_orderby, self.parent_property
                 )
+
+        chunksize = self._set_chunksize(loadopt)
 
         if query_info.load_only_child:
             self._load_via_child(
@@ -3352,10 +3411,16 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
                 q,
                 context,
                 execution_options,
+                chunksize,
             )
         else:
             self._load_via_parent(
-                our_states, query_info, q, context, execution_options
+                our_states,
+                query_info,
+                q,
+                context,
+                execution_options,
+                chunksize,
             )
 
     def _load_via_child(
@@ -3366,27 +3431,29 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
         q,
         context,
         execution_options,
+        chunksize,
     ):
         uselist = self.uselist
+        n_pk = query_info.n_pk
+        zero_idx = query_info.zero_idx
 
-        # this sort is really for the benefit of the unit tests
-        our_keys = sorted(our_states)
+        # historically this used sorted instead of list to add determinism in
+        # tests. Since dicts are now ordered it's likely no longer needed
+        our_keys = list(our_states)
         while our_keys:
-            chunk = our_keys[0 : self._chunksize]
-            our_keys = our_keys[self._chunksize :]
-            data = {
-                k: v
-                for k, v in context.session.execute(
-                    q,
-                    params={
-                        "primary_keys": [
-                            key[0] if query_info.zero_idx else key
-                            for key in chunk
-                        ]
-                    },
-                    execution_options=execution_options,
-                ).unique()
-            }
+            chunk = our_keys[0:chunksize]
+            our_keys = our_keys[chunksize:]
+            primary_keys = [key[0] if zero_idx else key for key in chunk]
+            result = context.session.execute(
+                q,
+                params={"primary_keys": primary_keys},
+                execution_options=execution_options,
+            )
+            if result.context is not None and result.context.requires_uniquing:
+                rows = result.unique()
+            else:
+                rows = result._raw_all_tuples()
+            data = {row[:n_pk]: row[n_pk] for row in rows}
 
             for key in chunk:
                 # for a real foreign key and no concurrent changes to the
@@ -3414,30 +3481,33 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
             state.get_impl(self.key).set_committed_value(state, dict_, None)
 
     def _load_via_parent(
-        self, our_states, query_info, q, context, execution_options
+        self, our_states, query_info, q, context, execution_options, chunksize
     ):
         uselist = self.uselist
+        n_pk = query_info.n_pk
+        zero_idx = query_info.zero_idx
         _empty_result = () if uselist else None
 
         while our_states:
-            chunk = our_states[0 : self._chunksize]
-            our_states = our_states[self._chunksize :]
+            chunk = our_states[0:chunksize]
+            our_states = our_states[chunksize:]
 
             primary_keys = [
-                key[0] if query_info.zero_idx else key
-                for key, state, state_dict, overwrite in chunk
+                item[0][0] if zero_idx else item[0] for item in chunk
             ]
 
+            result = context.session.execute(
+                q,
+                params={"primary_keys": primary_keys},
+                execution_options=execution_options,
+            )
+            if result.context is not None and result.context.requires_uniquing:
+                rows = result.unique()
+            else:
+                rows = result._raw_all_tuples()
             data = collections.defaultdict(list)
-            for k, v in itertools.groupby(
-                context.session.execute(
-                    q,
-                    params={"primary_keys": primary_keys},
-                    execution_options=execution_options,
-                ).unique(),
-                lambda x: x[0],
-            ):
-                data[k].extend(vv[1] for vv in v)
+            for row in rows:
+                data[row[:n_pk]].append(row[n_pk])
 
             for key, state, state_dict, overwrite in chunk:
                 if not overwrite and self.key in state_dict:
@@ -3463,7 +3533,7 @@ class SelectInLoader(PostLoader, util.MemoizedSlots):
                     )
 
 
-def single_parent_validator(desc, prop):
+def _single_parent_validator(desc, prop):
     def _do_check(state, value, oldvalue, initiator):
         if value is not None and initiator.key == prop.key:
             hasparent = initiator.hasparent(attributes.instance_state(value))

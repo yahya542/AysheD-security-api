@@ -42,6 +42,10 @@ from .. import log
 from .. import util
 from ..sql import compiler
 from ..sql import util as sql_util
+from ..util.typing import Never
+from ..util.typing import TupleAny
+from ..util.typing import TypeVarTuple
+from ..util.typing import Unpack
 
 if typing.TYPE_CHECKING:
     from . import CursorResult
@@ -78,6 +82,7 @@ if typing.TYPE_CHECKING:
 
 
 _T = TypeVar("_T", bound=Any)
+_Ts = TypeVarTuple("_Ts")
 _EMPTY_EXECUTION_OPTS: _ExecuteOptions = util.EMPTY_DICT
 NO_OPTIONS: Mapping[str, Any] = util.EMPTY_DICT
 
@@ -246,6 +251,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         insertmanyvalues_page_size: int = ...,
         schema_translate_map: Optional[SchemaTranslateMapType] = ...,
         preserve_rowcount: bool = False,
+        driver_column_names: bool = False,
         **opt: Any,
     ) -> Connection: ...
 
@@ -508,6 +514,18 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             :ref:`orm_queryguide_execution_options` - documentation on all
             ORM-specific execution options
 
+        :param driver_column_names: When True, the returned
+         :class:`_engine.CursorResult` will use the column names as written in
+         ``cursor.description`` to set up the keys for the result set,
+         including the names of columns for the :class:`_engine.Row` object as
+         well as the dictionary keys when using :attr:`_engine.Row._mapping`.
+         On backends that use "name normalization" such as Oracle Database to
+         correct for lower case names being converted to all uppercase, this
+         behavior is turned off and the raw UPPERCASE names in
+         cursor.description will be present.
+
+         .. versionadded:: 2.1
+
         """  # noqa
         if self._has_events or self.engine._has_events:
             self.dispatch.set_connection_execution_options(self, opt)
@@ -517,8 +535,6 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
     def get_execution_options(self) -> _ExecuteOptions:
         """Get the non-SQL options which will take effect during execution.
-
-        .. versionadded:: 1.3
 
         .. seealso::
 
@@ -1266,10 +1282,21 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             self._dbapi_connection = None
         self.__can_reconnect = False
 
+    # special case to handle mypy issue:
+    # https://github.com/python/mypy/issues/20651
     @overload
     def scalar(
         self,
-        statement: TypedReturnsRows[Tuple[_T]],
+        statement: TypedReturnsRows[Never],
+        parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
+        execution_options: Optional[CoreExecuteOptionsParameter] = None,
+    ) -> Optional[Any]: ...
+
+    @overload
+    def scalar(
+        self,
+        statement: TypedReturnsRows[_T],
         parameters: Optional[_CoreSingleExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
@@ -1316,7 +1343,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     @overload
     def scalars(
         self,
-        statement: TypedReturnsRows[Tuple[_T]],
+        statement: TypedReturnsRows[_T],
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
@@ -1359,11 +1386,11 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     @overload
     def execute(
         self,
-        statement: TypedReturnsRows[_T],
+        statement: TypedReturnsRows[Unpack[_Ts]],
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> CursorResult[_T]: ...
+    ) -> CursorResult[Unpack[_Ts]]: ...
 
     @overload
     def execute(
@@ -1372,7 +1399,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> CursorResult[Any]: ...
+    ) -> CursorResult[Unpack[TupleAny]]: ...
 
     def execute(
         self,
@@ -1380,7 +1407,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         r"""Executes a SQL statement construct and returns a
         :class:`_engine.CursorResult`.
 
@@ -1429,7 +1456,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         func: FunctionElement[Any],
         distilled_parameters: _CoreMultiExecuteParams,
         execution_options: CoreExecuteOptionsParameter,
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         """Execute a sql.FunctionElement object."""
 
         return self._execute_clauseelement(
@@ -1444,9 +1471,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
     ) -> Any:
         """Execute a schema.ColumnDefault object."""
 
-        execution_options = self._execution_options.merge_with(
-            execution_options
-        )
+        exec_opts = self._execution_options.merge_with(execution_options)
 
         event_multiparams: Optional[_CoreMultiExecuteParams]
         event_params: Optional[_CoreAnyExecuteParams]
@@ -1462,7 +1487,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                 event_multiparams,
                 event_params,
             ) = self._invoke_before_exec_event(
-                default, distilled_parameters, execution_options
+                default, distilled_parameters, exec_opts
             )
         else:
             event_multiparams = event_params = None
@@ -1474,7 +1499,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
             dialect = self.dialect
             ctx = dialect.execution_ctx_cls._init_default(
-                dialect, self, conn, execution_options
+                dialect, self, conn, exec_opts
             )
         except (exc.PendingRollbackError, exc.ResourceClosedError):
             raise
@@ -1489,7 +1514,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                 default,
                 event_multiparams,
                 event_params,
-                execution_options,
+                exec_opts,
                 ret,
             )
 
@@ -1500,7 +1525,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         ddl: ExecutableDDLElement,
         distilled_parameters: _CoreMultiExecuteParams,
         execution_options: CoreExecuteOptionsParameter,
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         """Execute a schema.DDL object."""
 
         exec_opts = ddl._execution_options.merge_with(
@@ -1595,10 +1620,10 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         elem: Executable,
         distilled_parameters: _CoreMultiExecuteParams,
         execution_options: CoreExecuteOptionsParameter,
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         """Execute a sql.ClauseElement object."""
 
-        execution_options = elem._execution_options.merge_with(
+        exec_opts = elem._execution_options.merge_with(
             self._execution_options, execution_options
         )
 
@@ -1610,7 +1635,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                 event_multiparams,
                 event_params,
             ) = self._invoke_before_exec_event(
-                elem, distilled_parameters, execution_options
+                elem, distilled_parameters, exec_opts
             )
 
         if distilled_parameters:
@@ -1624,33 +1649,34 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
         dialect = self.dialect
 
-        schema_translate_map = execution_options.get(
-            "schema_translate_map", None
-        )
+        schema_translate_map = exec_opts.get("schema_translate_map", None)
 
-        compiled_cache: Optional[CompiledCacheType] = execution_options.get(
+        compiled_cache: Optional[CompiledCacheType] = exec_opts.get(
             "compiled_cache", self.engine._compiled_cache
         )
 
-        compiled_sql, extracted_params, cache_hit = elem._compile_w_cache(
-            dialect=dialect,
-            compiled_cache=compiled_cache,
-            column_keys=keys,
-            for_executemany=for_executemany,
-            schema_translate_map=schema_translate_map,
-            linting=self.dialect.compiler_linting | compiler.WARN_LINTING,
+        compiled_sql, extracted_params, param_dict, cache_hit = (
+            elem._compile_w_cache(
+                dialect=dialect,
+                compiled_cache=compiled_cache,
+                column_keys=keys,
+                for_executemany=for_executemany,
+                schema_translate_map=schema_translate_map,
+                linting=self.dialect.compiler_linting | compiler.WARN_LINTING,
+            )
         )
         ret = self._execute_context(
             dialect,
             dialect.execution_ctx_cls._init_compiled,
             compiled_sql,
             distilled_parameters,
-            execution_options,
+            exec_opts,
             compiled_sql,
             distilled_parameters,
             elem,
             extracted_params,
             cache_hit=cache_hit,
+            param_dict=param_dict,
         )
         if has_events:
             self.dispatch.after_execute(
@@ -1658,57 +1684,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                 elem,
                 event_multiparams,
                 event_params,
-                execution_options,
-                ret,
-            )
-        return ret
-
-    def _execute_compiled(
-        self,
-        compiled: Compiled,
-        distilled_parameters: _CoreMultiExecuteParams,
-        execution_options: CoreExecuteOptionsParameter = _EMPTY_EXECUTION_OPTS,
-    ) -> CursorResult[Any]:
-        """Execute a sql.Compiled object.
-
-        TODO: why do we have this?   likely deprecate or remove
-
-        """
-
-        execution_options = compiled.execution_options.merge_with(
-            self._execution_options, execution_options
-        )
-
-        if self._has_events or self.engine._has_events:
-            (
-                compiled,
-                distilled_parameters,
-                event_multiparams,
-                event_params,
-            ) = self._invoke_before_exec_event(
-                compiled, distilled_parameters, execution_options
-            )
-
-        dialect = self.dialect
-
-        ret = self._execute_context(
-            dialect,
-            dialect.execution_ctx_cls._init_compiled,
-            compiled,
-            distilled_parameters,
-            execution_options,
-            compiled,
-            distilled_parameters,
-            None,
-            None,
-        )
-        if self._has_events or self.engine._has_events:
-            self.dispatch.after_execute(
-                self,
-                compiled,
-                event_multiparams,
-                event_params,
-                execution_options,
+                exec_opts,
                 ret,
             )
         return ret
@@ -1718,7 +1694,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         statement: str,
         parameters: Optional[_DBAPIAnyExecuteParams] = None,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         r"""Executes a string SQL statement on the DBAPI cursor directly,
         without any SQL compilation steps.
 
@@ -1773,9 +1749,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
 
         distilled_parameters = _distill_raw_params(parameters)
 
-        execution_options = self._execution_options.merge_with(
-            execution_options
-        )
+        exec_opts = self._execution_options.merge_with(execution_options)
 
         dialect = self.dialect
         ret = self._execute_context(
@@ -1783,7 +1757,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             dialect.execution_ctx_cls._init_statement,
             statement,
             None,
-            execution_options,
+            exec_opts,
             statement,
             distilled_parameters,
         )
@@ -1799,7 +1773,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         execution_options: _ExecuteOptions,
         *args: Any,
         **kw: Any,
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         """Create an :class:`.ExecutionContext` and execute, returning
         a :class:`_engine.CursorResult`."""
 
@@ -1855,7 +1829,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         context: ExecutionContext,
         statement: Union[str, Compiled],
         parameters: Optional[_AnyMultiExecuteParams],
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         """continue the _execute_context() method for a single DBAPI
         cursor.execute() or cursor.executemany() call.
 
@@ -1886,40 +1860,40 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         else:
             effective_parameters = parameters
 
-        if self._has_events or self.engine._has_events:
-            for fn in self.dispatch.before_cursor_execute:
-                str_statement, effective_parameters = fn(
-                    self,
-                    cursor,
-                    str_statement,
-                    effective_parameters,
-                    context,
-                    context.executemany,
-                )
-
-        if self._echo:
-            self._log_info(str_statement)
-
-            stats = context._get_cache_stats()
-
-            if not self.engine.hide_parameters:
-                self._log_info(
-                    "[%s] %r",
-                    stats,
-                    sql_util._repr_params(
-                        effective_parameters,
-                        batches=10,
-                        ismulti=context.executemany,
-                    ),
-                )
-            else:
-                self._log_info(
-                    "[%s] [SQL parameters hidden due to hide_parameters=True]",
-                    stats,
-                )
-
         evt_handled: bool = False
         try:
+            if self._has_events or self.engine._has_events:
+                for fn in self.dispatch.before_cursor_execute:
+                    str_statement, effective_parameters = fn(
+                        self,
+                        cursor,
+                        str_statement,
+                        effective_parameters,
+                        context,
+                        context.executemany,
+                    )
+
+            if self._echo:
+                self._log_info(str_statement)
+
+                stats = context._get_cache_stats()
+
+                if not self.engine.hide_parameters:
+                    self._log_info(
+                        "[%s] %r",
+                        stats,
+                        sql_util._repr_params(
+                            effective_parameters,
+                            batches=10,
+                            ismulti=context.executemany,
+                        ),
+                    )
+                else:
+                    self._log_info(
+                        "[%s] [SQL parameters hidden due to "
+                        "hide_parameters=True]",
+                        stats,
+                    )
             if context.execute_style is ExecuteStyle.EXECUTEMANY:
                 effective_parameters = cast(
                     "_CoreMultiExecuteParams", effective_parameters
@@ -1995,7 +1969,7 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         self,
         dialect: Dialect,
         context: ExecutionContext,
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         """continue the _execute_context() method for an "insertmanyvalues"
         operation, which will invoke DBAPI
         cursor.execute() one or more times with individual log and
@@ -2023,13 +1997,6 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             )
         else:
             do_execute_dispatch = ()
-
-        if engine_events:
-            _WORKAROUND_ISSUE_13018 = getattr(
-                self, "_WORKAROUND_ISSUE_13018", False
-            )
-        else:
-            _WORKAROUND_ISSUE_13018 = False
 
         if self._echo:
             stats = context._get_cache_stats() + " (insertmanyvalues)"
@@ -2067,54 +2034,54 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             sub_stmt = imv_batch.replaced_statement
             sub_params = imv_batch.replaced_parameters
 
-            if engine_events:
-                for fn in self.dispatch.before_cursor_execute:
-                    sub_stmt, sub_params = fn(
-                        self,
-                        cursor,
-                        sub_stmt,
-                        sub_params,
-                        context,
-                        True,
-                    )
-
-            if self._echo:
-                self._log_info(sql_util._long_statement(sub_stmt))
-
-                imv_stats = f""" {imv_batch.batchnum}/{
-                            imv_batch.total_batches
-                } ({
-                    'ordered'
-                    if imv_batch.rows_sorted else 'unordered'
-                }{
-                    '; batch not supported'
-                    if imv_batch.is_downgraded
-                    else ''
-                })"""
-
-                if imv_batch.batchnum == 1:
-                    stats += imv_stats
-                else:
-                    stats = f"insertmanyvalues{imv_stats}"
-
-                if not self.engine.hide_parameters:
-                    self._log_info(
-                        "[%s] %r",
-                        stats,
-                        sql_util._repr_params(
-                            sub_params,
-                            batches=10,
-                            ismulti=False,
-                        ),
-                    )
-                else:
-                    self._log_info(
-                        "[%s] [SQL parameters hidden due to "
-                        "hide_parameters=True]",
-                        stats,
-                    )
-
             try:
+                if engine_events:
+                    for fn in self.dispatch.before_cursor_execute:
+                        sub_stmt, sub_params = fn(
+                            self,
+                            cursor,
+                            sub_stmt,
+                            sub_params,
+                            context,
+                            True,
+                        )
+
+                if self._echo:
+                    self._log_info(sql_util._long_statement(sub_stmt))
+
+                    imv_stats = f""" {imv_batch.batchnum}/{
+                                imv_batch.total_batches
+                    } ({
+                        'ordered'
+                        if imv_batch.rows_sorted else 'unordered'
+                    }{
+                        '; batch not supported'
+                        if imv_batch.is_downgraded
+                        else ''
+                    })"""
+
+                    if imv_batch.batchnum == 1:
+                        stats += imv_stats
+                    else:
+                        stats = f"insertmanyvalues{imv_stats}"
+
+                    if not self.engine.hide_parameters:
+                        self._log_info(
+                            "[%s] %r",
+                            stats,
+                            sql_util._repr_params(
+                                sub_params,
+                                batches=10,
+                                ismulti=False,
+                            ),
+                        )
+                    else:
+                        self._log_info(
+                            "[%s] [SQL parameters hidden due to "
+                            "hide_parameters=True]",
+                            stats,
+                        )
+
                 for fn in do_execute_dispatch:
                     if fn(
                         cursor,
@@ -2131,6 +2098,15 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                         context,
                     )
 
+                if engine_events:
+                    self.dispatch.after_cursor_execute(
+                        self,
+                        cursor,
+                        sub_stmt,
+                        sub_params,
+                        context,
+                        context.executemany,
+                    )
             except BaseException as e:
                 self._handle_dbapi_exception(
                     e,
@@ -2139,17 +2115,6 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                     cursor,
                     context,
                     is_sub_exec=True,
-                )
-
-            if engine_events:
-                self.dispatch.after_cursor_execute(
-                    self,
-                    cursor,
-                    # TODO: this will be fixed by #13018
-                    sub_stmt if _WORKAROUND_ISSUE_13018 else str_statement,
-                    sub_params if _WORKAROUND_ISSUE_13018 else parameters,
-                    context,
-                    context.executemany,
                 )
 
             if preserve_rowcount:
@@ -2187,16 +2152,17 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
         terminates at _execute_context().
 
         """
-        if self._has_events or self.engine._has_events:
-            for fn in self.dispatch.before_cursor_execute:
-                statement, parameters = fn(
-                    self, cursor, statement, parameters, context, False
-                )
-
-        if self._echo:
-            self._log_info(statement)
-            self._log_info("[raw sql] %r", parameters)
         try:
+            if self._has_events or self.engine._has_events:
+                for fn in self.dispatch.before_cursor_execute:
+                    statement, parameters = fn(
+                        self, cursor, statement, parameters, context, False
+                    )
+
+            if self._echo:
+                self._log_info(statement)
+                self._log_info("[raw sql] %r", parameters)
+
             for fn in (
                 ()
                 if not self.dialect._has_events
@@ -2206,14 +2172,14 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
                     break
             else:
                 self.dialect.do_execute(cursor, statement, parameters, context)
+
+            if self._has_events or self.engine._has_events:
+                self.dispatch.after_cursor_execute(
+                    self, cursor, statement, parameters, context, False
+                )
         except BaseException as e:
             self._handle_dbapi_exception(
                 e, statement, parameters, cursor, context
-            )
-
-        if self._has_events or self.engine._has_events:
-            self.dispatch.after_cursor_execute(
-                self, cursor, statement, parameters, context, False
             )
 
     def _safe_close_cursor(self, cursor: DBAPICursor) -> None:
@@ -2278,7 +2244,8 @@ class Connection(ConnectionEventsTarget, inspection.Inspectable["Inspector"]):
             # non-DBAPI error - if we already got a context,
             # or there's no string statement, don't wrap it
             should_wrap = isinstance(e, self.dialect.loaded_dbapi.Error) or (
-                statement is not None
+                not isinstance(e, exc.StatementError)
+                and statement is not None
                 and context is None
                 and not is_exit_exception
             )
@@ -3139,8 +3106,6 @@ class Engine(
 
     def get_execution_options(self) -> _ExecuteOptions:
         """Get the non-SQL options which will take effect during execution.
-
-        .. versionadded: 1.3
 
         .. seealso::
 

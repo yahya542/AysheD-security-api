@@ -48,6 +48,18 @@ class SuiteRequirements(Requirements):
         return exclusions.open()
 
     @property
+    def create_table_as(self):
+        """target platform supports CREATE TABLE AS SELECT."""
+
+        return exclusions.closed()
+
+    @property
+    def create_temp_table_as(self):
+        """target platform supports CREATE TEMPORARY TABLE AS SELECT."""
+
+        return exclusions.closed()
+
+    @property
     def table_ddl_if_exists(self):
         """target platform supports IF NOT EXISTS / IF EXISTS for tables."""
 
@@ -171,6 +183,16 @@ class SuiteRequirements(Requirements):
         """Target database must support a FOREIGN KEY constraint which names
         the same local column more than once, e.g.
         ``FOREIGN KEY (a, a) REFERENCES r (b, c)``.
+
+        """
+
+        return exclusions.closed()
+
+    @property
+    def repeated_remote_col_foreign_keys(self):
+        """Target database must support a FOREIGN KEY constraint which names
+        the same *remote* column more than once, e.g.
+        ``FOREIGN KEY (a, b) REFERENCES r (c, c)``.
 
         """
 
@@ -308,6 +330,21 @@ class SuiteRequirements(Requirements):
     @property
     def window_functions(self):
         """Target database must support window functions."""
+        return exclusions.closed()
+
+    @property
+    def window_range(self):
+        """Target backend supports RANGE in window functions with int frames"""
+        return exclusions.closed()
+
+    @property
+    def window_range_numeric(self):
+        """Target backend supports numeric values in RANGE"""
+        return exclusions.closed()
+
+    @property
+    def window_range_non_numeric(self):
+        """Target backend supports non-numeric values in RANGE"""
         return exclusions.closed()
 
     @property
@@ -804,6 +841,11 @@ class SuiteRequirements(Requirements):
         return exclusions.closed()
 
     @property
+    def create_or_replace_view(self):
+        """target database supports CREATE OR REPLACE VIEW"""
+        return exclusions.closed()
+
+    @property
     def index_reflection(self):
         return exclusions.open()
 
@@ -1287,6 +1329,14 @@ class SuiteRequirements(Requirements):
         return exclusions.open()
 
     @property
+    def aggregate_order_by(self):
+        """target database can use ORDER BY or equivalent in an aggregate
+        function, and dialect supports aggregate_order_by().
+
+        """
+        return exclusions.closed()
+
+    @property
     def recursive_fk_cascade(self):
         """target database must support ON DELETE CASCADE on a self-referential
         foreign key
@@ -1552,6 +1602,16 @@ class SuiteRequirements(Requirements):
         )
 
     @property
+    def only_linux(self):
+        return exclusions.only_if(self._running_on_linux())
+
+    def _running_on_linux(self):
+        return exclusions.LambdaPredicate(
+            lambda: platform.system() == "Linux",
+            description="running on Linux",
+        )
+
+    @property
     def timing_intensive(self):
         from . import config
 
@@ -1601,51 +1661,6 @@ class SuiteRequirements(Requirements):
                 return True
 
         return exclusions.skip_if(check)
-
-    @property
-    def up_to_date_typealias_type(self):
-        # this checks a particular quirk found in typing_extensions <=4.12.0
-        # using older python versions like 3.10 or 3.9, we use TypeAliasType
-        # from typing_extensions which does not provide for sufficient
-        # introspection prior to 4.13.0
-        def check(config):
-            import typing
-            import typing_extensions
-
-            TypeAliasType = getattr(
-                typing, "TypeAliasType", typing_extensions.TypeAliasType
-            )
-            TV = typing.TypeVar("TV")
-            TA_generic = TypeAliasType(  # type: ignore
-                "TA_generic", typing.List[TV], type_params=(TV,)
-            )
-            return hasattr(TA_generic[int], "__value__")
-
-        return exclusions.only_if(check)
-
-    @property
-    def python38(self):
-        return exclusions.only_if(
-            lambda: util.py38, "Python 3.8 or above required"
-        )
-
-    @property
-    def python39(self):
-        return exclusions.only_if(
-            lambda: util.py39, "Python 3.9 or above required"
-        )
-
-    @property
-    def python310(self):
-        return exclusions.only_if(
-            lambda: util.py310, "Python 3.10 or above required"
-        )
-
-    @property
-    def python311(self):
-        return exclusions.only_if(
-            lambda: util.py311, "Python 3.11 or above required"
-        )
 
     @property
     def python312(self):
@@ -1767,7 +1782,8 @@ class SuiteRequirements(Requirements):
 
     @property
     def async_dialect(self):
-        """dialect makes use of await_() to invoke operations on the DBAPI."""
+        """dialect makes use of await_() to invoke operations on the
+        DBAPI."""
 
         return exclusions.closed()
 

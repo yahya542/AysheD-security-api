@@ -14,6 +14,7 @@ from .base import BFILE
 from .base import BINARY_DOUBLE
 from .base import BINARY_FLOAT
 from .base import BLOB
+from .base import BOOLEAN
 from .base import CHAR
 from .base import CLOB
 from .base import DATE
@@ -35,6 +36,7 @@ from .base import VARCHAR2
 from .base import VECTOR
 from .base import VectorIndexConfig
 from .base import VectorIndexType
+from .json import JSON
 from .vector import SparseVector
 from .vector import VectorDistanceType
 from .vector import VectorStorageFormat
@@ -45,7 +47,7 @@ oracledb_async = type(
     "oracledb_async", (ModuleType,), {"dialect": oracledb.dialect_async}
 )
 
-base.dialect = dialect = cx_oracle.dialect
+base.dialect = dialect = oracledb.dialect
 
 __all__ = (
     "VARCHAR",
@@ -71,6 +73,7 @@ __all__ = (
     "NVARCHAR2",
     "ROWID",
     "REAL",
+    "BOOLEAN",
     "VECTOR",
     "VectorDistanceType",
     "VectorIndexType",
@@ -78,4 +81,5 @@ __all__ = (
     "VectorStorageFormat",
     "VectorStorageType",
     "SparseVector",
+    "JSON",
 )

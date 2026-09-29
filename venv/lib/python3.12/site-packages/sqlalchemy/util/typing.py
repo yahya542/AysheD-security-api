@@ -13,65 +13,52 @@ from collections import deque
 import collections.abc as collections_abc
 import re
 import sys
+from types import NoneType
 import typing
 from typing import Any
 from typing import Callable
 from typing import Dict
 from typing import ForwardRef
 from typing import Generic
+from typing import get_args
+from typing import get_origin
 from typing import Iterable
+from typing import Literal
 from typing import Mapping
 from typing import NewType
 from typing import NoReturn
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Set
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
-from typing import TypeVar
+from typing import TypeGuard
 from typing import Union
 
 import typing_extensions
 
-from . import compat
-
 if True:  # zimports removes the tailing comments
-    from typing_extensions import Annotated as Annotated  # 3.8
-    from typing_extensions import Concatenate as Concatenate  # 3.10
     from typing_extensions import (
         dataclass_transform as dataclass_transform,  # 3.11,
     )
-    from typing_extensions import Final as Final  # 3.8
-    from typing_extensions import final as final  # 3.8
-    from typing_extensions import get_args as get_args  # 3.10
-    from typing_extensions import get_origin as get_origin  # 3.10
-    from typing_extensions import Literal as Literal  # 3.8
     from typing_extensions import NotRequired as NotRequired  # 3.11
-    from typing_extensions import ParamSpec as ParamSpec  # 3.10
-    from typing_extensions import Protocol as Protocol  # 3.8
-    from typing_extensions import SupportsIndex as SupportsIndex  # 3.8
-    from typing_extensions import TypeAlias as TypeAlias  # 3.10
-    from typing_extensions import TypedDict as TypedDict  # 3.8
-    from typing_extensions import TypeGuard as TypeGuard  # 3.10
+    from typing_extensions import TypeVarTuple as TypeVarTuple  # 3.11
     from typing_extensions import Self as Self  # 3.11
     from typing_extensions import TypeAliasType as TypeAliasType  # 3.12
+    from typing_extensions import Unpack as Unpack  # 3.11
     from typing_extensions import Never as Never  # 3.11
     from typing_extensions import LiteralString as LiteralString  # 3.11
+    from typing_extensions import TypeVar as TypeVar  # 3.13 for default
+
 
 _T = TypeVar("_T", bound=Any)
 _KT = TypeVar("_KT")
-_KT_co = TypeVar("_KT_co", covariant=True)
-_KT_contra = TypeVar("_KT_contra", contravariant=True)
 _VT = TypeVar("_VT")
 _VT_co = TypeVar("_VT_co", covariant=True)
 
-if compat.py310:
-    # why they took until py310 to put this in stdlib is beyond me,
-    # I've been wanting it since py27
-    from types import NoneType as NoneType
-else:
-    NoneType = type(None)  # type: ignore
+TupleAny = Tuple[Any, ...]
 
 
 def is_fwd_none(typ: Any) -> bool:
@@ -80,6 +67,10 @@ def is_fwd_none(typ: Any) -> bool:
 
 _AnnotationScanType = Union[
     Type[Any], str, ForwardRef, NewType, TypeAliasType, "GenericProtocol[Any]"
+]
+
+_MatchedOnType = Union[
+    "GenericProtocol[Any]", TypeAliasType, NewType, Type[Any]
 ]
 
 
@@ -172,7 +163,7 @@ def de_stringify_annotation(
             # will always be Type.
             # the element here will be either ForwardRef or
             # Optional[ForwardRef]
-            return original_annotation  # type: ignore
+            return original_annotation  # type: ignore[return-value]
         else:
             _already_seen.add(annotation)
 
@@ -191,7 +182,7 @@ def de_stringify_annotation(
 
         return _copy_generic_annotation_with(annotation, elements)
 
-    return annotation  # type: ignore
+    return annotation  # type: ignore[return-value]
 
 
 def fixup_container_fwd_refs(
@@ -224,7 +215,7 @@ def fixup_container_fwd_refs(
         )
     ):
         # compat with py3.10 and earlier
-        return get_origin(type_).__class_getitem__(  # type: ignore
+        return get_origin(type_).__class_getitem__(  # type: ignore[no-any-return, union-attr]  # noqa: E501
             tuple(
                 [
                     ForwardRef(elem) if isinstance(elem, str) else elem
@@ -240,10 +231,10 @@ def _copy_generic_annotation_with(
 ) -> Type[_T]:
     if hasattr(annotation, "copy_with"):
         # List, Dict, etc. real generics
-        return annotation.copy_with(elements)  # type: ignore
+        return annotation.copy_with(elements)  # type: ignore[no-any-return]
     else:
         # Python builtins list, dict, etc.
-        return annotation.__origin__[elements]  # type: ignore
+        return annotation.__origin__[elements]  # type: ignore[no-any-return]
 
 
 def eval_expression(
@@ -340,11 +331,7 @@ def is_literal(type_: Any) -> bool:
 
 
 def is_newtype(type_: Optional[_AnnotationScanType]) -> TypeGuard[NewType]:
-    return hasattr(type_, "__supertype__")
-
-    # doesn't work in 3.8, 3.7 as it passes a closure, not an
-    # object instance
-    # isinstance(type, type_instances.NewType)
+    return isinstance(type_, _type_tuples.NewType)
 
 
 def is_generic(type_: _AnnotationScanType) -> TypeGuard[GenericProtocol[Any]]:
@@ -361,13 +348,6 @@ def is_pep695(type_: _AnnotationScanType) -> TypeGuard[TypeAliasType]:
             return False
         return is_pep695(type_.__origin__)
     return isinstance(type_, _type_instances.TypeAliasType)
-
-
-def flatten_newtype(type_: NewType) -> Type[Any]:
-    super_type = type_.__supertype__
-    while is_newtype(super_type):
-        super_type = super_type.__supertype__
-    return super_type  # type: ignore[return-value]
 
 
 def pep695_values(type_: _AnnotationScanType) -> Set[Any]:
@@ -407,11 +387,27 @@ def pep695_values(type_: _AnnotationScanType) -> Set[Any]:
         return {res}
 
 
+@overload
+def is_fwd_ref(
+    type_: _AnnotationScanType,
+    check_generic: bool = ...,
+    check_for_plain_string: Literal[False] = ...,
+) -> TypeGuard[ForwardRef]: ...
+
+
+@overload
+def is_fwd_ref(
+    type_: _AnnotationScanType,
+    check_generic: bool = ...,
+    check_for_plain_string: bool = ...,
+) -> TypeGuard[Union[str, ForwardRef]]: ...
+
+
 def is_fwd_ref(
     type_: _AnnotationScanType,
     check_generic: bool = False,
     check_for_plain_string: bool = False,
-) -> TypeGuard[ForwardRef]:
+) -> TypeGuard[Union[str, ForwardRef]]:
     if check_for_plain_string and isinstance(type_, str):
         return True
     elif isinstance(type_, _type_instances.ForwardRef):
@@ -436,6 +432,10 @@ def de_optionalize_union_types(type_: Type[Any]) -> Type[Any]: ...
 
 
 @overload
+def de_optionalize_union_types(type_: _MatchedOnType) -> _MatchedOnType: ...
+
+
+@overload
 def de_optionalize_union_types(
     type_: _AnnotationScanType,
 ) -> _AnnotationScanType: ...
@@ -447,33 +447,17 @@ def de_optionalize_union_types(
     """Given a type, filter out ``Union`` types that include ``NoneType``
     to not include the ``NoneType``.
 
-    Contains extra logic to work on non-flattened unions, unions that contain
-    ``None`` (seen in py38, 37)
-
     """
 
     if is_fwd_ref(type_):
         return _de_optionalize_fwd_ref_union_types(type_, False)
 
     elif is_union(type_) and includes_none(type_):
-        if compat.py39:
-            typ = set(type_.__args__)
-        else:
-            # py38, 37 - unions are not automatically flattened, can contain
-            # None rather than NoneType
-            stack_of_unions = deque([type_])
-            typ = set()
-            while stack_of_unions:
-                u_typ = stack_of_unions.popleft()
-                for elem in u_typ.__args__:
-                    if is_union(elem):
-                        stack_of_unions.append(elem)
-                    else:
-                        typ.add(elem)
-
-            typ.discard(None)  # type: ignore[arg-type,unused-ignore]
-
-        typ = {t for t in typ if t is not NoneType and not is_fwd_none(t)}
+        typ = {
+            t
+            for t in type_.__args__
+            if t is not NoneType and not is_fwd_none(t)
+        }
 
         return make_union_type(*typ)
 
@@ -550,7 +534,7 @@ def _de_optionalize_fwd_ref_union_types(
 def make_union_type(*types: _AnnotationScanType) -> Type[Any]:
     """Make a Union type."""
 
-    return Union[types]  # type: ignore
+    return Union[types]  # type: ignore[return-value]
 
 
 def includes_none(type_: Any) -> bool:
@@ -621,20 +605,9 @@ def is_origin_of(
     if origin is None:
         return False
 
-    return _get_type_name(origin) in names and (
+    return origin.__name__ in names and (
         module is None or origin.__module__.startswith(module)
     )
-
-
-def _get_type_name(type_: Type[Any]) -> str:
-    if compat.py310:
-        return type_.__name__
-    else:
-        typ_name = getattr(type_, "__name__", None)
-        if typ_name is None:
-            typ_name = getattr(type_, "_name", None)
-
-        return typ_name  # type: ignore
 
 
 class DescriptorProto(Protocol):

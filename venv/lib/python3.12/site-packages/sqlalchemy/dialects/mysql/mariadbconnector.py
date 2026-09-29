@@ -30,11 +30,9 @@ be ``mysqldb``. ``mariadb+mariadbconnector://`` is required to use this driver.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 from typing import Optional
 from typing import Sequence
-from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import Union
 from uuid import UUID as _python_UUID
@@ -42,6 +40,7 @@ from uuid import UUID as _python_UUID
 from .base import MySQLCompiler
 from .base import MySQLDialect
 from .base import MySQLExecutionContext
+from .mariadb import MariaDBDialect
 from ... import sql
 from ... import util
 from ...sql import sqltypes
@@ -60,7 +59,7 @@ if TYPE_CHECKING:
     from ...sql.type_api import _ResultProcessorType
 
 
-mariadb_cpy_minimum_version = (1, 0, 1)
+mariadb_cpy_minimum_version = util.VersionInfo((1, 0, 1))
 
 
 class _MariaDBUUID(sqltypes.UUID[sqltypes._UUID_RETURN]):
@@ -125,6 +124,8 @@ class MySQLDialect_mariadbconnector(MySQLDialect):
     driver = "mariadbconnector"
     supports_statement_cache = True
 
+    minimum_dbapi_version = mariadb_cpy_minimum_version
+
     # set this to True at the module level to prevent the driver from running
     # against a backend that server detects as MySQL. currently this appears to
     # be unnecessary as MariaDB client libraries have always worked against
@@ -151,30 +152,12 @@ class MySQLDialect_mariadbconnector(MySQLDialect):
         MySQLDialect.colspecs, {sqltypes.Uuid: _MariaDBUUID}
     )
 
-    @util.memoized_property
-    def _dbapi_version(self) -> Tuple[int, ...]:
-        if self.dbapi and hasattr(self.dbapi, "__version__"):
-            return tuple(
-                [
-                    int(x)
-                    for x in re.findall(
-                        r"(\d+)(?:[-\.]?|$)", self.dbapi.__version__
-                    )
-                ]
-            )
-        else:
-            return (99, 99, 99)
+    def retrieve_dbapi_version(self, dbapi: DBAPIModule) -> util.VersionInfo:
+        return util.parse_version_string(getattr(dbapi, "__version__", None))
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.paramstyle = "qmark"
-        if self.dbapi is not None:
-            if self._dbapi_version < mariadb_cpy_minimum_version:
-                raise NotImplementedError(
-                    "The minimum required version for MariaDB "
-                    "Connector/Python is %s"
-                    % ".".join(str(x) for x in mariadb_cpy_minimum_version)
-                )
 
     @classmethod
     def import_dbapi(cls) -> DBAPIModule:
@@ -320,4 +303,12 @@ class MySQLDialect_mariadbconnector(MySQLDialect):
         )
 
 
+class MariaDBDialect_mariadbconnector(
+    MariaDBDialect, MySQLDialect_mariadbconnector
+):
+    supports_statement_cache = True
+    _allows_uuid_binds = False
+
+
 dialect = MySQLDialect_mariadbconnector
+mariadb_dialect = MariaDBDialect_mariadbconnector

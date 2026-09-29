@@ -19,6 +19,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 from typing import List
+from typing import Literal
 from typing import MutableMapping
 from typing import Optional
 from typing import Tuple
@@ -36,13 +37,13 @@ from . import schema
 from . import visitors
 from .base import _clone
 from .base import Executable
+from .base import ExecutableStatement
 from .base import Options
 from .cache_key import CacheConst
 from .operators import ColumnOperators
 from .. import exc
 from .. import inspection
 from .. import util
-from ..util.typing import Literal
 
 if TYPE_CHECKING:
     from .elements import BindParameter
@@ -480,7 +481,7 @@ class DeferredLambdaElement(LambdaElement):
         for deferred_copy_internals in self._transforms:
             expr = deferred_copy_internals(expr)
 
-        return expr  # type: ignore
+        return expr  # type: ignore[no-any-return]
 
     def _copy_internals(
         self, clone=_clone, deferred_copy_internals=None, **kw
@@ -498,7 +499,7 @@ class DeferredLambdaElement(LambdaElement):
 
 
 class StatementLambdaElement(
-    roles.AllowsLambdaRole, LambdaElement, Executable
+    roles.AllowsLambdaRole, ExecutableStatement, LambdaElement
 ):
     """Represent a composable SQL statement as a :class:`_sql.LambdaElement`.
 

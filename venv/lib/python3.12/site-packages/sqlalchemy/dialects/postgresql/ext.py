@@ -12,18 +12,21 @@ from typing import Iterable
 from typing import List
 from typing import Optional
 from typing import overload
+from typing import Sequence
 from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
 from . import types
 from .array import ARRAY
+from ... import exc
 from ...sql import coercions
 from ...sql import elements
 from ...sql import expression
 from ...sql import functions
 from ...sql import roles
 from ...sql import schema
+from ...sql.base import SyntaxExtension
 from ...sql.schema import ColumnCollectionConstraint
 from ...sql.sqltypes import TEXT
 from ...sql.visitors import InternalTraversal
@@ -57,22 +60,14 @@ class aggregate_order_by(expression.ColumnElement[_T]):
 
         SELECT array_agg(a ORDER BY b DESC) FROM table;
 
-    Similarly::
-
-        expr = func.string_agg(
-            table.c.a, aggregate_order_by(literal_column("','"), table.c.a)
-        )
-        stmt = select(expr)
-
-    Would represent:
-
-    .. sourcecode:: sql
-
-        SELECT string_agg(a, ',' ORDER BY a) FROM table;
-
-    .. versionchanged:: 1.2.13 - the ORDER BY argument may be multiple terms
+    .. legacy:: An improved dialect-agnostic form of this function is now
+       available in Core by calling the
+       :meth:`_functions.Function.aggregate_order_by` method on any function
+       defined by the backend as an aggregate function.
 
     .. seealso::
+
+        :func:`_sql.aggregate_order_by` - Core level function
 
         :class:`_functions.array_agg`
 
@@ -253,8 +248,6 @@ class ExcludeConstraint(ColumnCollectionConstraint):
           elements; works the same way as that of the
           :ref:`postgresql_ops <postgresql_operator_classes>`
           parameter specified to the :class:`_schema.Index` construct.
-
-          .. versionadded:: 1.3.21
 
           .. seealso::
 
@@ -544,3 +537,63 @@ class ts_headline(_regconfig_fn):
             for c in args
         ]
         super().__init__(*(initial_arg + addtl_args), **kwargs)
+
+
+def distinct_on(*expr: _ColumnExpressionArgument[Any]) -> DistinctOnClause:
+    """apply a DISTINCT_ON to a SELECT statement
+
+    e.g.::
+
+        stmt = select(tbl).ext(distinct_on(t.c.some_col))
+
+    this supersedes the previous approach of using
+    ``select(tbl).distinct(t.c.some_col))`` to apply a similar construct.
+
+    .. versionadded:: 2.1
+
+    """
+    return DistinctOnClause(expr)
+
+
+class DistinctOnClause(SyntaxExtension, expression.ClauseElement):
+    stringify_dialect = "postgresql"
+    __visit_name__ = "postgresql_distinct_on"
+
+    _traverse_internals: _TraverseInternalsType = [
+        ("_distinct_on", InternalTraversal.dp_clauseelement_tuple),
+    ]
+
+    def __init__(self, distinct_on: Sequence[_ColumnExpressionArgument[Any]]):
+        self._distinct_on = tuple(
+            coercions.expect(roles.ByOfRole, e, apply_propagate_attrs=self)
+            for e in distinct_on
+        )
+
+    def apply_to_select(self, select_stmt: expression.Select[Any]) -> None:
+        if select_stmt._distinct_on:
+            raise exc.InvalidRequestError(
+                "Cannot mix ``select.ext(distinct_on(...))`` and "
+                "``select.distinct(...)``"
+            )
+        # mark this select as a distinct
+        select_stmt.distinct.non_generative(select_stmt)
+
+        select_stmt.apply_syntax_extension_point(
+            self._merge_other_distinct, "pre_columns"
+        )
+
+    def _merge_other_distinct(
+        self, existing: Sequence[elements.ClauseElement]
+    ) -> Sequence[elements.ClauseElement]:
+        res = []
+        to_merge = ()
+        for e in existing:
+            if isinstance(e, DistinctOnClause):
+                to_merge += e._distinct_on
+            else:
+                res.append(e)
+        if to_merge:
+            res.append(DistinctOnClause(to_merge + self._distinct_on))
+        else:
+            res.append(self)
+        return res

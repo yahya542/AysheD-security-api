@@ -47,6 +47,7 @@ from typing import MutableMapping
 from typing import MutableSequence
 from typing import NoReturn
 from typing import Optional
+from typing import Protocol
 from typing import Sequence
 from typing import Set
 from typing import Tuple
@@ -63,7 +64,6 @@ from .registry import _ListenerFnType
 from .. import exc
 from .. import util
 from ..util.concurrency import AsyncAdaptedLock
-from ..util.typing import Protocol
 
 _T = TypeVar("_T", bound=Any)
 
@@ -475,8 +475,6 @@ class _CompoundListener(_InstanceLevelDispatch[_ET]):
 
         If exec_once was already called, then this method will never run
         the callable regardless of whether it raised or not.
-
-        .. versionadded:: 1.3.8
 
         """
         if not self._exec_once:

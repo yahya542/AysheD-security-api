@@ -387,6 +387,7 @@ from typing import List
 from typing import Optional
 from typing import overload
 from typing import Set
+from typing import SupportsIndex
 from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import TypeVar
@@ -414,7 +415,6 @@ from ..sql.base import SchemaEventTarget
 from ..sql.schema import Column
 from ..sql.type_api import TypeEngine
 from ..util import memoized_property
-from ..util.typing import SupportsIndex
 
 _KT = TypeVar("_KT")  # Key type.
 _VT = TypeVar("_VT")  # Value type.
@@ -648,8 +648,6 @@ class Mutable(MutableBase):
         """
 
         def listen_for_type(mapper: Mapper[_O], class_: type) -> None:
-            if mapper.non_primary:
-                return
             for prop in mapper.column_attrs:
                 if isinstance(prop.columns[0].type, sqltype):
                     cls.associate_with_attribute(getattr(class_, prop.key))
@@ -713,8 +711,6 @@ class Mutable(MutableBase):
             mapper: Mapper[_T],
             class_: Union[DeclarativeAttributeIntercept, type],
         ) -> None:
-            if mapper.non_primary:
-                return
             _APPLIED_KEY = "_ext_mutable_listener_applied"
 
             for prop in mapper.column_attrs:
@@ -847,13 +843,13 @@ class MutableDict(Mutable, Dict[_KT, _VT]):
     if TYPE_CHECKING:
 
         @overload
-        def pop(self, __key: _KT) -> _VT: ...
+        def pop(self, __key: _KT, /) -> _VT: ...
 
         @overload
-        def pop(self, __key: _KT, __default: _VT | _T) -> _VT | _T: ...
+        def pop(self, __key: _KT, default: _VT | _T, /) -> _VT | _T: ...
 
         def pop(
-            self, __key: _KT, __default: _VT | _T | None = None
+            self, __key: _KT, __default: _VT | _T | None = None, /
         ) -> _VT | _T: ...
 
     else:

@@ -22,37 +22,27 @@ from typing import Dict
 from typing import Iterable
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import Mapping
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import Union
 
+from ._util_cy import anon_map as anon_map
+from ._util_cy import prefix_anon_map as prefix_anon_map  # noqa: F401
 from .. import exc
 from .. import util
 from ..util import langhelpers
-from ..util._has_cy import HAS_CYEXTENSION
-from ..util.typing import Literal
-from ..util.typing import Protocol
 from ..util.typing import Self
 
 if TYPE_CHECKING:
     from .annotation import _AnnotationDict
     from .elements import ColumnElement
-
-if typing.TYPE_CHECKING or not HAS_CYEXTENSION:
-    from ._py_util import prefix_anon_map as prefix_anon_map
-    from ._py_util import cache_anon_map as anon_map
-else:
-    from sqlalchemy.cyextension.util import (  # noqa: F401,E501
-        prefix_anon_map as prefix_anon_map,
-    )
-    from sqlalchemy.cyextension.util import (  # noqa: F401,E501
-        cache_anon_map as anon_map,
-    )
 
 
 __all__ = [
@@ -133,11 +123,11 @@ class Visitable:
             try:
                 meth = getter(visitor)
             except AttributeError as err:
-                return visitor.visit_unsupported_compilation(self, err, **kw)  # type: ignore  # noqa: E501
+                return visitor.visit_unsupported_compilation(self, err, **kw)  # type: ignore[no-any-return]  # noqa: E501
             else:
-                return meth(self, **kw)  # type: ignore  # noqa: E501
+                return meth(self, **kw)  # type: ignore[no-any-return]  # noqa: E501
 
-        cls._compiler_dispatch = (  # type: ignore
+        cls._compiler_dispatch = (  # type: ignore[method-assign]
             cls._original_compiler_dispatch
         ) = _compiler_dispatch
 
@@ -225,7 +215,7 @@ class InternalTraversal(Enum):
 
     dp_executable_options = "EO"
 
-    dp_with_context_options = "WC"
+    dp_compile_state_funcs = "WC"
 
     dp_fromclause_ordered_set = "CO"
     """Visit an ordered set of :class:`_expression.FromClause` objects. """
@@ -416,9 +406,8 @@ class InternalTraversal(Enum):
 
     """
 
-    dp_inspectable_list = "IL"
-    """Visit a list of inspectable objects which upon inspection are
-    HasCacheKey objects."""
+    dp_params = "PM"
+    """Visit the _params collection of ExecutableStatement"""
 
 
 _TraverseInternalsType = List[Tuple[str, InternalTraversal]]
@@ -508,7 +497,7 @@ class HasTraversalDispatch:
 
         """
         name = _dispatch_lookup[visit_symbol]
-        return getattr(self, name, None)  # type: ignore
+        return getattr(self, name, None)  # type: ignore[return-value]
 
     def run_generated_dispatch(
         self,
@@ -566,7 +555,7 @@ class HasTraversalDispatch:
         meth_text = ("def %s(self, visitor):\n" % method_name) + code + "\n"
         return cast(
             _InternalTraversalDispatchType,
-            langhelpers._exec_code_in_env(meth_text, {}, method_name),
+            langhelpers.exec_code_in_env(meth_text, {}, method_name),
         )
 
 
@@ -1139,7 +1128,7 @@ def replacement_traverse(
             newelem = replace(elem)
             if newelem is not None:
                 stop_on.add(id(newelem))
-                return newelem  # type: ignore
+                return newelem  # type: ignore[no-any-return]
             else:
                 # base "already seen" on id(), not hash, so that we don't
                 # replace an Annotated element with its non-annotated one, and
@@ -1150,11 +1139,11 @@ def replacement_traverse(
                         newelem = kw["replace"](elem)
                         if newelem is not None:
                             cloned[id_elem] = newelem
-                            return newelem  # type: ignore
+                            return newelem  # type: ignore[no-any-return]
 
                     cloned[id_elem] = newelem = elem._clone(**kw)
                     newelem._copy_internals(clone=clone, **kw)
-                return cloned[id_elem]  # type: ignore
+                return cloned[id_elem]  # type: ignore[no-any-return]
 
     if obj is not None:
         obj = clone(

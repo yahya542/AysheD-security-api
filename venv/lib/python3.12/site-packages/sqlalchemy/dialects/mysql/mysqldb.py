@@ -87,13 +87,12 @@ The mysqldb dialect supports server-side cursors. See :ref:`mysql_ss_cursors`.
 
 from __future__ import annotations
 
-import re
+import itertools
 from typing import Any
 from typing import Callable
 from typing import cast
-from typing import Dict
+from typing import Literal
 from typing import Optional
-from typing import Tuple
 from typing import TYPE_CHECKING
 
 from .base import MySQLCompiler
@@ -101,7 +100,6 @@ from .base import MySQLDialect
 from .base import MySQLExecutionContext
 from .base import MySQLIdentifierPreparer
 from ... import util
-from ...util.typing import Literal
 
 if TYPE_CHECKING:
 
@@ -137,22 +135,27 @@ class MySQLDialect_mysqldb(MySQLDialect):
     execution_ctx_cls = MySQLExecutionContext_mysqldb
     statement_compiler = MySQLCompiler_mysqldb
     preparer = MySQLIdentifierPreparer
-    server_version_info: Tuple[int, ...]
+    server_version_info: tuple[int, ...]
 
-    def __init__(self, **kwargs: Any):
-        super().__init__(**kwargs)
-        self._mysql_dbapi_version = (
-            self._parse_dbapi_version(self.dbapi.__version__)
-            if self.dbapi is not None and hasattr(self.dbapi, "__version__")
-            else (0, 0, 0)
-        )
-
-    def _parse_dbapi_version(self, version: str) -> Tuple[int, ...]:
-        m = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", version)
-        if m:
-            return tuple(int(x) for x in m.group(1, 2, 3) if x is not None)
-        else:
-            return (0, 0, 0)
+    def retrieve_dbapi_version(self, dbapi: DBAPIModule) -> util.VersionInfo:
+        # mysqlclient publishes ``version_info``, a tuple in the style of
+        # ``sys.version_info`` such as ``(2, 2, 7, "final", 0)``, and no
+        # version string of its own; MySQL-python published
+        # ``__version__``.  cymysql, which subclasses this dialect, also
+        # publishes ``__version__``.  pymysql publishes both of these as
+        # mysqlclient compatibility values rather than as its own version,
+        # so that dialect overrides this method; the asyncio dialects
+        # likewise override as their DBAPI is a wrapper module.
+        version_info = getattr(dbapi, "version_info", None)
+        if version_info is not None:
+            return util.VersionInfo(
+                tuple(
+                    itertools.takewhile(
+                        lambda part: isinstance(part, int), version_info
+                    )
+                )
+            )
+        return util.parse_version_string(getattr(dbapi, "__version__", None))
 
     @util.langhelpers.memoized_property
     def supports_server_side_cursors(self) -> bool:
@@ -199,7 +202,7 @@ class MySQLDialect_mysqldb(MySQLDialect):
             cast(MySQLExecutionContext, context)._rowcount = rowcount
 
     def create_connect_args(
-        self, url: URL, _translate_args: Optional[Dict[str, Any]] = None
+        self, url: URL, _translate_args: Optional[dict[str, Any]] = None
     ) -> ConnectArgsType:
         if _translate_args is None:
             _translate_args = dict(
@@ -260,7 +263,7 @@ class MySQLDialect_mysqldb(MySQLDialect):
             except (AttributeError, ImportError):
                 return None
             else:
-                return CLIENT_FLAGS.FOUND_ROWS  # type: ignore
+                return CLIENT_FLAGS.FOUND_ROWS  # type: ignore[no-any-return]
         else:
             return None
 
@@ -290,7 +293,7 @@ class MySQLDialect_mysqldb(MySQLDialect):
 
     def get_isolation_level_values(
         self, dbapi_conn: DBAPIConnection
-    ) -> Tuple[IsolationLevel, ...]:
+    ) -> tuple[IsolationLevel, ...]:
         return (
             "SERIALIZABLE",
             "READ UNCOMMITTED",

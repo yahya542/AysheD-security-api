@@ -7,6 +7,8 @@
 # mypy: ignore-errors
 
 import collections.abc as collections_abc
+from datetime import date
+from datetime import timedelta
 import itertools
 
 from .. import AssertsCompiledSQL
@@ -23,9 +25,13 @@ from ... import bindparam
 from ... import case
 from ... import column
 from ... import Computed
+from ... import Date
 from ... import exists
 from ... import false
+from ... import Float
 from ... import ForeignKey
+from ... import FrameClause
+from ... import FrameClauseType
 from ... import func
 from ... import Identity
 from ... import Integer
@@ -204,7 +210,7 @@ class FetchLimitOffsetTest(fixtures.TablesTest):
         )
 
     def _assert_result(
-        self, connection, select, result, params=(), set_=False
+        self, connection, select, result, params=None, set_=False
     ):
         if set_:
             query_res = connection.execute(select, params).fetchall()
@@ -214,7 +220,7 @@ class FetchLimitOffsetTest(fixtures.TablesTest):
         else:
             eq_(connection.execute(select, params).fetchall(), result)
 
-    def _assert_result_str(self, select, result, params=()):
+    def _assert_result_str(self, select, result, params=None):
         with config.db.connect() as conn:
             eq_(conn.exec_driver_sql(select, params).fetchall(), result)
 
@@ -736,7 +742,7 @@ class SameNamedSchemaTableTest(fixtures.TablesTest):
 class JoinTest(fixtures.TablesTest):
     __sparse_driver_backend__ = True
 
-    def _assert_result(self, select, result, params=()):
+    def _assert_result(self, select, result, params=None):
         with config.db.connect() as conn:
             eq_(conn.execute(select, params).fetchall(), result)
 
@@ -858,7 +864,7 @@ class CompoundSelectTest(fixtures.TablesTest):
             ],
         )
 
-    def _assert_result(self, select, result, params=()):
+    def _assert_result(self, select, result, params=None):
         with config.db.connect() as conn:
             eq_(conn.execute(select, params).fetchall(), result)
 
@@ -1123,7 +1129,7 @@ class ExpandingBoundInTest(fixtures.TablesTest):
             ],
         )
 
-    def _assert_result(self, select, result, params=()):
+    def _assert_result(self, select, result, params=None):
         with config.db.connect() as conn:
             eq_(conn.execute(select, params).fetchall(), result)
 
@@ -1839,7 +1845,10 @@ class DistinctOnTest(AssertsCompiledSQL, fixtures.TablesTest):
 
     @testing.fails_if(testing.requires.supports_distinct_on)
     def test_distinct_on(self):
-        stm = select("*").distinct(column("q")).select_from(table("foo"))
+        with testing.expect_deprecated(
+            "Passing expression to ``distinct`` to generate "
+        ):
+            stm = select("*").distinct(column("q")).select_from(table("foo"))
         with testing.expect_deprecated(
             "DISTINCT ON is currently supported only by the PostgreSQL "
         ):
@@ -1912,13 +1921,22 @@ class WindowFunctionTest(fixtures.TablesTest):
             Column("id", Integer, primary_key=True),
             Column("col1", Integer),
             Column("col2", Integer),
+            Column("col3", Float),
         )
 
     @classmethod
     def insert_data(cls, connection):
+        def row_factory(i):
+            return {
+                "id": i,
+                "col1": i,
+                "col2": i * 5,
+                "col3": i + 0.5,
+            }
+
         connection.execute(
             cls.tables.some_table.insert(),
-            [{"id": i, "col1": i, "col2": i * 5} for i in range(1, 50)],
+            [row_factory(i) for i in range(1, 50)],
         )
 
     def test_window(self, connection):
@@ -1933,21 +1951,105 @@ class WindowFunctionTest(fixtures.TablesTest):
 
         eq_(rows, [(95,) for i in range(19)])
 
-    def test_window_rows_between(self, connection):
+    @testing.requires.window_range
+    def test_window_range(self, connection):
         some_table = self.tables.some_table
-
-        # note the rows are part of the cache key right now, not handled
-        # as binds.  this is issue #11515
         rows = connection.execute(
             select(
-                func.max(some_table.c.col2).over(
-                    order_by=[some_table.c.col1],
-                    rows=(-5, 0),
+                func.max(some_table.c.col1).over(
+                    partition_by=[some_table.c.col2],
+                    order_by=[some_table.c.col2.asc()],
+                    range_=(0, 1),
                 )
-            )
+            ).where(some_table.c.col1 < 20)
         ).all()
 
-        eq_(rows, [(i,) for i in range(5, 250, 5)])
+        eq_(rows, [(i,) for i in range(1, 20)])
+
+    @testing.requires.window_range_numeric
+    def test_window_range_numeric(self, connection):
+        some_table = self.tables.some_table
+        rows = connection.execute(
+            select(
+                func.max(some_table.c.col3).over(
+                    partition_by=[some_table.c.col3],
+                    order_by=[some_table.c.col3.asc()],
+                    range_=FrameClause(
+                        1.25,
+                        1.25,
+                        FrameClauseType.PRECEDING,
+                        FrameClauseType.FOLLOWING,
+                    ),
+                )
+            ).where(some_table.c.col1 < 20)
+        ).all()
+
+        eq_(rows, [(i + 0.5,) for i in range(1, 20)])
+
+    @testing.requires.window_range_non_numeric
+    def test_window_range_dates(self, connection, metadata):
+        t = Table(
+            "range_string",
+            metadata,
+            Column("value", Integer),
+            Column("oder", Date),
+        )
+        t.create(connection)
+        connection.execute(
+            t.insert(),
+            [
+                {"value": 1, "oder": date(2025, 10, 1)},
+                {"value": 2, "oder": date(2025, 10, 2)},
+                {"value": 3, "oder": date(2025, 10, 10)},
+                {"value": 4, "oder": date(2025, 10, 13)},
+                {"value": 5, "oder": date(2025, 10, 16)},
+            ],
+        )
+        rows = connection.execute(
+            select(
+                func.sum(t.c.value).over(
+                    order_by=t.c.oder,
+                    range_=FrameClause(
+                        timedelta(days=7),
+                        None,
+                        FrameClauseType.PRECEDING,
+                        FrameClauseType.CURRENT,
+                    ),
+                )
+            ).order_by(t.c.oder)
+        ).all()
+
+        eq_(rows, [(1,), (3,), (3,), (7,), (12,)])
+
+    def test_window_rows_between_w_caching(self, connection):
+        some_table = self.tables.some_table
+
+        # this tests that dialects such as SQL Server which require literal
+        # rendering of ROWS BETWEEN and RANGE BETWEEN numerical values make
+        # use of literal_execute, for post-cache rendering of integer values,
+        # and not literal_binds which would include the integer values in the
+        # cached string (caching overall fixed in #11515)
+        for i in range(3):
+            for rows, expected in [
+                (
+                    (5, 20),
+                    list(range(105, 245, 5)) + ([245] * 16) + [None] * 5,
+                ),
+                (
+                    (20, 30),
+                    list(range(155, 245, 5)) + ([245] * 11) + [None] * 20,
+                ),
+            ]:
+                result_rows = connection.execute(
+                    select(
+                        func.max(some_table.c.col2).over(
+                            order_by=[some_table.c.col1],
+                            rows=rows,
+                        )
+                    )
+                ).all()
+
+                eq_(result_rows, [(i,) for i in expected])
 
 
 class BitwiseTest(fixtures.TablesTest):

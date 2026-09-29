@@ -29,16 +29,14 @@ from . import loading
 from . import sync
 from .base import state_str
 from .. import exc as sa_exc
-from .. import future
 from .. import sql
 from .. import util
 from ..engine import cursor as _cursor
 from ..sql import operators
 from ..sql.elements import BooleanClauseList
-from ..sql.selectable import LABEL_STYLE_TABLENAME_PLUS_COL
 
 
-def save_obj(base_mapper, states, uowtransaction, single=False):
+def _save_obj(base_mapper, states, uowtransaction, single=False):
     """Issue ``INSERT`` and/or ``UPDATE`` statements for a list
     of objects.
 
@@ -52,7 +50,7 @@ def save_obj(base_mapper, states, uowtransaction, single=False):
     # if batch=false, call _save_obj separately for each object
     if not single and not base_mapper.batch:
         for state in _sort_states(base_mapper, states):
-            save_obj(base_mapper, [state], uowtransaction, single=True)
+            _save_obj(base_mapper, [state], uowtransaction, single=True)
         return
 
     states_to_update = []
@@ -121,7 +119,7 @@ def save_obj(base_mapper, states, uowtransaction, single=False):
     )
 
 
-def post_update(base_mapper, states, uowtransaction, post_update_cols):
+def _post_update(base_mapper, states, uowtransaction, post_update_cols):
     """Issue UPDATE statements on behalf of a relationship() which
     specifies post_update.
 
@@ -166,7 +164,7 @@ def post_update(base_mapper, states, uowtransaction, post_update_cols):
         )
 
 
-def delete_obj(base_mapper, states, uowtransaction):
+def _delete_obj(base_mapper, states, uowtransaction):
     """Issue ``DELETE`` statements for a list of objects.
 
     This is called within the context of a UOWTransaction during a
@@ -457,8 +455,13 @@ def _collect_update_commands(
 
         pks = mapper._pks_by_table[table]
 
-        if use_orm_update_stmt is not None:
+        if (
+            use_orm_update_stmt is not None
+            and not use_orm_update_stmt._maintain_values_ordering
+        ):
             # TODO: ordered values, etc
+            # ORM bulk_persistence will raise for the maintain_values_ordering
+            # case right now
             value_params = use_orm_update_stmt._values
         else:
             value_params = {}
@@ -623,7 +626,7 @@ def _collect_update_commands(
             # occurs after the UPDATE is emitted however we invoke it here
             # explicitly in the absence of our invoking an UPDATE
             for m, equated_pairs in mapper._table_to_equated[table]:
-                sync.populate(
+                sync._populate(
                     state,
                     m,
                     state,
@@ -1555,10 +1558,8 @@ def _finalize_insert_update_commands(base_mapper, uowtransaction, states):
 
         if toload_now:
             state.key = base_mapper._identity_key_from_state(state)
-            stmt = future.select(mapper).set_label_style(
-                LABEL_STYLE_TABLENAME_PLUS_COL
-            )
-            loading.load_on_ident(
+            stmt = sql.select(mapper)
+            loading._load_on_ident(
                 uowtransaction.session,
                 stmt,
                 state.key,
@@ -1727,7 +1728,7 @@ def _postfetch(
     # TODO: this still goes a little too often.  would be nice to
     # have definitive list of "columns that changed" here
     for m, equated_pairs in mapper._table_to_equated[table]:
-        sync.populate(
+        sync._populate(
             state,
             m,
             state,
@@ -1740,7 +1741,7 @@ def _postfetch(
 
 def _postfetch_bulk_save(mapper, dict_, table):
     for m, equated_pairs in mapper._table_to_equated[table]:
-        sync.bulk_populate_inherit_keys(dict_, m, equated_pairs)
+        sync._bulk_populate_inherit_keys(dict_, m, equated_pairs)
 
 
 def _connections_for_states(base_mapper, uowtransaction, states):

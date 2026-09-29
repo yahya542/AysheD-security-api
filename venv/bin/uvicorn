@@ -1,4 +1,4 @@
-#!/home/yahya/AysheD/apiSEC/venv/bin/python3
+#!/home/yahya/ayshed/apiSEC/venv/bin/python3
 # -*- coding: utf-8 -*-
 import re
 import sys

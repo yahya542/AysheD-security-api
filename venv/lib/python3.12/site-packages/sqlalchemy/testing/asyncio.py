@@ -11,13 +11,6 @@
 # setup/teardown in an asyncio event loop, conditionally based on the
 # current DB driver being used for a test.
 
-# note that SQLAlchemy's asyncio integration also supports a method
-# of running individual asyncio functions inside of separate event loops
-# using "async_fallback" mode; however running whole functions in the event
-# loop is a more accurate test for how SQLAlchemy's asyncio features
-# would run in the real world.
-
-
 from __future__ import annotations
 
 from functools import wraps

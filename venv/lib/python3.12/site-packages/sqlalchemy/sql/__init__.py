@@ -11,14 +11,18 @@ from ._typing import ColumnExpressionArgument as ColumnExpressionArgument
 from ._typing import NotNullable as NotNullable
 from ._typing import Nullable as Nullable
 from .base import Executable as Executable
+from .base import ExecutableStatement as ExecutableStatement
+from .base import SyntaxExtension as SyntaxExtension
 from .compiler import COLLECT_CARTESIAN_PRODUCTS as COLLECT_CARTESIAN_PRODUCTS
 from .compiler import FROM_LINTING as FROM_LINTING
 from .compiler import NO_LINTING as NO_LINTING
 from .compiler import WARN_LINTING as WARN_LINTING
 from .ddl import BaseDDLElement as BaseDDLElement
+from .ddl import CheckFirst as CheckFirst
 from .ddl import DDL as DDL
 from .ddl import DDLElement as DDLElement
 from .ddl import ExecutableDDLElement as ExecutableDDLElement
+from .expression import aggregate_order_by as aggregate_order_by
 from .expression import Alias as Alias
 from .expression import alias as alias
 from .expression import all_ as all_
@@ -46,6 +50,7 @@ from .expression import exists as exists
 from .expression import extract as extract
 from .expression import false as false
 from .expression import False_ as False_
+from .expression import from_dml_column as from_dml_column
 from .expression import FromClause as FromClause
 from .expression import func as func
 from .expression import funcfilter as funcfilter
@@ -92,10 +97,15 @@ from .expression import table as table
 from .expression import TableClause as TableClause
 from .expression import TableSample as TableSample
 from .expression import tablesample as tablesample
+from .expression import TableValuedAlias as TableValuedAlias
+from .expression import TableValuedColumn as TableValuedColumn
 from .expression import text as text
+from .expression import TextClause as TextClause
 from .expression import true as true
 from .expression import True_ as True_
 from .expression import try_cast as try_cast
+from .expression import TString as TString
+from .expression import tstring as tstring
 from .expression import tuple_ as tuple_
 from .expression import type_coerce as type_coerce
 from .expression import union as union
@@ -105,6 +115,7 @@ from .expression import update as update
 from .expression import Values as Values
 from .expression import values as values
 from .expression import within_group as within_group
+from .expression import WriteableColumnCollection as WriteableColumnCollection
 from .visitors import ClauseVisitor as ClauseVisitor
 
 

@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import functools
 import operator
+import re
 from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Dict
 from typing import Iterable
 from typing import List
+from typing import Literal
 from typing import MutableMapping
 from typing import NamedTuple
 from typing import Optional
@@ -44,7 +46,6 @@ from .selectable import Select
 from .selectable import TableClause
 from .. import exc
 from .. import util
-from ..util.typing import Literal
 
 if TYPE_CHECKING:
     from .compiler import _BindNameForColProtocol
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from .dml import DMLState
     from .dml import ValuesBase
     from .elements import ColumnElement
+    from .elements import DMLTargetCopy
     from .elements import KeyedColumnElement
     from .schema import _SQLExprDefault
     from .schema import Column
@@ -168,6 +170,9 @@ def _get_crud_params(
         "accumulate_bind_names" not in kw
     ), "Don't know how to handle insert within insert without a CTE"
 
+    bindmarkers: MutableMapping[ColumnElement[Any], DMLTargetCopy[Any]] = {}
+    kw["bindmarkers"] = bindmarkers
+
     # getters - these are normally just column.key,
     # but in the case of mysql multi-table update, the rules for
     # .key must conditionally take tablename into account
@@ -231,11 +236,6 @@ def _get_crud_params(
         assert mp is not None
         spd = mp[0]
         stmt_parameter_tuples = list(spd.items())
-        spd_str_key = {_column_as_key(key) for key in spd}
-    elif compile_state._ordered_values:
-        spd = compile_state._dict_parameters
-        stmt_parameter_tuples = compile_state._ordered_values
-        assert spd is not None
         spd_str_key = {_column_as_key(key) for key in spd}
     elif compile_state._dict_parameters:
         spd = compile_state._dict_parameters
@@ -403,6 +403,26 @@ def _get_crud_params(
             cast("Callable[..., str]", _column_as_key),
             kw,
         )
+
+        if bindmarkers:
+            _replace_bindmarkers(
+                compiler,
+                _column_as_key,
+                bindmarkers,
+                compile_state,
+                values,
+                kw,
+            )
+            for m_v in multi_extended_values:
+                _replace_bindmarkers(
+                    compiler,
+                    _column_as_key,
+                    bindmarkers,
+                    compile_state,
+                    m_v,
+                    kw,
+                )
+
         return _CrudParams(values, multi_extended_values)
     elif (
         not values
@@ -423,6 +443,10 @@ def _get_crud_params(
         ]
         is_default_metavalue_only = True
 
+    if bindmarkers:
+        _replace_bindmarkers(
+            compiler, _column_as_key, bindmarkers, compile_state, values, kw
+        )
     return _CrudParams(
         values,
         [],
@@ -430,6 +454,45 @@ def _get_crud_params(
         use_insertmanyvalues=use_insertmanyvalues,
         use_sentinel_columns=use_sentinel_columns,
     )
+
+
+def _replace_bindmarkers(
+    compiler, _column_as_key, bindmarkers, compile_state, values, kw
+):
+    _expr_by_col_key = {
+        _column_as_key(col): compiled_str for col, _, compiled_str, _ in values
+    }
+
+    def replace_marker(m):
+        try:
+            return _expr_by_col_key[m.group(1)]
+        except KeyError as ke:
+            if dml.isupdate(compile_state):
+                return compiler.process(bindmarkers[m.group(1)].column, **kw)
+            else:
+                raise exc.CompileError(
+                    f"Can't resolve referenced column name in "
+                    f"INSERT statement: {m.group(1)!r}"
+                ) from ke
+
+    values[:] = [
+        (
+            col,
+            col_value,
+            re.sub(
+                r"__BINDMARKER_~~(.+?)~~",
+                replace_marker,
+                compiled_str,
+            ),
+            accumulated_bind_names,
+        )
+        for (
+            col,
+            col_value,
+            compiled_str,
+            accumulated_bind_names,
+        ) in values
+    ]
 
 
 @overload
@@ -542,7 +605,7 @@ def _key_getters_for_crud_column(
         ) -> Union[str, Tuple[str, str]]:
             str_key = c_key_role(key)
             if hasattr(key, "table") and key.table in _et:
-                return (key.table.name, str_key)  # type: ignore
+                return (key.table.name, str_key)  # type: ignore[union-attr]
             else:
                 return str_key
 
@@ -550,7 +613,7 @@ def _key_getters_for_crud_column(
             col: ColumnClause[Any],
         ) -> Union[str, Tuple[str, str]]:
             if col.table in _et:
-                return (col.table.name, col.key)  # type: ignore
+                return (col.table.name, col.key)  # type: ignore[attr-defined]
             else:
                 return col.key
 
@@ -566,7 +629,7 @@ def _key_getters_for_crud_column(
         _column_as_key = functools.partial(
             coercions.expect_as_key, roles.DMLColumnRole
         )
-        _getattr_col_key = _col_bind_name = operator.attrgetter("key")  # type: ignore  # noqa: E501
+        _getattr_col_key = _col_bind_name = operator.attrgetter("key")  # type: ignore[assignment]  # noqa: E501
 
     return _column_as_key, _getattr_col_key, _col_bind_name
 
@@ -664,9 +727,9 @@ def _scan_cols(
 
     assert compile_state.isupdate or compile_state.isinsert
 
-    if compile_state._parameter_ordering:
+    if compile_state._maintain_values_ordering:
         parameter_ordering = [
-            _column_as_key(key) for key in compile_state._parameter_ordering
+            _column_as_key(key) for key in compile_state._dict_parameters
         ]
         ordered_keys = set(parameter_ordering)
         cols = [
@@ -1291,7 +1354,7 @@ def _create_insert_prefetch_bind_param(
     param = _create_bind_param(
         compiler, c, None, process=process, name=name, **kw
     )
-    compiler.insert_prefetch.append(c)  # type: ignore
+    compiler.insert_prefetch.append(c)  # type: ignore[attr-defined]
     return param
 
 
@@ -1323,7 +1386,7 @@ def _create_update_prefetch_bind_param(
     param = _create_bind_param(
         compiler, c, None, process=process, name=name, **kw
     )
-    compiler.update_prefetch.append(c)  # type: ignore
+    compiler.update_prefetch.append(c)  # type: ignore[attr-defined]
     return param
 
 

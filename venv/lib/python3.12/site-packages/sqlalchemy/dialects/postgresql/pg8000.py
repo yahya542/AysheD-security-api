@@ -97,7 +97,6 @@ of the :ref:`psycopg2 <psycopg2_isolation_level>` dialect:
 """  # noqa
 
 import decimal
-import re
 
 from . import ranges
 from .array import ARRAY as PGARRAY
@@ -127,7 +126,7 @@ class _PGString(sqltypes.String):
     render_bind_cast = True
 
 
-class _PGNumeric(sqltypes.Numeric):
+class _PGNumericCommon(sqltypes.NumericCommon):
     render_bind_cast = True
 
     def result_processor(self, dialect, coltype):
@@ -155,9 +154,12 @@ class _PGNumeric(sqltypes.Numeric):
                 )
 
 
-class _PGFloat(_PGNumeric, sqltypes.Float):
-    __visit_name__ = "float"
-    render_bind_cast = True
+class _PGNumeric(_PGNumericCommon, sqltypes.Numeric):
+    pass
+
+
+class _PGFloat(_PGNumericCommon, sqltypes.Float):
+    pass
 
 
 class _PGNumericNoBind(_PGNumeric):
@@ -168,15 +170,9 @@ class _PGNumericNoBind(_PGNumeric):
 class _PGJSON(JSON):
     render_bind_cast = True
 
-    def result_processor(self, dialect, coltype):
-        return None
-
 
 class _PGJSONB(JSONB):
     render_bind_cast = True
-
-    def result_processor(self, dialect, coltype):
-        return None
 
 
 class _PGJSONIndexType(sqltypes.JSON.JSONIndexType):
@@ -408,6 +404,8 @@ class PGDialect_pg8000(PGDialect):
     driver = "pg8000"
     supports_statement_cache = True
 
+    minimum_dbapi_version = util.VersionInfo((1, 16, 6))
+
     supports_unicode_statements = True
 
     supports_unicode_binds = True
@@ -418,6 +416,10 @@ class PGDialect_pg8000(PGDialect):
     statement_compiler = PGCompiler_pg8000
     preparer = PGIdentifierPreparer_pg8000
     supports_server_side_cursors = True
+
+    supports_native_json_serialization = False
+    supports_native_json_deserialization = True
+    dialect_injects_custom_json_deserializer = True
 
     render_bind_cast = True
 
@@ -472,9 +474,6 @@ class PGDialect_pg8000(PGDialect):
         PGDialect.__init__(self, **kwargs)
         self.client_encoding = client_encoding
 
-        if self._dbapi_version < (1, 16, 6):
-            raise NotImplementedError("pg8000 1.16.6 or greater is required")
-
         if self._native_inet_types:
             raise NotImplementedError(
                 "The pg8000 dialect does not fully implement "
@@ -482,19 +481,8 @@ class PGDialect_pg8000(PGDialect):
                 "CIDR is not"
             )
 
-    @util.memoized_property
-    def _dbapi_version(self):
-        if self.dbapi and hasattr(self.dbapi, "__version__"):
-            return tuple(
-                [
-                    int(x)
-                    for x in re.findall(
-                        r"(\d+)(?:[-\.]?|$)", self.dbapi.__version__
-                    )
-                ]
-            )
-        else:
-            return (99, 99, 99)
+    def retrieve_dbapi_version(self, dbapi):
+        return util.parse_version_string(getattr(dbapi, "__version__", None))
 
     @classmethod
     def import_dbapi(cls):

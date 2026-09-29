@@ -40,7 +40,7 @@ class MappedTest(ORMTest, TablesTest, assertions.AssertsExecutionResults):
     classes: Any = None
 
     @config.fixture(autouse=True, scope="class")
-    @config.fixture_classmethod
+    @classmethod
     def _setup_tables_test_class(cls):
         cls._init_class()
 

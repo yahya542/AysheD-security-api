@@ -16,6 +16,7 @@ from typing import Callable
 from typing import cast
 from typing import Dict
 from typing import Iterable
+from typing import Literal
 from typing import Optional
 from typing import overload
 from typing import Sequence
@@ -25,23 +26,23 @@ from typing import TypeVar
 from typing import Union
 
 from . import util as orm_util
-from ._typing import insp_is_aliased_class
 from ._typing import insp_is_attribute
 from ._typing import insp_is_mapper
 from ._typing import insp_is_mapper_property
 from .attributes import QueryableAttribute
+from .base import entity_str
 from .base import InspectionAttr
 from .interfaces import LoaderOption
+from .path_registry import _AbstractEntityRegistry
 from .path_registry import _ACCEPTED_TOKENS
 from .path_registry import _COLUMN_TOKEN
 from .path_registry import _DEFAULT_TOKEN
 from .path_registry import _RELATIONSHIP_TOKEN
 from .path_registry import _StrPathToken
+from .path_registry import _TokenRegistry
 from .path_registry import _WILDCARD_TOKEN
-from .path_registry import AbstractEntityRegistry
 from .path_registry import path_is_property
 from .path_registry import PathRegistry
-from .path_registry import TokenRegistry
 from .util import _orm_full_deannotate
 from .util import AliasedInsp
 from .. import exc as sa_exc
@@ -54,7 +55,6 @@ from ..sql import roles
 from ..sql import traversals
 from ..sql import visitors
 from ..sql.base import _generative
-from ..util.typing import Literal
 from ..util.typing import Self
 
 _FN = TypeVar("_FN", bound="Callable[..., Any]")
@@ -63,7 +63,7 @@ if typing.TYPE_CHECKING:
     from ._typing import _EntityType
     from ._typing import _InternalEntityType
     from .context import _MapperEntity
-    from .context import ORMCompileState
+    from .context import _ORMCompileState
     from .context import QueryContext
     from .interfaces import _StrategyKey
     from .interfaces import MapperProperty
@@ -82,6 +82,10 @@ _WildcardKeyType = Literal["relationship", "column"]
 _StrategySpec = Dict[str, Any]
 _OptsType = Dict[str, Any]
 _AttrGroupType = Tuple[_AttrType, ...]
+
+# maps _StrategyKey tuples to the user-facing loader function name,
+# populated by the @_strategy_labels() decorator below
+_STRATEGY_FN_LABELS: Dict[Any, str] = {}
 
 
 class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
@@ -358,6 +362,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         self,
         attr: _AttrType,
         recursion_depth: Optional[int] = None,
+        chunksize: Optional[int] = None,
     ) -> Self:
         """Indicate that the given attribute should be loaded using
         SELECT IN eager loading.
@@ -396,6 +401,11 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
          .. versionadded:: 2.0 added
             :paramref:`_orm.selectinload.recursion_depth`
 
+        :param chunksize: optional int; when set to a positive non-zero
+         integer, the keys from the IN statement will be chunked relative
+         to the passed parameter
+
+         .. versionadded:: 2.1.0b3
 
         .. seealso::
 
@@ -407,7 +417,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         return self._set_relationship_strategy(
             attr,
             {"lazy": "selectin"},
-            opts={"recursion_depth": recursion_depth},
+            opts={"recursion_depth": recursion_depth, "chunksize": chunksize},
         )
 
     def lazyload(self, attr: _AttrType) -> Self:
@@ -475,6 +485,13 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         )
         return loader
 
+    @util.deprecated(
+        "2.1",
+        "The :func:`_orm.noload` option is deprecated and will be removed "
+        "in a future release.  This option "
+        "produces incorrect results by returning ``None`` for related "
+        "items.",
+    )
     def noload(self, attr: _AttrType) -> Self:
         """Indicate that the given relationship attribute should remain
         unloaded.
@@ -482,16 +499,8 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         The relationship attribute will return ``None`` when accessed without
         producing any loading effect.
 
-        This function is part of the :class:`_orm.Load` interface and supports
-        both method-chained and standalone operation.
-
         :func:`_orm.noload` applies to :func:`_orm.relationship` attributes
         only.
-
-        .. legacy:: The :func:`_orm.noload` option is **legacy**.  As it
-           forces collections to be empty, which invariably leads to
-           non-intuitive and difficult to predict results.  There are no
-           legitimate uses for this option in modern SQLAlchemy.
 
         .. seealso::
 
@@ -731,8 +740,6 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
                 with_expression(SomeClass.x_y_expr, SomeClass.x + SomeClass.y)
             )
 
-        .. versionadded:: 1.2
-
         :param key: Attribute to be populated
 
         :param expr: SQL expression to be applied to the attribute.
@@ -759,8 +766,6 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
         This uses an additional SELECT with IN against all matched primary
         key values, and is the per-query analogue to the ``"selectin"``
         setting on the :paramref:`.mapper.polymorphic_load` parameter.
-
-        .. versionadded:: 1.2
 
         .. seealso::
 
@@ -892,7 +897,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
 
     def process_compile_state_replaced_entities(
         self,
-        compile_state: ORMCompileState,
+        compile_state: _ORMCompileState,
         mapper_entities: Sequence[_MapperEntity],
     ) -> None:
         if not compile_state.compile_options._enable_eagerloads:
@@ -907,7 +912,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
             not bool(compile_state.current_path),
         )
 
-    def process_compile_state(self, compile_state: ORMCompileState) -> None:
+    def process_compile_state(self, compile_state: _ORMCompileState) -> None:
         if not compile_state.compile_options._enable_eagerloads:
             return
 
@@ -920,7 +925,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
 
     def _process(
         self,
-        compile_state: ORMCompileState,
+        compile_state: _ORMCompileState,
         mapper_entities: Sequence[_MapperEntity],
         raiseerr: bool,
     ) -> None:
@@ -947,7 +952,7 @@ class _AbstractLoad(traversals.GenerativeOnTraversal, LoaderOption):
                     return to_chop
                 elif (
                     c_token != f"{_RELATIONSHIP_TOKEN}:{_WILDCARD_TOKEN}"
-                    and c_token != p_token.key  # type: ignore
+                    and c_token != p_token.key  # type: ignore[union-attr]
                 ):
                     return None
 
@@ -1017,11 +1022,11 @@ class Load(_AbstractLoad):
         self.additional_source_entities = ()
 
     def __str__(self) -> str:
-        return f"Load({self.path[0]})"
+        return f"Load({entity_str(self.path[0])})"
 
     @classmethod
     def _construct_for_existing_path(
-        cls, path: AbstractEntityRegistry
+        cls, path: _AbstractEntityRegistry
     ) -> Load:
         load = cls.__new__(cls)
         load.path = path
@@ -1117,7 +1122,7 @@ class Load(_AbstractLoad):
 
     def _process(
         self,
-        compile_state: ORMCompileState,
+        compile_state: _ORMCompileState,
         mapper_entities: Sequence[_MapperEntity],
         raiseerr: bool,
     ) -> None:
@@ -1205,8 +1210,6 @@ class Load(_AbstractLoad):
         :param \*opts: A series of loader option objects (ultimately
          :class:`_orm.Load` objects) which should be applied to the path
          specified by this :class:`_orm.Load` object.
-
-        .. versionadded:: 1.3.6
 
         .. seealso::
 
@@ -1404,7 +1407,7 @@ class _WildcardLoad(_AbstractLoad):
         if attr.endswith(_DEFAULT_TOKEN):
             attr = f"{attr.split(':')[0]}:{_WILDCARD_TOKEN}"
 
-        effective_path = cast(AbstractEntityRegistry, parent.path).token(attr)
+        effective_path = cast(_AbstractEntityRegistry, parent.path).token(attr)
 
         assert effective_path.is_token
 
@@ -1619,16 +1622,17 @@ class _LoadElement(
         if not found_entities:
             raise sa_exc.ArgumentError(
                 "Query has only expression-based entities; "
-                f"attribute loader options for {path[0]} can't "
-                "be applied here."
+                f"attribute loader option {self._to_option_method_string()} "
+                "can't be applied here."
             )
         else:
             raise sa_exc.ArgumentError(
-                f"Mapped class {path[0]} does not apply to any of the "
-                f"root entities in this query, e.g. "
+                f"Mapped class {entity_str(path[0])} referenced in "
+                f"option {self._to_option_method_string()} does not apply "
+                f"to any of the root entities in this query, e.g. "
                 f"""{
                     ", ".join(
-                        str(x.entity_zero)
+                        entity_str(x.entity_zero)
                         for x in mapper_entities if x.entity_zero
                     )}. Please """
                 "specify the full path "
@@ -1765,7 +1769,7 @@ class _LoadElement(
         )
 
         if not path:
-            return None  # type: ignore
+            return None  # type: ignore[return-value]
 
         assert opt.is_token_strategy == path.is_token
 
@@ -1801,7 +1805,7 @@ class _LoadElement(
         ):
             raise sa_exc.ArgumentError(
                 f'Attribute "{self.path[1]}" does not link '
-                f'from element "{parent.path[-1]}".'
+                f'from element "{entity_str(parent.path[-1])}".'
             )
 
         return self._prepend_path(parent.path)
@@ -1871,8 +1875,33 @@ class _LoadElement(
             return replacement
 
         raise sa_exc.InvalidRequestError(
-            f"Loader strategies for {replacement.path} conflict"
+            f"Loader strategy replacement "
+            f"{replacement._to_option_method_string()} is in conflict "
+            f"with existing strategy {existing._to_option_method_string()}"
         )
+
+    def _to_option_method_string(self) -> str:
+        """Return a string representation of this :class:`._LoadElement`
+        as it would be written as a loader option method call, e.g.
+        ``"joinedload(User.orders)"``.
+
+        """
+        assert (
+            self.strategy is not None
+        ), "to_option_method_string() requires a strategy to be set"
+
+        for opt_key in self.local_opts:
+            fn = _STRATEGY_FN_LABELS.get((self.strategy, opt_key))
+            if fn:
+                break
+        else:
+            fn = _STRATEGY_FN_LABELS.get((self.strategy, None))
+
+        assert (
+            fn is not None
+        ), f"No _STRATEGY_FN_LABELS entry for strategy {self.strategy!r}"
+
+        return f"{fn}({self.path.path_string()})"
 
 
 class _AttributeStrategyLoad(_LoadElement):
@@ -2237,7 +2266,7 @@ class _TokenStrategyLoad(_LoadElement):
             ("loader", natural_path)
             for natural_path in (
                 cast(
-                    TokenRegistry, effective_path
+                    _TokenRegistry, effective_path
                 )._generate_natural_for_superclasses()
             )
         ]
@@ -2378,7 +2407,7 @@ def _parse_attr_argument(
         # TODO: need to figure out this None thing being returned by
         # inspect(), it should not have None as an option in most cases
         # if at all
-        insp: InspectionAttr = inspect(attr)  # type: ignore
+        insp: InspectionAttr = inspect(attr)  # type: ignore[assignment]
     except sa_exc.NoInspectionAvailable as err:
         raise sa_exc.ArgumentError(
             "expected ORM mapped attribute for loader strategy argument"
@@ -2398,6 +2427,30 @@ def _parse_attr_argument(
         )
 
     return insp, lead_entity, prop
+
+
+def _strategy_labels(
+    *strategy_keys: "Any",
+    discriminating_opt: Optional[str] = None,
+) -> Callable[[_FN], _FN]:
+    """Decorator that registers strategy key(s) -> function name in
+    ``_STRATEGY_FN_LABELS``.  Apply below ``@loader_unbound_fn`` so that
+    ``fn.__name__`` is still the original function name when the decorator
+    runs.
+
+    :param discriminating_opt: optional local_opts key that distinguishes
+     this function from another function with the same strategy key.
+     When set, the entry is stored under ``(strategy_key, opt_key)``
+     instead of ``(strategy_key, None)``, and ``__str__`` will use this
+     function name when that opt is present in ``local_opts``.
+    """
+
+    def decorator(fn: _FN) -> _FN:
+        for key in strategy_keys:
+            _STRATEGY_FN_LABELS[(key, discriminating_opt)] = fn.__name__
+        return fn
+
+    return decorator
 
 
 def loader_unbound_fn(fn: _FN) -> _FN:
@@ -2440,6 +2493,7 @@ def _expand_column_strategy_attrs(
 
 
 @loader_unbound_fn
+@_strategy_labels((("lazy", "joined"),), discriminating_opt="eager_from_alias")
 def contains_eager(*keys: _AttrType, **kw: Any) -> _AbstractLoad:
     return _generate_from_keys(Load.contains_eager, keys, True, kw)
 
@@ -2454,30 +2508,40 @@ def load_only(*attrs: _AttrType, raiseload: bool = False) -> _AbstractLoad:
 
 
 @loader_unbound_fn
+@_strategy_labels((("lazy", "joined"),))
 def joinedload(*keys: _AttrType, **kw: Any) -> _AbstractLoad:
     return _generate_from_keys(Load.joinedload, keys, False, kw)
 
 
 @loader_unbound_fn
+@_strategy_labels((("lazy", "subquery"),))
 def subqueryload(*keys: _AttrType) -> _AbstractLoad:
     return _generate_from_keys(Load.subqueryload, keys, False, {})
 
 
 @loader_unbound_fn
+@_strategy_labels((("lazy", "selectin"),))
 def selectinload(
-    *keys: _AttrType, recursion_depth: Optional[int] = None
+    *keys: _AttrType,
+    recursion_depth: Optional[int] = None,
+    chunksize: Optional[int] = None,
 ) -> _AbstractLoad:
     return _generate_from_keys(
-        Load.selectinload, keys, False, {"recursion_depth": recursion_depth}
+        Load.selectinload,
+        keys,
+        False,
+        {"recursion_depth": recursion_depth, "chunksize": chunksize},
     )
 
 
 @loader_unbound_fn
+@_strategy_labels((("lazy", "select"),))
 def lazyload(*keys: _AttrType) -> _AbstractLoad:
     return _generate_from_keys(Load.lazyload, keys, False, {})
 
 
 @loader_unbound_fn
+@_strategy_labels((("lazy", "immediate"),))
 def immediateload(
     *keys: _AttrType, recursion_depth: Optional[int] = None
 ) -> _AbstractLoad:
@@ -2487,11 +2551,13 @@ def immediateload(
 
 
 @loader_unbound_fn
+@_strategy_labels((("lazy", "noload"),))
 def noload(*keys: _AttrType) -> _AbstractLoad:
     return _generate_from_keys(Load.noload, keys, False, {})
 
 
 @loader_unbound_fn
+@_strategy_labels((("lazy", "raise"),), (("lazy", "raise_on_sql"),))
 def raiseload(*keys: _AttrType, **kw: Any) -> _AbstractLoad:
     return _generate_from_keys(Load.raiseload, keys, False, kw)
 
@@ -2502,35 +2568,23 @@ def defaultload(*keys: _AttrType) -> _AbstractLoad:
 
 
 @loader_unbound_fn
-def defer(
-    key: _AttrType, *addl_attrs: _AttrType, raiseload: bool = False
-) -> _AbstractLoad:
-    if addl_attrs:
-        util.warn_deprecated(
-            "The *addl_attrs on orm.defer is deprecated.  Please use "
-            "method chaining in conjunction with defaultload() to "
-            "indicate a path.",
-            version="1.3",
-        )
-
+@_strategy_labels(
+    (("deferred", True), ("instrument", True)),
+    (("deferred", True), ("instrument", True), ("raiseload", True)),
+)
+def defer(key: _AttrType, *, raiseload: bool = False) -> _AbstractLoad:
     if raiseload:
         kw = {"raiseload": raiseload}
     else:
         kw = {}
 
-    return _generate_from_keys(Load.defer, (key,) + addl_attrs, False, kw)
+    return _generate_from_keys(Load.defer, (key,), False, kw)
 
 
 @loader_unbound_fn
-def undefer(key: _AttrType, *addl_attrs: _AttrType) -> _AbstractLoad:
-    if addl_attrs:
-        util.warn_deprecated(
-            "The *addl_attrs on orm.undefer is deprecated.  Please use "
-            "method chaining in conjunction with defaultload() to "
-            "indicate a path.",
-            version="1.3",
-        )
-    return _generate_from_keys(Load.undefer, (key,) + addl_attrs, False, {})
+@_strategy_labels((("deferred", False), ("instrument", True)))
+def undefer(key: _AttrType) -> _AbstractLoad:
+    return _generate_from_keys(Load.undefer, (key,), False, {})
 
 
 @loader_unbound_fn
@@ -2540,6 +2594,7 @@ def undefer_group(name: str) -> _AbstractLoad:
 
 
 @loader_unbound_fn
+@_strategy_labels((("query_expression", True),))
 def with_expression(
     key: _AttrType, expression: _ColumnExpressionArgument[Any]
 ) -> _AbstractLoad:
@@ -2549,6 +2604,7 @@ def with_expression(
 
 
 @loader_unbound_fn
+@_strategy_labels((("selectinload_polymorphic", True),))
 def selectin_polymorphic(
     base_cls: _EntityType[Any], classes: Iterable[Type[Any]]
 ) -> _AbstractLoad:
@@ -2559,22 +2615,23 @@ def selectin_polymorphic(
 def _raise_for_does_not_link(path, attrname, parent_entity):
     if len(path) > 1:
         path_is_of_type = path[-1].entity is not path[-2].mapper.class_
-        if insp_is_aliased_class(parent_entity):
-            parent_entity_str = str(parent_entity)
-        else:
-            parent_entity_str = parent_entity.class_.__name__
 
         raise sa_exc.ArgumentError(
             f'ORM mapped entity or attribute "{attrname}" does not '
-            f'link from relationship "{path[-2]}%s".%s'
+            f'link from relationship "{entity_str(path[-2])}%s".%s'
             % (
-                f".of_type({path[-1]})" if path_is_of_type else "",
+                (
+                    f".of_type({entity_str(path[-1])})"
+                    if path_is_of_type
+                    else ""
+                ),
                 (
                     "  Did you mean to use "
-                    f'"{path[-2]}'
-                    f'.of_type({parent_entity_str})" or "loadopt.options('
+                    f'"{entity_str(path[-2])}'
+                    f'.of_type({entity_str(parent_entity)})" or '
+                    '"loadopt.options('
                     f"selectin_polymorphic({path[-2].mapper.class_.__name__}, "
-                    f'[{parent_entity_str}]), ...)" ?'
+                    f'[{entity_str(parent_entity)}]), ...)" ?'
                     if not path_is_of_type
                     and not path[-1].is_aliased_class
                     and orm_util._entity_corresponds_to(
@@ -2587,5 +2644,5 @@ def _raise_for_does_not_link(path, attrname, parent_entity):
     else:
         raise sa_exc.ArgumentError(
             f'ORM mapped attribute "{attrname}" does not '
-            f'link mapped class "{path[-1]}"'
+            f'link mapped class "{entity_str(path[-1])}"'
         )

@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from ...sql.type_api import TypeEngine
 
 
-class _NumericType:
+class _NumericCommonType:
     """Base for MySQL numeric types.
 
     This is the base both for NUMERIC as well as INTEGER, hence
@@ -41,13 +41,22 @@ class _NumericType:
         self.zerofill = zerofill
         super().__init__(**kw)
 
-    def __repr__(self) -> str:
-        return util.generic_repr(
-            self, to_inspect=[_NumericType, sqltypes.Numeric]
+
+class _NumericType(
+    _NumericCommonType, sqltypes.Numeric[Union[decimal.Decimal, float]]
+):
+
+    def repr_struct(self) -> util.GenericRepr:
+        return util.GenericRepr(
+            self,
+            to_inspect=[_NumericType, _NumericCommonType, sqltypes.Numeric],
         )
 
 
-class _FloatType(_NumericType, sqltypes.Float[Union[decimal.Decimal, float]]):
+class _FloatType(
+    _NumericCommonType, sqltypes.Float[Union[decimal.Decimal, float]]
+):
+
     def __init__(
         self,
         precision: Optional[int] = None,
@@ -66,20 +75,21 @@ class _FloatType(_NumericType, sqltypes.Float[Union[decimal.Decimal, float]]):
         super().__init__(precision=precision, asdecimal=asdecimal, **kw)
         self.scale = scale
 
-    def __repr__(self) -> str:
-        return util.generic_repr(
-            self, to_inspect=[_FloatType, _NumericType, sqltypes.Float]
+    def repr_struct(self) -> util.GenericRepr:
+        return util.GenericRepr(
+            self, to_inspect=[_FloatType, _NumericCommonType, sqltypes.Float]
         )
 
 
-class _IntegerType(_NumericType, sqltypes.Integer):
+class _IntegerType(_NumericCommonType, sqltypes.Integer):
     def __init__(self, display_width: Optional[int] = None, **kw: Any):
         self.display_width = display_width
         super().__init__(**kw)
 
-    def __repr__(self) -> str:
-        return util.generic_repr(
-            self, to_inspect=[_IntegerType, _NumericType, sqltypes.Integer]
+    def repr_struct(self) -> util.GenericRepr:
+        return util.GenericRepr(
+            self,
+            to_inspect=[_IntegerType, _NumericCommonType, sqltypes.Integer],
         )
 
 
@@ -107,8 +117,8 @@ class _StringType(sqltypes.String):
         self.national = national
         super().__init__(**kw)
 
-    def __repr__(self) -> str:
-        return util.generic_repr(
+    def repr_struct(self) -> util.GenericRepr:
+        return util.GenericRepr(
             self, to_inspect=[_StringType, sqltypes.String]
         )
 

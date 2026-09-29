@@ -46,7 +46,6 @@ from ._collections import UniqueAppender as UniqueAppender
 from ._collections import update_copy as update_copy
 from ._collections import WeakPopulateDict as WeakPopulateDict
 from ._collections import WeakSequence as WeakSequence
-from .compat import anext_ as anext_
 from .compat import arm as arm
 from .compat import b as b
 from .compat import b64decode as b64decode
@@ -64,16 +63,12 @@ from .compat import is64bit as is64bit
 from .compat import local_dataclass_fields as local_dataclass_fields
 from .compat import mini_gil as mini_gil
 from .compat import osx as osx
-from .compat import py310 as py310
-from .compat import py311 as py311
 from .compat import py312 as py312
 from .compat import py313 as py313
 from .compat import py314 as py314
-from .compat import py38 as py38
-from .compat import py39 as py39
 from .compat import pypy as pypy
 from .compat import win32 as win32
-from .concurrency import await_fallback as await_fallback
+from .concurrency import await_ as await_
 from .concurrency import await_only as await_only
 from .concurrency import greenlet_spawn as greenlet_spawn
 from .concurrency import is_exit_exception as is_exit_exception
@@ -105,12 +100,14 @@ from .langhelpers import dictlike_iteritems as dictlike_iteritems
 from .langhelpers import duck_type_collection as duck_type_collection
 from .langhelpers import ellipses_string as ellipses_string
 from .langhelpers import EnsureKWArg as EnsureKWArg
+from .langhelpers import exec_code_in_env as exec_code_in_env
 from .langhelpers import FastIntFlag as FastIntFlag
 from .langhelpers import find_matching_paren as find_matching_paren
 from .langhelpers import format_argspec_init as format_argspec_init
 from .langhelpers import format_argspec_plus as format_argspec_plus
 from .langhelpers import generic_fn_descriptor as generic_fn_descriptor
 from .langhelpers import generic_repr as generic_repr
+from .langhelpers import GenericRepr as GenericRepr
 from .langhelpers import get_callable_argspec as get_callable_argspec
 from .langhelpers import get_cls_kwargs as get_cls_kwargs
 from .langhelpers import get_func_kwargs as get_func_kwargs
@@ -135,14 +132,17 @@ from .langhelpers import (
     monkeypatch_proxied_specials as monkeypatch_proxied_specials,
 )
 from .langhelpers import non_memoized_property as non_memoized_property
-from .langhelpers import NoneType as NoneType
 from .langhelpers import only_once as only_once
 from .langhelpers import (
     parse_user_argument_for_enum as parse_user_argument_for_enum,
 )
+from .langhelpers import (
+    parse_version_from_metadata as parse_version_from_metadata,
+)
+from .langhelpers import parse_version_string as parse_version_string
 from .langhelpers import PluginLoader as PluginLoader
-from .langhelpers import portable_instancemethod as portable_instancemethod
 from .langhelpers import quoted_token_parser as quoted_token_parser
+from .langhelpers import restore_annotations as restore_annotations
 from .langhelpers import ro_memoized_property as ro_memoized_property
 from .langhelpers import ro_non_memoized_property as ro_non_memoized_property
 from .langhelpers import rw_hybridproperty as rw_hybridproperty
@@ -155,6 +155,7 @@ from .langhelpers import TypingOnly as TypingOnly
 from .langhelpers import (
     unbound_method_to_callable as unbound_method_to_callable,
 )
+from .langhelpers import VersionInfo as VersionInfo
 from .langhelpers import walk_subclasses as walk_subclasses
 from .langhelpers import warn as warn
 from .langhelpers import warn_exception as warn_exception

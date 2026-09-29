@@ -16,8 +16,11 @@ from __future__ import annotations
 import collections
 import enum
 from functools import update_wrapper
+import importlib.metadata
+import importlib.util
 import inspect
 import itertools
+import linecache
 import operator
 import re
 import sys
@@ -25,6 +28,7 @@ import textwrap
 import threading
 import types
 from types import CodeType
+from types import ModuleType
 from typing import Any
 from typing import Callable
 from typing import cast
@@ -33,6 +37,7 @@ from typing import FrozenSet
 from typing import Generic
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import NoReturn
 from typing import Optional
 from typing import overload
@@ -44,20 +49,59 @@ from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import Union
 import warnings
+import weakref
 
 from . import _collections
 from . import compat
-from ._has_cy import HAS_CYEXTENSION
-from .typing import Literal
 from .. import exc
 
 _T = TypeVar("_T")
 _T_co = TypeVar("_T_co", covariant=True)
 _F = TypeVar("_F", bound=Callable[..., Any])
-_MP = TypeVar("_MP", bound="memoized_property[Any]")
 _MA = TypeVar("_MA", bound="HasMemoized.memoized_attribute[Any]")
-_HP = TypeVar("_HP", bound="hybridproperty[Any]")
-_HM = TypeVar("_HM", bound="hybridmethod[Any]")
+_M = TypeVar("_M", bound=ModuleType)
+
+
+def restore_annotations(
+    cls: type, new_annotations: dict[str, Any]
+) -> Callable[[], None]:
+    """apply alternate annotations to a class, with a callable to restore
+    the pristine state of the former.
+    This is used strictly to provide dataclasses on a mapped class, where
+    in some cases where are making dataclass fields based on an attribute
+    that is actually a python descriptor on a superclass which we called
+    to get a value.
+    if dataclasses were to give us a way to achieve this without swapping
+    __annotations__, that would be much better.
+    """
+    delattr_ = object()
+
+    # pep-649 means classes have "__annotate__", and it's a callable. if it's
+    # there and is None, we're in "legacy future mode", where it's python 3.14
+    # or higher and "from __future__ import annotations" is set. in "legacy
+    # future mode" we have to do the same steps we do for older pythons,
+    # __annotate__ can be ignored
+    is_pep649 = hasattr(cls, "__annotate__") and cls.__annotate__ is not None
+
+    if is_pep649:
+        memoized = {
+            "__annotate__": getattr(cls, "__annotate__", delattr_),
+        }
+    else:
+        memoized = {
+            "__annotations__": getattr(cls, "__annotations__", delattr_)
+        }
+
+    cls.__annotations__ = new_annotations
+
+    def restore():
+        for k, v in memoized.items():
+            if v is delattr_:
+                delattr(cls, k)
+            else:
+                setattr(cls, k, v)
+
+    return restore
 
 
 def md5_hex(x: Any) -> str:
@@ -304,22 +348,124 @@ def decorator(target: Callable[..., Any]) -> Callable[[_Fn], _Fn]:
             "__name__": fn.__module__,
         }
 
+        # the target's name is part of the description because decorators
+        # built here do get stacked (see ValuesBase.values()), and
+        # update_wrapper() gives every layer the same __qualname__; without
+        # it the outer layer would claim the inner layer's source.
         decorated = cast(
             types.FunctionType,
-            _exec_code_in_env(code, env, fn.__name__),
+            exec_code_in_env(
+                code,
+                env,
+                fn.__name__,
+                f"{target.__name__}() wrapper for "
+                f"{fn.__module__}.{fn.__qualname__}",
+            ),
         )
         decorated.__defaults__ = fn.__defaults__
-        decorated.__kwdefaults__ = fn.__kwdefaults__  # type: ignore
+        decorated.__kwdefaults__ = fn.__kwdefaults__  # type: ignore[union-attr]  # noqa: E501
         return update_wrapper(decorated, fn)  # type: ignore[return-value]
 
     return update_wrapper(decorate, target)  # type: ignore[return-value]
 
 
-def _exec_code_in_env(
-    code: Union[str, types.CodeType], env: Dict[str, Any], fn_name: str
+_LinecacheEntry = Tuple[int, None, List[str], str]
+
+
+def _linecache_cache_getter():
+    """safe getter for linecache.cache
+
+    linecache.cache despite being non-underscored and widely used is
+    nonetheless not documented by cPython.   Therefore we cannot trust that it
+    it's present in third party Python distributions, or that it wont
+    suddenly be removed or changed.  Guard against this such that linecache
+    features will be silently disabled if this should happen.  Unit tests in
+    test/base/test_utils.py ensures linecache.cache remains available for new
+    releases.
+
+    """
+    try:
+        linecache_cache = linecache.cache
+    except AttributeError:
+        raise
+    else:
+        if not isinstance(linecache_cache, dict):
+            raise AttributeError("linecache has changed from being a dict")
+        return linecache_cache
+
+
+def _remove_linecache_entry(filename: str, entry: _LinecacheEntry) -> None:
+    """Discard a ``linecache`` entry made by :func:`.exec_code_in_env`, if
+    it is still the live one.
+
+    Runs from a weakref finalizer.
+
+    This function is only established if we actually added an entry to the
+    linecache within exec_code_in_env.
+
+    """
+    try:
+        linecache_cache = _linecache_cache_getter()
+    except AttributeError:
+        # linecache.cache is gone or is no longer a dict; as this runs
+        # from a finalizer, an exception here would only surface as an
+        # unraisable error
+        return
+
+    if linecache_cache.get(filename) is entry:
+        linecache_cache.pop(filename, None)
+
+
+def exec_code_in_env(
+    code: Union[str, types.CodeType],
+    env: Dict[str, Any],
+    fn_name: str,
+    description: Optional[str] = None,
 ) -> Callable[..., Any]:
+    """Exec generated ``code`` in ``env`` and return the function it defines.
+
+    If ``description`` is passed, the code is compiled against a synthetic
+    filename which is registered with :mod:`linecache`, allowing traceback
+    frames to reference the actual source code being referenced.
+
+    entries are placed in the cache without an expiration time and a
+    weakref.finalize() is applied to the function to remove the linecache
+    entry if and when the function is garbage collected.
+
+    """
+    filename: Optional[str] = None
+    entry: Optional[_LinecacheEntry] = None
+
+    if description is not None:
+        assert isinstance(code, str), (
+            "a description is only meaningful for source that has not "
+            "already been compiled"
+        )
+        filename = f"<sqlalchemy generated {description}>"
+
+        try:
+            linecache_cache = _linecache_cache_getter()
+        except AttributeError:
+            pass
+        else:
+            entry = (len(code), None, code.splitlines(True), filename)
+            linecache_cache[filename] = entry
+        code = compile(code, filename, "exec")
+
     exec(code, env)
-    return env[fn_name]  # type: ignore[no-any-return]
+    fn = env[fn_name]
+
+    if filename is not None and entry is not None:
+        # apply a finalizer that addresses on-the-fly functions, ORM mapped
+        # classes, etc. which might be garbage collected
+        finalizer = weakref.finalize(
+            fn, _remove_linecache_entry, filename, entry
+        )
+        # atexit is a property on the C implementation; typeshed
+        # renders finalize with an empty __slots__
+        finalizer.atexit = False  # type: ignore[misc]
+
+    return fn  # type: ignore[no-any-return]
 
 
 _PF = TypeVar("_PF")
@@ -735,6 +881,143 @@ def unbound_method_to_callable(func_or_cls):
         return func_or_cls
 
 
+class GenericRepr:
+    """Encapsulates the logic for creating a generic __repr__() string.
+
+    This class allows for the repr structure to be created, then modified
+    (e.g., changing the class name), before being rendered as a string.
+
+    .. versionadded:: 2.1
+    """
+
+    __slots__ = (
+        "_obj",
+        "_additional_kw",
+        "_to_inspect",
+        "_omit_kwarg",
+        "_class_name",
+    )
+
+    _obj: Any
+    _additional_kw: Sequence[Tuple[str, Any]]
+    _to_inspect: List[object]
+    _omit_kwarg: Sequence[str]
+    _class_name: Optional[str]
+
+    def __init__(
+        self,
+        obj: Any,
+        additional_kw: Sequence[Tuple[str, Any]] = (),
+        to_inspect: Optional[Union[object, List[object]]] = None,
+        omit_kwarg: Sequence[str] = (),
+    ):
+        """Create a GenericRepr object.
+
+        :param obj: The object being repr'd
+        :param additional_kw: Additional keyword arguments to check for in
+            the repr, as a sequence of 2-tuples of (name, default_value)
+        :param to_inspect: One or more objects whose __init__ signature
+            should be inspected. If not provided, defaults to [obj].
+        :param omit_kwarg: Sequence of keyword argument names to omit from
+            the repr output
+        """
+        self._obj = obj
+        self._additional_kw = additional_kw
+        self._to_inspect = (
+            [obj] if to_inspect is None else _collections.to_list(to_inspect)
+        )
+        self._omit_kwarg = omit_kwarg
+        self._class_name = None
+
+    def set_class_name(self, class_name: str) -> GenericRepr:
+        """Set the class name to be used in the repr.
+
+        By default, the class name is taken from obj.__class__.__name__.
+        This method allows it to be overridden.
+
+        :param class_name: The class name to use
+        :return: self, for method chaining
+        """
+        self._class_name = class_name
+        return self
+
+    def __str__(self) -> str:
+        """Produce the __repr__() string based on the configured parameters."""
+        obj = self._obj
+        to_inspect = self._to_inspect
+        additional_kw = self._additional_kw
+        omit_kwarg = self._omit_kwarg
+
+        missing = object()
+
+        pos_args = []
+        kw_args: _collections.OrderedDict[str, Any] = (
+            _collections.OrderedDict()
+        )
+        vargs = None
+        for i, insp in enumerate(to_inspect):
+            try:
+                spec = compat.inspect_getfullargspec(insp.__init__)  # type: ignore[misc]  # noqa: E501
+            except TypeError:
+                continue
+            else:
+                default_len = len(spec.defaults) if spec.defaults else 0
+                if i == 0:
+                    if spec.varargs:
+                        vargs = spec.varargs
+                    if default_len:
+                        pos_args.extend(spec.args[1:-default_len])
+                    else:
+                        pos_args.extend(spec.args[1:])
+                else:
+                    kw_args.update(
+                        [(arg, missing) for arg in spec.args[1:-default_len]]
+                    )
+
+                if default_len:
+                    assert spec.defaults
+                    kw_args.update(
+                        [
+                            (arg, default)
+                            for arg, default in zip(
+                                spec.args[-default_len:], spec.defaults
+                            )
+                        ]
+                    )
+        output: List[str] = []
+
+        output.extend(repr(getattr(obj, arg, None)) for arg in pos_args)
+
+        if vargs is not None and hasattr(obj, vargs):
+            output.extend([repr(val) for val in getattr(obj, vargs)])
+
+        for arg, defval in kw_args.items():
+            if arg in omit_kwarg:
+                continue
+            try:
+                val = getattr(obj, arg, missing)
+                if val is not missing and val != defval:
+                    output.append("%s=%r" % (arg, val))
+            except Exception:
+                pass
+
+        if additional_kw:
+            for arg, defval in additional_kw:
+                try:
+                    val = getattr(obj, arg, missing)
+                    if val is not missing and val != defval:
+                        output.append("%s=%r" % (arg, val))
+                except Exception:
+                    pass
+
+        class_name = (
+            self._class_name
+            if self._class_name is not None
+            else obj.__class__.__name__
+        )
+        return "%s(%s)" % (class_name, ", ".join(output))
+
+
 def generic_repr(
     obj: Any,
     additional_kw: Sequence[Tuple[str, Any]] = (),
@@ -745,102 +1028,14 @@ def generic_repr(
     specification vs. same-named attributes present.
 
     """
-    if to_inspect is None:
-        to_inspect = [obj]
-    else:
-        to_inspect = _collections.to_list(to_inspect)
-
-    missing = object()
-
-    pos_args = []
-    kw_args: _collections.OrderedDict[str, Any] = _collections.OrderedDict()
-    vargs = None
-    for i, insp in enumerate(to_inspect):
-        try:
-            spec = compat.inspect_getfullargspec(insp.__init__)
-        except TypeError:
-            continue
-        else:
-            default_len = len(spec.defaults) if spec.defaults else 0
-            if i == 0:
-                if spec.varargs:
-                    vargs = spec.varargs
-                if default_len:
-                    pos_args.extend(spec.args[1:-default_len])
-                else:
-                    pos_args.extend(spec.args[1:])
-            else:
-                kw_args.update(
-                    [(arg, missing) for arg in spec.args[1:-default_len]]
-                )
-
-            if default_len:
-                assert spec.defaults
-                kw_args.update(
-                    [
-                        (arg, default)
-                        for arg, default in zip(
-                            spec.args[-default_len:], spec.defaults
-                        )
-                    ]
-                )
-    output: List[str] = []
-
-    output.extend(repr(getattr(obj, arg, None)) for arg in pos_args)
-
-    if vargs is not None and hasattr(obj, vargs):
-        output.extend([repr(val) for val in getattr(obj, vargs)])
-
-    for arg, defval in kw_args.items():
-        if arg in omit_kwarg:
-            continue
-        try:
-            val = getattr(obj, arg, missing)
-            if val is not missing and val != defval:
-                output.append("%s=%r" % (arg, val))
-        except Exception:
-            pass
-
-    if additional_kw:
-        for arg, defval in additional_kw:
-            try:
-                val = getattr(obj, arg, missing)
-                if val is not missing and val != defval:
-                    output.append("%s=%r" % (arg, val))
-            except Exception:
-                pass
-
-    return "%s(%s)" % (obj.__class__.__name__, ", ".join(output))
-
-
-class portable_instancemethod:
-    """Turn an instancemethod into a (parent, name) pair
-    to produce a serializable callable.
-
-    """
-
-    __slots__ = "target", "name", "kwargs", "__weakref__"
-
-    def __getstate__(self):
-        return {
-            "target": self.target,
-            "name": self.name,
-            "kwargs": self.kwargs,
-        }
-
-    def __setstate__(self, state):
-        self.target = state["target"]
-        self.name = state["name"]
-        self.kwargs = state.get("kwargs", ())
-
-    def __init__(self, meth, kwargs=()):
-        self.target = meth.__self__
-        self.name = meth.__name__
-        self.kwargs = kwargs
-
-    def __call__(self, *arg, **kw):
-        kw.update(self.kwargs)
-        return getattr(self.target, self.name)(*arg, **kw)
+    return str(
+        GenericRepr(
+            obj,
+            additional_kw=additional_kw,
+            to_inspect=to_inspect,
+            omit_kwarg=omit_kwarg,
+        )
+    )
 
 
 def class_hierarchy(cls):
@@ -956,12 +1151,22 @@ def monkeypatch_proxied_specials(
         env: Dict[str, types.FunctionType] = (
             from_instance is not None and {name: from_instance} or {}
         )
-        exec(py, env)
+        # the generated source is derived entirely from from_cls and the method
+        # name, and into_cls is a throwaway per-descriptor class whose
+        # __qualname__ is the same for every one of them, so this is keyed on
+        # from_cls rather than into_cls
+        proxied = exec_code_in_env(
+            py,
+            env,
+            method,
+            f"{method} proxying to "
+            f"{from_cls.__module__}.{from_cls.__qualname__}",
+        )
         try:
-            env[method].__defaults__ = fn.__defaults__
+            proxied.__defaults__ = fn.__defaults__
         except AttributeError:
             pass
-        setattr(into_cls, method, env[method])
+        setattr(into_cls, method, proxied)
 
 
 def methods_equivalent(meth1, meth2):
@@ -1188,7 +1393,7 @@ def memoized_instancemethod(fn: _F) -> _F:
         self.__dict__[fn.__name__] = memo
         return result
 
-    return update_wrapper(oneshot, fn)  # type: ignore
+    return update_wrapper(oneshot, fn)  # type: ignore[return-value]
 
 
 class HasMemoized:
@@ -1265,7 +1470,7 @@ class HasMemoized:
             self._memoized_keys |= {fn.__name__}
             return result
 
-        return update_wrapper(oneshot, fn)  # type: ignore
+        return update_wrapper(oneshot, fn)  # type: ignore[return-value]
 
 
 if TYPE_CHECKING:
@@ -1438,7 +1643,7 @@ def duck_type_collection(
         ):
             return set
         else:
-            return specimen.__emulates__  # type: ignore
+            return specimen.__emulates__  # type: ignore[no-any-return]
 
     isa = issubclass if isinstance(specimen, type) else isinstance
     if isa(specimen, list):
@@ -1846,6 +2051,10 @@ def _warnings_warn(
     category: Optional[Type[Warning]] = None,
     stacklevel: int = 2,
 ) -> None:
+
+    if category is None and isinstance(message, Warning):
+        category = type(message)
+
     # adjust the given stacklevel to be outside of SQLAlchemy
     try:
         frame = sys._getframe(stacklevel)
@@ -1948,9 +2157,6 @@ def chop_traceback(
     return tb[start : end + 1]
 
 
-NoneType = type(None)
-
-
 def attrsetter(attrname):
     code = "def set(obj, value):    obj.%s = value" % attrname
     env = locals().copy()
@@ -1958,7 +2164,7 @@ def attrsetter(attrname):
     return env["set"]
 
 
-_dunders = re.compile("^__.+__$")
+dunders_re = re.compile("^__.+__$")
 
 
 class TypingOnly:
@@ -1969,17 +2175,17 @@ class TypingOnly:
 
     __slots__ = ()
 
-    def __init_subclass__(cls) -> None:
+    def __init_subclass__(cls, **kw: Any) -> None:
         if TypingOnly in cls.__bases__:
             remaining = {
-                name for name in cls.__dict__ if not _dunders.match(name)
+                name for name in cls.__dict__ if not dunders_re.match(name)
             }
             if remaining:
                 raise AssertionError(
                     f"Class {cls} directly inherits TypingOnly but has "
                     f"additional attributes {remaining}."
                 )
-        super().__init_subclass__()
+        super().__init_subclass__(**kw)
 
 
 class EnsureKWArg:
@@ -2290,6 +2496,8 @@ def repr_tuple_names(names: List[str]) -> Optional[str]:
 
 
 def has_compiled_ext(raise_=False):
+    from ._has_cython import HAS_CYEXTENSION
+
     if HAS_CYEXTENSION:
         return True
     elif raise_:
@@ -2299,6 +2507,292 @@ def has_compiled_ext(raise_=False):
         )
     else:
         return False
+
+
+def load_uncompiled_module(module: _M) -> _M:
+    """Load the non-compied version of a module that is also
+    compiled with cython.
+    """
+    full_name = module.__name__
+    assert module.__spec__
+    parent_name = module.__spec__.parent
+    assert parent_name
+    parent_module = sys.modules[parent_name]
+    assert parent_module.__spec__
+    package_path = parent_module.__spec__.origin
+    assert package_path and package_path.endswith("__init__.py")
+
+    name = full_name.split(".")[-1]
+    module_path = package_path.replace("__init__.py", f"{name}.py")
+
+    py_spec = importlib.util.spec_from_file_location(full_name, module_path)
+    assert py_spec
+    py_module = importlib.util.module_from_spec(py_spec)
+    assert py_spec.loader
+    py_spec.loader.exec_module(py_module)
+    return cast(_M, py_module)
+
+
+_pre_release_normalize = {
+    "a": "a",
+    "alpha": "a",
+    "b": "b",
+    "beta": "b",
+    "c": "rc",
+    "pre": "rc",
+    "preview": "rc",
+    "rc": "rc",
+}
+
+_version_string_re = re.compile(
+    r"""
+    \s*
+    (?:[a-z][a-z0-9]*[-_])?                       # ignored prefix, "py3-"
+    v?
+    (?P<release>\d+(?:\.\d+)*)
+    (?:                                           # pre-release
+        [-_.]?
+        (?P<pre_l>alpha|beta|preview|pre|rc|a|b|c)
+        [-_.]?
+        (?P<pre_n>\d+)?
+    )?
+    (?:                                           # post-release
+        [-_.]?
+        (?P<post_l>post|rev|r)
+        [-_.]?
+        (?P<post_n>\d+)?
+    )?
+    (?:                                           # developmental release
+        [-_.]?
+        (?P<dev_l>dev)
+        [-_.]?
+        (?P<dev_n>\d+)?
+    )?
+    """,
+    re.X | re.I,
+)
+
+_VersionSortKey = Tuple[
+    Tuple[int, ...],
+    Tuple[int, str, int],
+    Tuple[int, int],
+    Tuple[int, int],
+]
+
+
+def _version_sort_key(
+    release: Tuple[int, ...],
+    pre: Optional[Tuple[str, int]],
+    post: Optional[int],
+    dev: Optional[int],
+) -> _VersionSortKey:
+    if pre is None and post is None and dev is not None:
+        # a dev release with no other qualifiers precedes every
+        # pre-release of the same release number
+        pre_key = (-1, "", 0)
+    elif pre is None:
+        pre_key = (1, "", 0)
+    else:
+        pre_key = (0, pre[0], pre[1])
+
+    return (
+        release,
+        pre_key,
+        (0, 0) if post is None else (1, post),
+        (1, 0) if dev is None else (0, dev),
+    )
+
+
+def _version_comparison(
+    op: Callable[[Any, Any], bool],
+) -> Callable[[VersionInfo, Any], Any]:
+    """Build one of :class:`.VersionInfo`'s comparison methods.
+
+    Comparison takes place against the sort key rather than the tuple
+    itself, so that pre-release and similar qualifiers are taken into
+    account.  A plain tuple is interpreted as the release segment of a
+    final release; anything else is not comparable.
+
+    """
+
+    def compare(self: VersionInfo, other: Any) -> Any:
+        if isinstance(other, VersionInfo):
+            other_key = other._sort_key
+        elif isinstance(other, tuple):
+            other_key = _version_sort_key(other, None, None, None)
+        else:
+            return NotImplemented
+        return op(self._sort_key, other_key)
+
+    return compare
+
+
+class VersionInfo(Tuple[int, ...]):
+    """A version number, as a tuple of integers.
+
+    :class:`.VersionInfo` is a ``tuple`` subclass consisting of the
+    numeric "release" segment of a version only, e.g. ``2.0.0rc1``
+    is the tuple ``(2, 0, 0)``.  Ordering however takes any
+    pre-release, post-release and developmental qualifiers into account
+    as described by :pep:`440`, so that ``2.0.0rc1`` compares as less than
+    ``2.0.0``, including when compared against a plain tuple such as
+    ``(2, 0, 0)``.
+
+    Plain tuples are interpreted as final releases when compared against
+    a :class:`.VersionInfo`.
+
+    .. versionadded:: 2.1
+
+    """
+
+    string: Optional[str]
+    """the string from which this version was parsed, if any."""
+
+    pre: Optional[Tuple[str, int]]
+    """normalized pre-release qualifier, e.g. ``("rc", 1)``."""
+
+    post: Optional[int]
+    """post-release number, if any."""
+
+    dev: Optional[int]
+    """developmental release number, if any."""
+
+    _sort_key: _VersionSortKey
+
+    def __new__(
+        cls,
+        release: Sequence[int] = (),
+        *,
+        string: Optional[str] = None,
+        pre: Optional[Tuple[str, int]] = None,
+        post: Optional[int] = None,
+        dev: Optional[int] = None,
+    ) -> VersionInfo:
+        # __new__ is needed as the release segment has to be passed to
+        # tuple.__new__(); the remaining state is set up in __init__
+        return tuple.__new__(cls, release)
+
+    def __init__(
+        self,
+        release: Sequence[int] = (),
+        *,
+        string: Optional[str] = None,
+        pre: Optional[Tuple[str, int]] = None,
+        post: Optional[int] = None,
+        dev: Optional[int] = None,
+    ):
+        self.string = string
+        self.pre = pre
+        self.post = post
+        self.dev = dev
+        self._sort_key = _version_sort_key(tuple(self), pre, post, dev)
+
+    def __repr__(self) -> str:
+        if self.string is not None:
+            return f"VersionInfo({tuple(self)!r}, string={self.string!r})"
+        else:
+            return f"VersionInfo({tuple(self)!r})"
+
+    def __str__(self) -> str:
+        if self.string is not None:
+            return self.string
+        else:
+            return ".".join(str(num) for num in self)
+
+    # every comparison has to be stated explicitly; ``tuple`` implements
+    # all six of them, so ``functools.total_ordering`` fills in nothing
+    # here and the ones left out would silently compare as plain tuples
+    __eq__ = _version_comparison(operator.eq)
+    __ne__ = _version_comparison(operator.ne)
+    __lt__ = _version_comparison(operator.lt)
+    __le__ = _version_comparison(operator.le)
+    __gt__ = _version_comparison(operator.gt)
+    __ge__ = _version_comparison(operator.ge)
+
+    def __hash__(self) -> int:
+        return hash(self._sort_key)
+
+
+def parse_version_string(version: Optional[str]) -> VersionInfo:
+    """Parse a DBAPI version string into a :class:`.VersionInfo`.
+
+    Leading characters that are not part of the version itself are
+    ignored, as are trailing characters following the version, so that
+    strings such as ``"py3-4.0.19-beta4"`` and
+    ``"2.9.10 (dt dec pq3 ext lo64)"`` parse correctly.
+
+    An empty :class:`.VersionInfo` is returned if no version number can be
+    located at all.
+
+    Parsing is deliberately more tolerant than that of :pep:`440`, which
+    the version strings published by DBAPIs frequently do not conform to;
+    a strict implementation such as that of the ``packaging`` library
+    rejects each of the above outright.
+
+    .. versionadded:: 2.1
+
+    """
+
+    if not version:
+        return VersionInfo((), string=version)
+
+    m = _version_string_re.match(version)
+    if m is None:
+        return VersionInfo((), string=version)
+
+    release = tuple(int(x) for x in m.group("release").split("."))
+
+    pre_l = m.group("pre_l")
+    pre: Optional[Tuple[str, int]]
+    if pre_l is not None:
+        pre = (
+            _pre_release_normalize[pre_l.lower()],
+            int(m.group("pre_n") or 0),
+        )
+    else:
+        pre = None
+
+    return VersionInfo(
+        release,
+        string=version,
+        pre=pre,
+        post=(
+            int(m.group("post_n") or 0)
+            if m.group("post_l") is not None
+            else None
+        ),
+        dev=(
+            int(m.group("dev_n") or 0)
+            if m.group("dev_l") is not None
+            else None
+        ),
+    )
+
+
+def parse_version_from_metadata(distribution: str) -> VersionInfo:
+    """Return the version of an installed distribution as a
+    :class:`.VersionInfo`.
+
+    This is intended for use by dialects whose DBAPI module does not
+    itself publish a version number, such as ``asyncmy``.  As the
+    distribution name is not necessarily the same as the module name, and
+    the installed distribution is not necessarily the module that was
+    imported, this should not be used when the DBAPI module provides a
+    version of its own.
+
+    An empty :class:`.VersionInfo` is returned if the distribution is not
+    installed.
+
+    .. versionadded:: 2.1
+
+    """
+
+    try:
+        version = importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return VersionInfo()
+    else:
+        return parse_version_string(version)
 
 
 class _Missing(enum.Enum):

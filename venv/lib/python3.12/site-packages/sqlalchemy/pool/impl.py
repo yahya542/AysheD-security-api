@@ -16,6 +16,7 @@ import typing
 from typing import Any
 from typing import cast
 from typing import List
+from typing import Literal
 from typing import Optional
 from typing import Set
 from typing import Type
@@ -35,7 +36,6 @@ from .. import exc
 from .. import util
 from ..util import chop_traceback
 from ..util import queue as sqla_queue
-from ..util.typing import Literal
 
 if typing.TYPE_CHECKING:
     from ..engine.interfaces import DBAPIConnection
@@ -117,8 +117,6 @@ class QueuePool(Pool):
           during non-peak periods of use.   When planning for server-side
           timeouts, ensure that a recycle or pre-ping strategy is in use to
           gracefully handle stale connections.
-
-          .. versionadded:: 1.3
 
           .. seealso::
 
@@ -276,10 +274,6 @@ class AsyncAdaptedQueuePool(QueuePool):
     )
 
     _dialect = _AsyncConnDialect()
-
-
-class FallbackAsyncAdaptedQueuePool(AsyncAdaptedQueuePool):
-    _queue_class = sqla_queue.FallbackAsyncAdaptedQueue  # type: ignore[assignment] # noqa: E501
 
 
 class NullPool(Pool):

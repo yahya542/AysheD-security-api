@@ -125,4 +125,5 @@ GETITEM = operators.custom_op(
     precedence=_getitem_precedence,
     natural_self_precedent=True,
     eager_grouping=True,
+    visit_name="hstore_getitem",
 )

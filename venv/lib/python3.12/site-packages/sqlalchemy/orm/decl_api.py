@@ -9,20 +9,22 @@
 
 from __future__ import annotations
 
-import itertools
 import re
 import typing
 from typing import Any
 from typing import Callable
+from typing import cast
 from typing import ClassVar
 from typing import Dict
 from typing import FrozenSet
 from typing import Generic
 from typing import Iterable
 from typing import Iterator
+from typing import Literal
 from typing import Mapping
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Set
 from typing import Tuple
 from typing import Type
@@ -47,12 +49,14 @@ from .base import _is_mapped_class
 from .base import Mapped
 from .base import ORMDescriptor
 from .decl_base import _add_attribute
-from .decl_base import _as_declarative
-from .decl_base import _ClassScanMapperConfig
 from .decl_base import _declarative_constructor
-from .decl_base import _DeferredMapperConfig
+from .decl_base import _DeclarativeMapperConfig
+from .decl_base import _DeclMappedClassProtocol
+from .decl_base import _DeferredDeclarativeConfig
 from .decl_base import _del_attribute
-from .decl_base import _mapper
+from .decl_base import _get_immediate_cls_attr
+from .decl_base import _ORMClassConfigurator
+from .decl_base import MappedClassProtocol
 from .descriptor_props import Composite
 from .descriptor_props import Synonym
 from .descriptor_props import Synonym as _orm_synonym
@@ -60,10 +64,14 @@ from .mapper import Mapper
 from .properties import MappedColumn
 from .relationships import RelationshipProperty
 from .state import InstanceState
+from .. import event
 from .. import exc
 from .. import inspection
 from .. import util
+from ..event import dispatcher
+from ..event import EventTarget
 from ..sql import sqltypes
+from ..sql._annotated_cols import _TC
 from ..sql.base import _NoArg
 from ..sql.elements import SQLCoreOperations
 from ..sql.schema import MetaData
@@ -71,28 +79,25 @@ from ..sql.selectable import FromClause
 from ..util import hybridmethod
 from ..util import hybridproperty
 from ..util import typing as compat_typing
-from ..util import warn_deprecated
+from ..util import TypingOnly
 from ..util.typing import CallableReference
 from ..util.typing import de_optionalize_union_types
-from ..util.typing import flatten_newtype
+from ..util.typing import GenericProtocol
 from ..util.typing import is_generic
 from ..util.typing import is_literal
-from ..util.typing import is_newtype
-from ..util.typing import is_pep593
-from ..util.typing import is_pep695
-from ..util.typing import Literal
 from ..util.typing import LITERAL_TYPES
 from ..util.typing import Self
+from ..util.typing import TypeAliasType
 
 if TYPE_CHECKING:
     from ._typing import _O
     from ._typing import _RegistryType
-    from .decl_base import _DataclassArguments
     from .instrumentation import ClassManager
+    from .interfaces import _DataclassArguments
     from .interfaces import MapperProperty
     from .state import InstanceState  # noqa
     from ..sql._typing import _TypeEngineArgument
-    from ..sql.type_api import _MatchedOnType
+    from ..util.typing import _MatchedOnType
 
 _T = TypeVar("_T", bound=Any)
 _T_co = TypeVar("_T_co", bound=Any, covariant=True)
@@ -197,7 +202,7 @@ class DeclarativeMeta(DeclarativeAttributeIntercept):
                 cls._sa_registry = reg
 
         if not cls.__dict__.get("__abstract__", False):
-            _as_declarative(reg, cls, dict_)
+            _ORMClassConfigurator._as_declarative(reg, cls, dict_)
         type.__init__(cls, classname, bases, dict_)
 
 
@@ -458,7 +463,7 @@ class declared_attr(interfaces._MappedAttribute[_T_co], _declared_attr_common):
     @hybridproperty
     def directive(cls) -> _declared_directive[Any]:
         # see mapping_api.rst for docstring
-        return _declared_directive  # type: ignore
+        return _declared_directive  # type: ignore[return-value]
 
     @hybridproperty
     def cascading(cls) -> _stateful_declared_attr[_T_co]:
@@ -484,6 +489,11 @@ class _stateful_declared_attr(declared_attr[_T_co]):
         return declared_attr(fn, **self.kw)
 
 
+@util.deprecated(
+    "2.1",
+    "The declarative_mixin decorator was used only by the now removed "
+    "mypy plugin so it has no longer any use and can be safely removed.",
+)
 def declarative_mixin(cls: Type[_T]) -> Type[_T]:
     """Mark a class as providing the feature of "declarative mixin".
 
@@ -511,20 +521,14 @@ def declarative_mixin(cls: Type[_T]) -> Type[_T]:
 
     The :func:`_orm.declarative_mixin` decorator currently does not modify
     the given class in any way; it's current purpose is strictly to assist
-    the :ref:`Mypy plugin <mypy_toplevel>` in being able to identify
+    the Mypy plugin in being able to identify
     SQLAlchemy declarative mixin classes when no other context is present.
 
     .. versionadded:: 1.4.6
 
-    .. legacy:: This api is considered legacy and will be deprecated in the next
-      SQLAlchemy version.
-
     .. seealso::
 
         :ref:`orm_mixins_toplevel`
-
-        :ref:`mypy_declarative_mixins` - in the
-        :ref:`Mypy plugin documentation <mypy_toplevel>`
 
     """  # noqa: E501
 
@@ -532,17 +536,10 @@ def declarative_mixin(cls: Type[_T]) -> Type[_T]:
 
 
 def _setup_declarative_base(cls: Type[Any]) -> None:
-    if "metadata" in cls.__dict__:
-        metadata = cls.__dict__["metadata"]
-    else:
-        metadata = None
+    metadata = getattr(cls, "metadata", None)
+    type_annotation_map = getattr(cls, "type_annotation_map", None)
+    reg = getattr(cls, "registry", None)
 
-    if "type_annotation_map" in cls.__dict__:
-        type_annotation_map = cls.__dict__["type_annotation_map"]
-    else:
-        type_annotation_map = None
-
-    reg = cls.__dict__.get("registry", None)
     if reg is not None:
         if not isinstance(reg, registry):
             raise exc.InvalidRequestError(
@@ -572,6 +569,43 @@ def _setup_declarative_base(cls: Type[Any]) -> None:
         cls.__init__ = cls.registry.constructor
 
 
+def _generate_dc_transforms(
+    cls_: Type[_O],
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    eq: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    order: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    unsafe_hash: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    match_args: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    dataclass_callable: Union[
+        _NoArg, Callable[..., Type[Any]]
+    ] = _NoArg.NO_ARG,
+) -> None:
+    apply_dc_transforms: _DataclassArguments = {
+        "init": init,
+        "repr": repr,
+        "eq": eq,
+        "order": order,
+        "unsafe_hash": unsafe_hash,
+        "match_args": match_args,
+        "kw_only": kw_only,
+        "dataclass_callable": dataclass_callable,
+    }
+
+    if hasattr(cls_, "_sa_apply_dc_transforms"):
+        current = cls_._sa_apply_dc_transforms  # type: ignore[attr-defined]
+
+        _DeclarativeMapperConfig._assert_dc_arguments(current)
+
+        cls_._sa_apply_dc_transforms = {  # type: ignore[attr-defined]  # noqa: E501
+            k: current.get(k, _NoArg.NO_ARG) if v is _NoArg.NO_ARG else v
+            for k, v in apply_dc_transforms.items()
+        }
+    else:
+        setattr(cls_, "_sa_apply_dc_transforms", apply_dc_transforms)
+
+
 class MappedAsDataclass(metaclass=DCTransformDeclarative):
     """Mixin class to indicate when mapping this class, also convert it to be
     a dataclass.
@@ -579,7 +613,14 @@ class MappedAsDataclass(metaclass=DCTransformDeclarative):
     .. seealso::
 
         :ref:`orm_declarative_native_dataclasses` - complete background
-        on SQLAlchemy native dataclass mapping
+        on SQLAlchemy native dataclass mapping with
+        :class:`_orm.MappedAsDataclass`.
+
+        :ref:`orm_declarative_dc_mixins` - examples specific to using
+        :class:`_orm.MappedAsDataclass` to create mixins
+
+        :func:`_orm.mapped_as_dataclass` / :func:`_orm.unmapped_dataclass` -
+        decorator versions with equivalent functionality
 
     .. versionadded:: 2.0
 
@@ -599,47 +640,223 @@ class MappedAsDataclass(metaclass=DCTransformDeclarative):
         ] = _NoArg.NO_ARG,
         **kw: Any,
     ) -> None:
-        apply_dc_transforms: _DataclassArguments = {
-            "init": init,
-            "repr": repr,
-            "eq": eq,
-            "order": order,
-            "unsafe_hash": unsafe_hash,
-            "match_args": match_args,
-            "kw_only": kw_only,
-            "dataclass_callable": dataclass_callable,
-        }
-
-        current_transforms: _DataclassArguments
-
-        if hasattr(cls, "_sa_apply_dc_transforms"):
-            current = cls._sa_apply_dc_transforms
-
-            _ClassScanMapperConfig._assert_dc_arguments(current)
-
-            cls._sa_apply_dc_transforms = current_transforms = {  # type: ignore  # noqa: E501
-                k: current.get(k, _NoArg.NO_ARG) if v is _NoArg.NO_ARG else v
-                for k, v in apply_dc_transforms.items()
-            }
-        else:
-            cls._sa_apply_dc_transforms = current_transforms = (
-                apply_dc_transforms
-            )
-
+        _generate_dc_transforms(
+            init=init,
+            repr=repr,
+            eq=eq,
+            order=order,
+            unsafe_hash=unsafe_hash,
+            match_args=match_args,
+            kw_only=kw_only,
+            dataclass_callable=dataclass_callable,
+            cls_=cls,
+        )
         super().__init_subclass__(**kw)
 
         if not _is_mapped_class(cls):
-            new_anno = (
-                _ClassScanMapperConfig._update_annotations_for_non_mapped_class
-            )(cls)
-            _ClassScanMapperConfig._apply_dataclasses_to_any_class(
-                current_transforms, cls, new_anno
-            )
+            # turn unmapped classes into "good enough" dataclasses to serve
+            # as a base or a mixin
+            _ORMClassConfigurator._as_unmapped_dataclass(cls, cls.__dict__)
+
+
+class _DeclarativeTyping(TypingOnly):
+    """Common typing annotations shared by the DeclarativeBase and
+    DeclarativeBaseNoMeta classes.
+    """
+
+    __slots__ = ()
+
+    if typing.TYPE_CHECKING:
+        # protocols for inspection
+        def _sa_inspect_type(self) -> Mapper[Self]: ...
+
+        def _sa_inspect_instance(self) -> InstanceState[Self]: ...
+
+        # internal stuff
+        _sa_registry: ClassVar[_RegistryType]
+
+        # public interface
+        registry: ClassVar[_RegistryType]
+        """Refers to the :class:`_orm.registry` in use where new
+        :class:`_orm.Mapper` objects will be associated."""
+
+        metadata: ClassVar[MetaData]
+        """Refers to the :class:`_schema.MetaData` collection that will be used
+        for new :class:`_schema.Table` objects.
+
+        .. seealso::
+
+            :ref:`orm_declarative_metadata`
+
+        """
+
+        __name__: ClassVar[str]
+
+        # this ideally should be Mapper[Self], but mypy as of 1.4.1 does not
+        # like it, and breaks the declared_attr_one test. Pyright/pylance is
+        # ok with it.
+        __mapper__: ClassVar[Mapper[Any]]
+        """The :class:`_orm.Mapper` object to which a particular class is
+        mapped.
+
+        May also be acquired using :func:`_sa.inspect`, e.g.
+        ``inspect(klass)``.
+
+        """
+
+        __table__: ClassVar[FromClause]
+        """The :class:`_sql.FromClause` to which a particular subclass is
+        mapped.
+
+        This is usually an instance of :class:`_schema.Table` but may also
+        refer to other kinds of :class:`_sql.FromClause` such as
+        :class:`_sql.Subquery`, depending on how the class is mapped.
+
+        .. seealso::
+
+            :ref:`orm_declarative_metadata`
+
+        """
+
+        # pyright/pylance do not consider a classmethod a ClassVar so use Any
+        # https://github.com/microsoft/pylance-release/issues/3484
+        __tablename__: Any
+        """String name to assign to the generated
+        :class:`_schema.Table` object, if not specified directly via
+        :attr:`_orm.DeclarativeBase.__table__`.
+
+        .. seealso::
+
+            :ref:`orm_declarative_table`
+
+        """
+
+        __mapper_args__: Any
+        """Dictionary of arguments which will be passed to the
+        :class:`_orm.Mapper` constructor.
+
+        .. seealso::
+
+            :ref:`orm_declarative_mapper_options`
+
+        """
+
+        __table_args__: Any
+        """A dictionary or tuple of arguments that will be passed to the
+        :class:`_schema.Table` constructor.  See
+        :ref:`orm_declarative_table_configuration`
+        for background on the specific structure of this collection.
+
+        .. seealso::
+
+            :ref:`orm_declarative_table_configuration`
+
+        """
+
+        def __init__(self, **kw: Any): ...
+
+
+class MappedClassWithTypedColumnsProtocol(Protocol[_TC]):
+    """An ORM mapped class that also defines in the ``__typed_cols__``
+    attribute its typed columns.
+
+    .. versionadded:: 2.1.0b2
+    """
+
+    __typed_cols__: _TC
+    """The :class:`_schema.TypedColumns` of this ORM mapped class."""
+
+    __name__: ClassVar[str]
+    __mapper__: ClassVar[Mapper[Any]]
+    __table__: ClassVar[FromClause]
+
+
+@overload
+def as_typed_table(
+    cls: type[MappedClassWithTypedColumnsProtocol[_TC]], /
+) -> FromClause[_TC]: ...
+
+
+@overload
+def as_typed_table(
+    cls: MappedClassProtocol[Any], typed_columns_cls: type[_TC], /
+) -> FromClause[_TC]: ...
+
+
+def as_typed_table(
+    cls: (
+        MappedClassProtocol[Any]
+        | type[MappedClassWithTypedColumnsProtocol[Any]]
+    ),
+    typed_columns_cls: Any = None,
+    /,
+) -> FromClause[Any]:
+    """Return a typed :class:`_sql.FromClause` from the give ORM model.
+
+    This function is just a typing help, at runtime it just returns the
+    ``__table__`` attribute of the provided ORM model.
+
+    It's usually called providing both the ORM model and the
+    :class:`_schema.TypedColumns` class. Single argument calls are supported
+    if the ORM model class provides an annotation pointing to its
+    :class:`_schema.TypedColumns` in the ``__typed_cols__`` attribute.
+
+
+    Example usage::
+
+        from sqlalchemy import TypedColumns
+        from sqlalchemy.orm import DeclarativeBase, mapped_column
+        from sqlalchemy.orm import MappedColumn, as_typed_table
+
+
+        class Base(DeclarativeBase):
+            pass
+
+
+        class A(Base):
+            __tablename__ = "a"
+
+            id: MappedColumn[int] = mapped_column(primary_key=True)
+            data: MappedColumn[str]
+
+
+        class a_cols(A, TypedColumns):
+            pass
+
+
+        # table_a is annotated as FromClause[a_cols]
+        table_a = as_typed_table(A, a_cols)
+
+
+        class B(Base):
+            __tablename__ = "b"
+            __typed_cols__: "b_cols"
+
+            a: Mapped[int] = mapped_column(primary_key=True)
+            b: Mapped[str]
+
+
+        class b_cols(B, TypedColumns):
+            pass
+
+
+        # table_b is a FromClause[b_cols], can call with just B since it
+        # provides the __typed_cols__ annotation
+        table_b = as_typed_table(B)
+
+    For proper typing integration :class:`_orm.MappedColumn` should be used
+    to annotate the single columns, since it's a more specific annotation than
+    the usual :class:`_orm.Mapped` used for ORM attributes.
+
+    .. versionadded:: 2.1.0b2
+    """
+    return cls.__table__
 
 
 class DeclarativeBase(
     # Inspectable is used only by the mypy plugin
     inspection.Inspectable[InstanceState[Any]],
+    _DeclarativeTyping,
     metaclass=DeclarativeAttributeIntercept,
 ):
     """Base class used for declarative class definitions.
@@ -666,7 +883,7 @@ class DeclarativeBase(
     collection as well as a specific value for
     :paramref:`_orm.registry.type_annotation_map`::
 
-        from typing_extensions import Annotated
+        from typing import Annotated
 
         from sqlalchemy import BigInteger
         from sqlalchemy import MetaData
@@ -754,99 +971,14 @@ class DeclarativeBase(
 
     """
 
-    if typing.TYPE_CHECKING:
-
-        def _sa_inspect_type(self) -> Mapper[Self]: ...
-
-        def _sa_inspect_instance(self) -> InstanceState[Self]: ...
-
-        _sa_registry: ClassVar[_RegistryType]
-
-        registry: ClassVar[_RegistryType]
-        """Refers to the :class:`_orm.registry` in use where new
-        :class:`_orm.Mapper` objects will be associated."""
-
-        metadata: ClassVar[MetaData]
-        """Refers to the :class:`_schema.MetaData` collection that will be used
-        for new :class:`_schema.Table` objects.
-
-        .. seealso::
-
-            :ref:`orm_declarative_metadata`
-
-        """
-
-        __name__: ClassVar[str]
-
-        # this ideally should be Mapper[Self], but mypy as of 1.4.1 does not
-        # like it, and breaks the declared_attr_one test. Pyright/pylance is
-        # ok with it.
-        __mapper__: ClassVar[Mapper[Any]]
-        """The :class:`_orm.Mapper` object to which a particular class is
-        mapped.
-
-        May also be acquired using :func:`_sa.inspect`, e.g.
-        ``inspect(klass)``.
-
-        """
-
-        __table__: ClassVar[FromClause]
-        """The :class:`_sql.FromClause` to which a particular subclass is
-        mapped.
-
-        This is usually an instance of :class:`_schema.Table` but may also
-        refer to other kinds of :class:`_sql.FromClause` such as
-        :class:`_sql.Subquery`, depending on how the class is mapped.
-
-        .. seealso::
-
-            :ref:`orm_declarative_metadata`
-
-        """
-
-        # pyright/pylance do not consider a classmethod a ClassVar so use Any
-        # https://github.com/microsoft/pylance-release/issues/3484
-        __tablename__: Any
-        """String name to assign to the generated
-        :class:`_schema.Table` object, if not specified directly via
-        :attr:`_orm.DeclarativeBase.__table__`.
-
-        .. seealso::
-
-            :ref:`orm_declarative_table`
-
-        """
-
-        __mapper_args__: Any
-        """Dictionary of arguments which will be passed to the
-        :class:`_orm.Mapper` constructor.
-
-        .. seealso::
-
-            :ref:`orm_declarative_mapper_options`
-
-        """
-
-        __table_args__: Any
-        """A dictionary or tuple of arguments that will be passed to the
-        :class:`_schema.Table` constructor.  See
-        :ref:`orm_declarative_table_configuration`
-        for background on the specific structure of this collection.
-
-        .. seealso::
-
-            :ref:`orm_declarative_table_configuration`
-
-        """
-
-        def __init__(self, **kw: Any): ...
-
     def __init_subclass__(cls, **kw: Any) -> None:
         if DeclarativeBase in cls.__bases__:
             _check_not_declarative(cls, DeclarativeBase)
             _setup_declarative_base(cls)
         else:
-            _as_declarative(cls._sa_registry, cls, cls.__dict__)
+            _ORMClassConfigurator._as_declarative(
+                cls._sa_registry, cls, cls.__dict__
+            )
         super().__init_subclass__(**kw)
 
 
@@ -867,7 +999,8 @@ def _check_not_declarative(cls: Type[Any], base: Type[Any]) -> None:
 
 class DeclarativeBaseNoMeta(
     # Inspectable is used only by the mypy plugin
-    inspection.Inspectable[InstanceState[Any]]
+    inspection.Inspectable[InstanceState[Any]],
+    _DeclarativeTyping,
 ):
     """Same as :class:`_orm.DeclarativeBase`, but does not use a metaclass
     to intercept new attributes.
@@ -880,95 +1013,14 @@ class DeclarativeBaseNoMeta(
 
     """
 
-    _sa_registry: ClassVar[_RegistryType]
-
-    registry: ClassVar[_RegistryType]
-    """Refers to the :class:`_orm.registry` in use where new
-    :class:`_orm.Mapper` objects will be associated."""
-
-    metadata: ClassVar[MetaData]
-    """Refers to the :class:`_schema.MetaData` collection that will be used
-    for new :class:`_schema.Table` objects.
-
-    .. seealso::
-
-        :ref:`orm_declarative_metadata`
-
-    """
-
-    # this ideally should be Mapper[Self], but mypy as of 1.4.1 does not
-    # like it, and breaks the declared_attr_one test. Pyright/pylance is
-    # ok with it.
-    __mapper__: ClassVar[Mapper[Any]]
-    """The :class:`_orm.Mapper` object to which a particular class is
-    mapped.
-
-    May also be acquired using :func:`_sa.inspect`, e.g.
-    ``inspect(klass)``.
-
-    """
-
-    __table__: Optional[FromClause]
-    """The :class:`_sql.FromClause` to which a particular subclass is
-    mapped.
-
-    This is usually an instance of :class:`_schema.Table` but may also
-    refer to other kinds of :class:`_sql.FromClause` such as
-    :class:`_sql.Subquery`, depending on how the class is mapped.
-
-    .. seealso::
-
-        :ref:`orm_declarative_metadata`
-
-    """
-
-    if typing.TYPE_CHECKING:
-
-        def _sa_inspect_type(self) -> Mapper[Self]: ...
-
-        def _sa_inspect_instance(self) -> InstanceState[Self]: ...
-
-        __tablename__: Any
-        """String name to assign to the generated
-        :class:`_schema.Table` object, if not specified directly via
-        :attr:`_orm.DeclarativeBase.__table__`.
-
-        .. seealso::
-
-            :ref:`orm_declarative_table`
-
-        """
-
-        __mapper_args__: Any
-        """Dictionary of arguments which will be passed to the
-        :class:`_orm.Mapper` constructor.
-
-        .. seealso::
-
-            :ref:`orm_declarative_mapper_options`
-
-        """
-
-        __table_args__: Any
-        """A dictionary or tuple of arguments that will be passed to the
-        :class:`_schema.Table` constructor.  See
-        :ref:`orm_declarative_table_configuration`
-        for background on the specific structure of this collection.
-
-        .. seealso::
-
-            :ref:`orm_declarative_table_configuration`
-
-        """
-
-        def __init__(self, **kw: Any): ...
-
     def __init_subclass__(cls, **kw: Any) -> None:
         if DeclarativeBaseNoMeta in cls.__bases__:
             _check_not_declarative(cls, DeclarativeBaseNoMeta)
             _setup_declarative_base(cls)
         else:
-            _as_declarative(cls._sa_registry, cls, cls.__dict__)
+            _ORMClassConfigurator._as_declarative(
+                cls._sa_registry, cls, cls.__dict__
+            )
         super().__init_subclass__(**kw)
 
 
@@ -1114,7 +1166,7 @@ def declarative_base(
     )
 
 
-class registry:
+class registry(EventTarget):
     """Generalized registry for mapping classes.
 
     The :class:`_orm.registry` serves as the basis for maintaining a collection
@@ -1149,13 +1201,19 @@ class registry:
 
     _class_registry: clsregistry._ClsRegistryType
     _managers: weakref.WeakKeyDictionary[ClassManager[Any], Literal[True]]
-    _non_primary_mappers: weakref.WeakKeyDictionary[Mapper[Any], Literal[True]]
     metadata: MetaData
     constructor: CallableReference[Callable[..., None]]
     type_annotation_map: _MutableTypeAnnotationMapType
     _dependents: Set[_RegistryType]
     _dependencies: Set[_RegistryType]
+    _declare_first_classes: weakref.WeakKeyDictionary[
+        _DeclMappedClassProtocol[Any], Literal[True]
+    ]
+    _declare_last_classes: weakref.WeakKeyDictionary[
+        _DeclMappedClassProtocol[Any], Literal[True]
+    ]
     _new_mappers: bool
+    dispatch: dispatcher["registry"]
 
     def __init__(
         self,
@@ -1211,7 +1269,6 @@ class registry:
 
         self._class_registry = class_registry
         self._managers = weakref.WeakKeyDictionary()
-        self._non_primary_mappers = weakref.WeakKeyDictionary()
         self.metadata = lcl_metadata
         self.constructor = constructor
         self.type_annotation_map = {}
@@ -1219,6 +1276,15 @@ class registry:
             self.update_type_annotation_map(type_annotation_map)
         self._dependents = set()
         self._dependencies = set()
+        self._declare_first_classes = weakref.WeakKeyDictionary()
+        self._declare_last_classes = weakref.WeakKeyDictionary()
+
+        # these listeners are established first, so that user-defined
+        # listeners appended to the same events run after the
+        # ``__declare_first__()`` / ``__declare_last__()`` hooks; a listener
+        # added with ``insert=True`` will run before them
+        event.listen(self, "before_configured", _declare_first_for_registry)
+        event.listen(self, "after_configured", _declare_last_for_registry)
 
         self._new_mappers = False
 
@@ -1239,8 +1305,67 @@ class registry:
             }
         )
 
+    def _resolve_type_with_events(
+        self,
+        cls: Any,
+        key: str,
+        raw_annotation: _MatchedOnType,
+        extracted_type: _MatchedOnType,
+        *,
+        raw_pep_593_type: Optional[GenericProtocol[Any]] = None,
+        pep_593_resolved_argument: Optional[_MatchedOnType] = None,
+        raw_pep_695_type: Optional[TypeAliasType] = None,
+        pep_695_resolved_value: Optional[_MatchedOnType] = None,
+    ) -> Optional[sqltypes.TypeEngine[Any]]:
+        """Resolve type with event support for custom type mapping.
+
+        This method fires the resolve_type_annotation event first to allow
+        custom resolution, then falls back to normal resolution.
+
+        """
+
+        if self.dispatch.resolve_type_annotation:
+            type_resolve = TypeResolve(
+                self,
+                cls,
+                key,
+                raw_annotation,
+                (
+                    pep_593_resolved_argument
+                    if pep_593_resolved_argument is not None
+                    else (
+                        pep_695_resolved_value
+                        if pep_695_resolved_value is not None
+                        else extracted_type
+                    )
+                ),
+                raw_pep_593_type,
+                pep_593_resolved_argument,
+                raw_pep_695_type,
+                pep_695_resolved_value,
+            )
+
+            for fn in self.dispatch.resolve_type_annotation:
+                result = fn(type_resolve)
+                if result is not None:
+                    return sqltypes.to_instance(result)  # type: ignore[no-any-return] # noqa: E501
+
+        if raw_pep_695_type is not None:
+            sqltype = self._resolve_type(raw_pep_695_type)
+            if sqltype is not None:
+                return sqltype
+
+        sqltype = self._resolve_type(extracted_type)
+        if sqltype is not None:
+            return sqltype
+
+        if pep_593_resolved_argument is not None:
+            sqltype = self._resolve_type(pep_593_resolved_argument)
+
+        return sqltype
+
     def _resolve_type(
-        self, python_type: _MatchedOnType, _do_fallbacks: bool = False
+        self, python_type: _MatchedOnType
     ) -> Optional[sqltypes.TypeEngine[Any]]:
         python_type_type: Type[Any]
         search: Iterable[Tuple[_MatchedOnType, Type[Any]]]
@@ -1267,7 +1392,7 @@ class registry:
             # we search through full __mro__ for types.  however...
             sql_type = self.type_annotation_map.get(pt)
             if sql_type is None:
-                sql_type = sqltypes._type_map_get(pt)  # type: ignore  # noqa: E501
+                sql_type = sqltypes._type_map_get(pt)  # type: ignore[arg-type]  # noqa: E501
 
             if sql_type is not None:
                 sql_type_inst = sqltypes.to_instance(sql_type)
@@ -1285,63 +1410,13 @@ class registry:
                 if resolved_sql_type is not None:
                     return resolved_sql_type
 
-        # 2.0 fallbacks
-        if _do_fallbacks:
-            python_type_to_check: Any = None
-            kind = None
-            if is_pep695(python_type):
-                # NOTE: assume there aren't type alias types of new types.
-                python_type_to_check = python_type
-                while is_pep695(python_type_to_check) and not is_pep593(
-                    python_type_to_check
-                ):
-                    python_type_to_check = python_type_to_check.__value__
-                python_type_to_check = de_optionalize_union_types(
-                    python_type_to_check
-                )
-                kind = "pep-695 type"
-            if is_newtype(python_type):
-                python_type_to_check = flatten_newtype(python_type)
-                kind = "NewType"
-
-            if python_type_to_check is not None:
-                res_after_fallback = self._resolve_type(
-                    python_type_to_check, False
-                )
-                if res_after_fallback is not None:
-                    assert kind is not None
-                    if kind == "pep-695 type":
-                        warn_deprecated(
-                            f"Matching to {kind} '{python_type}' in "
-                            "a recursive "
-                            "fashion without the recursed type being present "
-                            "in the type_annotation_map is deprecated; add "
-                            "this type or its recursed value to "
-                            "the type_annotation_map to allow it to match "
-                            "explicitly.",
-                            "2.0",
-                        )
-                    else:
-                        warn_deprecated(
-                            f"Matching the provided {kind} '{python_type}' on "
-                            "its resolved value without matching it in the "
-                            "type_annotation_map is deprecated; add this "
-                            "type to "
-                            "the type_annotation_map to allow it to match "
-                            "explicitly.",
-                            "2.0",
-                        )
-                    return res_after_fallback
-
         return None
 
     @property
     def mappers(self) -> FrozenSet[Mapper[Any]]:
         """read only collection of all :class:`_orm.Mapper` objects."""
 
-        return frozenset(manager.mapper for manager in self._managers).union(
-            self._non_primary_mappers
-        )
+        return frozenset(manager.mapper for manager in self._managers)
 
     def _set_depends_on(self, registry: RegistryType) -> None:
         if registry is self:
@@ -1397,29 +1472,38 @@ class registry:
             todo.update(reg._dependencies.difference(done))
 
     def _mappers_to_configure(self) -> Iterator[Mapper[Any]]:
-        return itertools.chain(
-            (
-                manager.mapper
-                for manager in list(self._managers)
-                if manager.is_mapped
-                and not manager.mapper.configured
-                and manager.mapper._ready_for_configure
-            ),
-            (
-                npm
-                for npm in list(self._non_primary_mappers)
-                if not npm.configured and npm._ready_for_configure
-            ),
+        return (
+            manager.mapper
+            for manager in list(self._managers)
+            if manager.is_mapped
+            and not manager.mapper.configured
+            and manager.mapper._ready_for_configure
         )
 
-    def _add_non_primary_mapper(self, np_mapper: Mapper[Any]) -> None:
-        self._non_primary_mappers[np_mapper] = True
-
     def _dispose_cls(self, cls: Type[_O]) -> None:
-        clsregistry.remove_class(cls.__name__, cls, self._class_registry)
+        clsregistry._remove_class(cls.__name__, cls, self._class_registry)
 
     def _add_manager(self, manager: ClassManager[Any]) -> None:
         self._managers[manager] = True
+
+        # collect the class if it uses the __declare_first__() /
+        # __declare_last__() hooks, so that the registry-level listeners
+        # established in __init__() can invoke them.  the collection is
+        # weak so that the class remains garbage collectable.
+        #
+        # these are insertion ordered dictionaries rather than sets, as a
+        # class is necessarily added after its bases, and the hook of a base
+        # class has to run before that of its subclasses; ConcreteBase
+        # inherits __declare_first__() to the whole hierarchy, and the first
+        # class to run establishes the "type" property that the remaining
+        # ones then adapt as a ConcreteInheritedProperty
+        cls = manager.class_
+        decl_cls = cast("_DeclMappedClassProtocol[Any]", cls)
+        if _get_immediate_cls_attr(cls, "__declare_first__"):
+            self._declare_first_classes[decl_cls] = True
+        if _get_immediate_cls_attr(cls, "__declare_last__"):
+            self._declare_last_classes[decl_cls] = True
+
         if manager.is_mapped:
             raise exc.ArgumentError(
                 "Class '%s' already has a primary mapper defined. "
@@ -1624,12 +1708,13 @@ class registry:
         ),
     )
     @overload
-    def mapped_as_dataclass(self, __cls: Type[_O]) -> Type[_O]: ...
+    def mapped_as_dataclass(self, __cls: Type[_O], /) -> Type[_O]: ...
 
     @overload
     def mapped_as_dataclass(
         self,
         __cls: Literal[None] = ...,
+        /,
         *,
         init: Union[_NoArg, bool] = ...,
         repr: Union[_NoArg, bool] = ...,  # noqa: A002
@@ -1644,6 +1729,7 @@ class registry:
     def mapped_as_dataclass(
         self,
         __cls: Optional[Type[_O]] = None,
+        /,
         *,
         init: Union[_NoArg, bool] = _NoArg.NO_ARG,
         repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
@@ -1673,23 +1759,17 @@ class registry:
 
         """
 
-        def decorate(cls: Type[_O]) -> Type[_O]:
-            setattr(
-                cls,
-                "_sa_apply_dc_transforms",
-                {
-                    "init": init,
-                    "repr": repr,
-                    "eq": eq,
-                    "order": order,
-                    "unsafe_hash": unsafe_hash,
-                    "match_args": match_args,
-                    "kw_only": kw_only,
-                    "dataclass_callable": dataclass_callable,
-                },
-            )
-            _as_declarative(self, cls, cls.__dict__)
-            return cls
+        decorate = mapped_as_dataclass(
+            self,
+            init=init,
+            repr=repr,
+            eq=eq,
+            order=order,
+            unsafe_hash=unsafe_hash,
+            match_args=match_args,
+            kw_only=kw_only,
+            dataclass_callable=dataclass_callable,
+        )
 
         if __cls:
             return decorate(__cls)
@@ -1734,7 +1814,7 @@ class registry:
             :meth:`_orm.registry.mapped_as_dataclass`
 
         """
-        _as_declarative(self, cls, cls.__dict__)
+        _ORMClassConfigurator._as_declarative(self, cls, cls.__dict__)
         return cls
 
     def as_declarative_base(self, **kw: Any) -> Callable[[Type[_T]], Type[_T]]:
@@ -1770,7 +1850,7 @@ class registry:
         def decorate(cls: Type[_T]) -> Type[_T]:
             kw["cls"] = cls
             kw["name"] = cls.__name__
-            return self.generate_base(**kw)  # type: ignore
+            return self.generate_base(**kw)  # type: ignore[no-any-return]
 
         return decorate
 
@@ -1821,8 +1901,8 @@ class registry:
             :meth:`_orm.registry.map_imperatively`
 
         """
-        _as_declarative(self, cls, cls.__dict__)
-        return cls.__mapper__  # type: ignore
+        _ORMClassConfigurator._as_declarative(self, cls, cls.__dict__)
+        return cls.__mapper__  # type: ignore[attr-defined, no-any-return]
 
     def map_imperatively(
         self,
@@ -1880,7 +1960,7 @@ class registry:
             :ref:`orm_declarative_mapping`
 
         """
-        return _mapper(self, class_, local_table, kw)
+        return _ORMClassConfigurator._mapper(self, class_, local_table, kw)
 
 
 RegistryType = registry
@@ -1888,6 +1968,154 @@ RegistryType = registry
 if not TYPE_CHECKING:
     # allow for runtime type resolution of ``ClassVar[_RegistryType]``
     _RegistryType = registry  # noqa
+
+
+def _declare_first_for_registry(registry: registry) -> None:
+    """Invoke ``__declare_first__()`` for classes within this registry."""
+
+    for cls in list(registry._declare_first_classes):
+        cls.__declare_first__()
+
+
+def _declare_last_for_registry(registry: registry) -> None:
+    """Invoke ``__declare_last__()`` for classes within this registry."""
+
+    for cls in list(registry._declare_last_classes):
+        cls.__declare_last__()
+
+
+class TypeResolve:
+    """Primary argument to the :meth:`.RegistryEvents.resolve_type_annotation`
+    event.
+
+    This object contains all the information needed to resolve a Python
+    type to a SQLAlchemy type.  The :attr:`.TypeResolve.resolved_type` is
+    typically the main type that's resolved.  To resolve an arbitrary
+    Python type against the current type map, the :meth:`.TypeResolve.resolve`
+    method may be used.
+
+    .. versionadded:: 2.1
+
+    """
+
+    __slots__ = (
+        "registry",
+        "cls",
+        "key",
+        "raw_type",
+        "resolved_type",
+        "raw_pep_593_type",
+        "raw_pep_695_type",
+        "pep_593_resolved_argument",
+        "pep_695_resolved_value",
+    )
+
+    cls: Any
+    "The class being processed during declarative mapping"
+
+    registry: "registry"
+    "The :class:`registry` being used"
+
+    key: str
+    "String name of the ORM mapped attribute being processed"
+
+    raw_type: _MatchedOnType
+    """The type annotation object directly from the attribute's annotations.
+
+    It's recommended to look at :attr:`.TypeResolve.resolved_type` or
+    one of :attr:`.TypeResolve.pep_593_resolved_argument` or
+    :attr:`.TypeResolve.pep_695_resolved_value` rather than the raw type, as
+    the raw type will not be de-optionalized.
+
+    """
+
+    resolved_type: _MatchedOnType
+    """The de-optionalized, "resolved" type after accounting for :pep:`695`
+    and :pep:`593` indirection:
+
+    * If the annotation were a plain Python type or simple alias e.g.
+      ``Mapped[int]``, the resolved_type will be ``int``
+    * If the annotation refers to a :pep:`695` type that references a
+      plain Python type or simple alias, e.g. ``type MyType = int``
+      then ``Mapped[MyType]``, the type will refer to the ``__value__``
+      of the :pep:`695` type, e.g. ``int``, the same as
+      :attr:`.TypeResolve.pep_695_resolved_value`.
+    * If the annotation refers to a :pep:`593` ``Annotated`` object, or
+      a :pep:`695` type alias that in turn refers to a :pep:`593` type,
+      then the type will be the inner type inside of the ``Annotated``,
+      e.g. ``MyType = Annotated[float, mapped_column(...)]`` with
+      ``Mapped[MyType]`` becomes ``float``, the same as
+      :attr:`.TypeResolve.pep_593_resolved_argument`.
+
+    """
+
+    raw_pep_593_type: Optional[GenericProtocol[Any]]
+    """The de-optionalized :pep:`593` type, if the raw type referred to one.
+
+    This would refer to an ``Annotated`` object.
+
+    """
+
+    pep_593_resolved_argument: Optional[_MatchedOnType]
+    """The type extracted from a :pep:`593` ``Annotated`` construct, if the
+    type referred to one.
+
+    When present, this type would be the same as the
+    :attr:`.TypeResolve.resolved_type`.
+
+    """
+
+    raw_pep_695_type: Optional[TypeAliasType]
+    "The de-optionalized :pep:`695` type, if the raw type referred to one."
+
+    pep_695_resolved_value: Optional[_MatchedOnType]
+    """The de-optionalized type referenced by the raw :pep:`695` type, if the
+    raw type referred to one.
+
+    When present, and a :pep:`593` type is not present, this type would be the
+    same as the :attr:`.TypeResolve.resolved_type`.
+
+    """
+
+    def __init__(
+        self,
+        registry: RegistryType,
+        cls: Any,
+        key: str,
+        raw_type: _MatchedOnType,
+        resolved_type: _MatchedOnType,
+        raw_pep_593_type: Optional[GenericProtocol[Any]],
+        pep_593_resolved_argument: Optional[_MatchedOnType],
+        raw_pep_695_type: Optional[TypeAliasType],
+        pep_695_resolved_value: Optional[_MatchedOnType],
+    ):
+        self.registry = registry
+        self.cls = cls
+        self.key = key
+        self.raw_type = raw_type
+        self.resolved_type = resolved_type
+        self.raw_pep_593_type = raw_pep_593_type
+        self.pep_593_resolved_argument = pep_593_resolved_argument
+        self.raw_pep_695_type = raw_pep_695_type
+        self.pep_695_resolved_value = pep_695_resolved_value
+
+    def resolve(
+        self, python_type: _MatchedOnType
+    ) -> Optional[sqltypes.TypeEngine[Any]]:
+        """Resolve the given python type using the type_annotation_map of
+        the :class:`registry`.
+
+        :param python_type: a Python type (e.g. ``int``, ``str``, etc.)  Any
+         type object that's present in
+         :paramref:`_orm.registry_type_annotation_map` should produce a
+         non-``None`` result.
+        :return: a SQLAlchemy :class:`.TypeEngine` instance
+         (e.g. :class:`.Integer`,
+         :class:`.String`, etc.), or ``None`` to indicate no type could be
+         matched.
+
+        """
+        return self.registry._resolve_type(python_type)
 
 
 def as_declarative(**kw: Any) -> Callable[[Type[_T]], Type[_T]]:
@@ -1945,6 +2173,7 @@ def as_declarative(**kw: Any) -> Callable[[Type[_T]], Type[_T]]:
 )
 def mapped_as_dataclass(
     registry: RegistryType,
+    /,
     *,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
@@ -1984,16 +2213,23 @@ def mapped_as_dataclass(
     .. versionadded:: 2.0.44
 
     """
-    return registry.mapped_as_dataclass(
-        init=init,
-        repr=repr,
-        eq=eq,
-        order=order,
-        unsafe_hash=unsafe_hash,
-        match_args=match_args,
-        kw_only=kw_only,
-        dataclass_callable=dataclass_callable,
-    )
+
+    def decorate(cls: Type[_O]) -> Type[_O]:
+        _generate_dc_transforms(
+            init=init,
+            repr=repr,
+            eq=eq,
+            order=order,
+            unsafe_hash=unsafe_hash,
+            match_args=match_args,
+            kw_only=kw_only,
+            dataclass_callable=dataclass_callable,
+            cls_=cls,
+        )
+        _ORMClassConfigurator._as_declarative(registry, cls, cls.__dict__)
+        return cls
+
+    return decorate
 
 
 @inspection._inspects(
@@ -2002,6 +2238,98 @@ def mapped_as_dataclass(
 def _inspect_decl_meta(cls: Type[Any]) -> Optional[Mapper[Any]]:
     mp: Optional[Mapper[Any]] = _inspect_mapped_class(cls)
     if mp is None:
-        if _DeferredMapperConfig.has_cls(cls):
-            _DeferredMapperConfig.raise_unmapped_for_cls(cls)
+        if _DeferredDeclarativeConfig.has_cls(cls):
+            _DeferredDeclarativeConfig.raise_unmapped_for_cls(cls)
     return mp
+
+
+@compat_typing.dataclass_transform(
+    field_specifiers=(
+        MappedColumn,
+        RelationshipProperty,
+        Composite,
+        Synonym,
+        mapped_column,
+        relationship,
+        composite,
+        synonym,
+        deferred,
+    ),
+)
+@overload
+def unmapped_dataclass(__cls: Type[_O], /) -> Type[_O]: ...
+
+
+@overload
+def unmapped_dataclass(
+    __cls: Literal[None] = ...,
+    /,
+    *,
+    init: Union[_NoArg, bool] = ...,
+    repr: Union[_NoArg, bool] = ...,  # noqa: A002
+    eq: Union[_NoArg, bool] = ...,
+    order: Union[_NoArg, bool] = ...,
+    unsafe_hash: Union[_NoArg, bool] = ...,
+    match_args: Union[_NoArg, bool] = ...,
+    kw_only: Union[_NoArg, bool] = ...,
+    dataclass_callable: Union[_NoArg, Callable[..., Type[Any]]] = ...,
+) -> Callable[[Type[_O]], Type[_O]]: ...
+
+
+def unmapped_dataclass(
+    __cls: Optional[Type[_O]] = None,
+    /,
+    *,
+    init: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
+    eq: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    order: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    unsafe_hash: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    match_args: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    kw_only: Union[_NoArg, bool] = _NoArg.NO_ARG,
+    dataclass_callable: Union[
+        _NoArg, Callable[..., Type[Any]]
+    ] = _NoArg.NO_ARG,
+) -> Union[Type[_O], Callable[[Type[_O]], Type[_O]]]:
+    """Decorator which allows the creation of dataclass-compatible mixins
+    within mapped class hierarchies based on the
+    :func:`_orm.mapped_as_dataclass` decorator.
+
+    Parameters are the same as those of :func:`_orm.mapped_as_dataclass`.
+    The decorator turns the given class into a SQLAlchemy-compatible dataclass
+    in the same way that :func:`_orm.mapped_as_dataclass` does, taking
+    into account :func:`_orm.mapped_column` and other attributes for dataclass-
+    specific directives, but not actually mapping the class.
+
+    To create unmapped dataclass mixins when using a class hierarchy defined
+    by :class:`.DeclarativeBase` and :class:`.MappedAsDataclass`, the
+    :class:`.MappedAsDataclass` class may be subclassed alone for a similar
+    effect.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :ref:`orm_declarative_dc_mixins` - background and example use.
+
+    """
+
+    def decorate(cls: Type[_O]) -> Type[_O]:
+        _generate_dc_transforms(
+            init=init,
+            repr=repr,
+            eq=eq,
+            order=order,
+            unsafe_hash=unsafe_hash,
+            match_args=match_args,
+            kw_only=kw_only,
+            dataclass_callable=dataclass_callable,
+            cls_=cls,
+        )
+        _ORMClassConfigurator._as_unmapped_dataclass(cls, cls.__dict__)
+        return cls
+
+    if __cls:
+        return decorate(__cls)
+    else:
+        return decorate

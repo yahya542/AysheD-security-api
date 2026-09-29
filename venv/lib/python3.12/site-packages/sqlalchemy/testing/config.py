@@ -25,7 +25,6 @@ from typing import Union
 from . import mock
 from . import requirements as _requirements
 from .util import fail
-from .. import util
 
 # default requirements; this is replaced by plugin_base when pytest
 # is run
@@ -79,9 +78,6 @@ else:
 
         def async_test(self, fn):
             return fn
-
-        def fixture_classmethod(self, fn):
-            return classmethod(fn)
 
     # default fixture functions; these are replaced by plugin_base when
     # pytest runs
@@ -172,6 +168,7 @@ def combinations_list(arg_iterable: Iterable[Tuple[Any, ...]], **kw):
 
 
 class Variation:
+    __match_args__ = ("_name",)
     __slots__ = ("_name", "_argname")
 
     def __init__(self, case, argname, case_names):
@@ -199,6 +196,14 @@ class Variation:
 
     def __repr__(self):
         return str(self)
+
+    def __eq__(self, value: object) -> bool:
+        if isinstance(value, str):
+            return self._name == value
+        elif isinstance(value, Variation):
+            return self.name == value.name and self._argname == self._argname
+        else:
+            return NotImplemented
 
     def fail(self) -> NoReturn:
         fail(f"Unknown {self}")
@@ -332,9 +337,7 @@ class Config:
         self.test_schema = "test_schema"
         self.test_schema_2 = "test_schema_2"
 
-        self.is_async = db.dialect.is_async and not util.asbool(
-            db.url.query.get("async_fallback", False)
-        )
+        self.is_async = db.dialect.is_async
 
         from . import provision
 
@@ -435,7 +438,3 @@ def skip_test(msg):
 
 def async_test(fn):
     return _fixture_functions.async_test(fn)
-
-
-def fixture_classmethod(fn):
-    return _fixture_functions.fixture_classmethod(fn)

@@ -18,6 +18,7 @@ from typing import ClassVar
 from typing import Dict
 from typing import Generator
 from typing import Generic
+from typing import Literal
 from typing import NoReturn
 from typing import Optional
 from typing import overload
@@ -27,7 +28,6 @@ import weakref
 
 from . import exc as async_exc
 from ... import util
-from ...util.typing import Literal
 from ...util.typing import Self
 
 _T = TypeVar("_T", bound=Any)
@@ -99,7 +99,7 @@ class ReversibleProxy(Generic[_PT]):
         else:
             proxy = proxy_ref()
             if proxy is not None:
-                return proxy  # type: ignore
+                return proxy  # type: ignore[return-value]
 
         if regenerate:
             return cls._regenerate_proxy_for_target(target, **additional_kw)
@@ -144,11 +144,11 @@ class GeneratorStartableContext(StartableContext[_T_co]):
         args: Tuple[Any, ...],
         kwds: Dict[str, Any],
     ):
-        self.gen = func(*args, **kwds)  # type: ignore
+        self.gen = func(*args, **kwds)  # type: ignore[assignment]
 
     async def start(self, is_ctxmanager: bool = False) -> _T_co:
         try:
-            start_value = await util.anext_(self.gen)
+            start_value = await anext(self.gen)
         except StopAsyncIteration:
             raise RuntimeError("generator didn't yield") from None
 
@@ -167,7 +167,7 @@ class GeneratorStartableContext(StartableContext[_T_co]):
         # vendored from contextlib.py
         if typ is None:
             try:
-                await util.anext_(self.gen)
+                await anext(self.gen)
             except StopAsyncIteration:
                 return False
             else:

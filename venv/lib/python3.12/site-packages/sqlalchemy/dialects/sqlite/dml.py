@@ -7,30 +7,34 @@
 from __future__ import annotations
 
 from typing import Any
+from typing import Dict
 from typing import List
 from typing import Optional
-from typing import Tuple
+from typing import Sequence
 from typing import Union
 
 from .._typing import _OnConflictIndexElementsT
 from .._typing import _OnConflictIndexWhereT
 from .._typing import _OnConflictSetT
 from .._typing import _OnConflictWhereT
+from ... import exc
 from ... import util
 from ...sql import coercions
 from ...sql import roles
 from ...sql import schema
 from ...sql._typing import _DMLTableArgument
-from ...sql.base import _exclusive_against
-from ...sql.base import _generative
 from ...sql.base import ColumnCollection
 from ...sql.base import ReadOnlyColumnCollection
+from ...sql.base import SyntaxExtension
+from ...sql.dml import _DMLColumnElement
 from ...sql.dml import Insert as StandardInsert
 from ...sql.elements import ClauseElement
 from ...sql.elements import ColumnElement
 from ...sql.elements import KeyedColumnElement
 from ...sql.elements import TextClause
 from ...sql.expression import alias
+from ...sql.sqltypes import NULLTYPE
+from ...sql.visitors import InternalTraversal
 from ...util.typing import Self
 
 __all__ = ("Insert", "insert")
@@ -73,7 +77,7 @@ class Insert(StandardInsert):
     """
 
     stringify_dialect = "sqlite"
-    inherit_cache = False
+    inherit_cache = True
 
     @util.memoized_property
     def excluded(
@@ -99,16 +103,6 @@ class Insert(StandardInsert):
         """
         return alias(self.table, name="excluded").columns
 
-    _on_conflict_exclusive = _exclusive_against(
-        "_post_values_clause",
-        msgs={
-            "_post_values_clause": "This Insert construct already has "
-            "an ON CONFLICT clause established"
-        },
-    )
-
-    @_generative
-    @_on_conflict_exclusive
     def on_conflict_do_update(
         self,
         index_elements: _OnConflictIndexElementsT = None,
@@ -118,6 +112,17 @@ class Insert(StandardInsert):
     ) -> Self:
         r"""
         Specifies a DO UPDATE SET action for ON CONFLICT clause.
+
+        This method may be invoked more than once against the same
+        :class:`_sqlite.Insert` construct, where each ``ON CONFLICT`` clause
+        renders in the order in which it was established.
+
+        .. versionadded:: 2.1  Multiple ``ON CONFLICT`` clauses may be
+           established on a single :class:`_sqlite.Insert` construct.
+
+        .. seealso::
+
+            :ref:`sqlite_on_conflict_multiple`
 
         :param index_elements:
          A sequence consisting of string column names, :class:`_schema.Column`
@@ -155,13 +160,10 @@ class Insert(StandardInsert):
 
         """
 
-        self._post_values_clause = OnConflictDoUpdate(
-            index_elements, index_where, set_, where
+        return self.ext(
+            OnConflictDoUpdate(index_elements, index_where, set_, where)
         )
-        return self
 
-    @_generative
-    @_on_conflict_exclusive
     def on_conflict_do_nothing(
         self,
         index_elements: _OnConflictIndexElementsT = None,
@@ -169,6 +171,23 @@ class Insert(StandardInsert):
     ) -> Self:
         """
         Specifies a DO NOTHING action for ON CONFLICT clause.
+
+        This method may be invoked more than once against the same
+        :class:`_sqlite.Insert` construct, and may be combined with
+        :meth:`_sqlite.Insert.on_conflict_do_update`, where each
+        ``ON CONFLICT`` clause renders in the order in which it was
+        established.  As SQLite allows only the last ``ON CONFLICT`` clause
+        of a statement to omit its conflict target, a call that omits
+        :paramref:`_sqlite.Insert.on_conflict_do_nothing.index_elements`
+        must be the last clause established, else
+        :class:`.InvalidRequestError` is raised.
+
+        .. versionadded:: 2.1  Multiple ``ON CONFLICT`` clauses may be
+           established on a single :class:`_sqlite.Insert` construct.
+
+        .. seealso::
+
+            :ref:`sqlite_on_conflict_multiple`
 
         :param index_elements:
          A sequence consisting of string column names, :class:`_schema.Column`
@@ -181,18 +200,20 @@ class Insert(StandardInsert):
 
         """
 
-        self._post_values_clause = OnConflictDoNothing(
-            index_elements, index_where
-        )
-        return self
+        return self.ext(OnConflictDoNothing(index_elements, index_where))
 
 
-class OnConflictClause(ClauseElement):
+class OnConflictClause(SyntaxExtension, ClauseElement):
     stringify_dialect = "sqlite"
 
     inferred_target_elements: Optional[List[Union[str, schema.Column[Any]]]]
     inferred_target_whereclause: Optional[
         Union[ColumnElement[Any], TextClause]
+    ]
+
+    _traverse_internals = [
+        ("inferred_target_elements", InternalTraversal.dp_multi_list),
+        ("inferred_target_whereclause", InternalTraversal.dp_clauseelement),
     ]
 
     def __init__(
@@ -218,16 +239,44 @@ class OnConflictClause(ClauseElement):
                 self.inferred_target_whereclause
             ) = None
 
+    def _append_to_existing(
+        self, existing: Sequence[ClauseElement]
+    ) -> Sequence[ClauseElement]:
+        if existing:
+            last = existing[-1]
+            if (
+                isinstance(last, OnConflictClause)
+                and last.inferred_target_elements is None
+            ):
+                raise exc.InvalidRequestError(
+                    "This Insert construct already has an ON CONFLICT "
+                    "clause that omits a conflict target; such a clause "
+                    "must be the last ON CONFLICT clause in the statement"
+                )
+        return [*existing, self]
+
+    def apply_to_insert(self, insert_stmt: StandardInsert) -> None:
+        insert_stmt.apply_syntax_extension_point(
+            self._append_to_existing, "post_values"
+        )
+
 
 class OnConflictDoNothing(OnConflictClause):
     __visit_name__ = "on_conflict_do_nothing"
+
+    inherit_cache = True
 
 
 class OnConflictDoUpdate(OnConflictClause):
     __visit_name__ = "on_conflict_do_update"
 
-    update_values_to_set: List[Tuple[Union[schema.Column[Any], str], Any]]
+    update_values_to_set: Dict[_DMLColumnElement, ColumnElement[Any]]
     update_whereclause: Optional[ColumnElement[Any]]
+
+    _traverse_internals = OnConflictClause._traverse_internals + [
+        ("update_values_to_set", InternalTraversal.dp_dml_values),
+        ("update_whereclause", InternalTraversal.dp_clauseelement),
+    ]
 
     def __init__(
         self,
@@ -252,10 +301,12 @@ class OnConflictDoUpdate(OnConflictClause):
                 "or a ColumnCollection such as the `.c.` collection "
                 "of a Table object"
             )
-        self.update_values_to_set = [
-            (coercions.expect(roles.DMLColumnRole, key), value)
-            for key, value in set_.items()
-        ]
+        self.update_values_to_set = {
+            coercions.expect(roles.DMLColumnRole, k): coercions.expect(
+                roles.ExpressionElementRole, v, type_=NULLTYPE, is_crud=True
+            )
+            for k, v in set_.items()
+        }
         self.update_whereclause = (
             coercions.expect(roles.WhereHavingRole, where)
             if where is not None

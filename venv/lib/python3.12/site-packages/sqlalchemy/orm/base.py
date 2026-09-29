@@ -14,8 +14,10 @@ import operator
 import typing
 from typing import Any
 from typing import Callable
+from typing import cast
 from typing import Dict
 from typing import Generic
+from typing import Literal
 from typing import no_type_check
 from typing import Optional
 from typing import overload
@@ -26,16 +28,19 @@ from typing import TypeVar
 from typing import Union
 
 from . import exc
+from ._typing import _HasPathString
+from ._typing import _O
 from ._typing import insp_is_mapper
 from .. import exc as sa_exc
 from .. import inspection
 from .. import util
 from ..sql import roles
+from ..sql._typing import _T
+from ..sql._typing import _T_co
 from ..sql.elements import SQLColumnExpression
 from ..sql.elements import SQLCoreOperations
 from ..util import FastIntFlag
 from ..util.langhelpers import TypingOnly
-from ..util.typing import Literal
 
 if typing.TYPE_CHECKING:
     from ._typing import _EntityType
@@ -46,18 +51,16 @@ if typing.TYPE_CHECKING:
     from .instrumentation import ClassManager
     from .interfaces import PropComparator
     from .mapper import Mapper
+    from .properties import MappedColumn
     from .state import InstanceState
     from .util import AliasedClass
     from .writeonly import WriteOnlyCollection
+    from ..sql._annotated_cols import TypedColumns
     from ..sql._typing import _ColumnExpressionArgument
     from ..sql._typing import _InfoType
     from ..sql.elements import ColumnElement
     from ..sql.operators import OperatorType
-
-_T = TypeVar("_T", bound=Any)
-_T_co = TypeVar("_T_co", bound=Any, covariant=True)
-
-_O = TypeVar("_O", bound=object)
+    from ..sql.schema import Column
 
 
 class LoaderCallableStatus(Enum):
@@ -95,6 +98,8 @@ class LoaderCallableStatus(Enum):
 
     """
 
+    DONT_SET = 5
+
 
 (
     PASSIVE_NO_RESULT,
@@ -102,6 +107,7 @@ class LoaderCallableStatus(Enum):
     ATTR_WAS_SET,
     ATTR_EMPTY,
     NO_VALUE,
+    DONT_SET,
 ) = tuple(LoaderCallableStatus)
 
 NEVER_SET = NO_VALUE
@@ -381,6 +387,19 @@ def state_attribute_str(state: InstanceState[Any], attribute: str) -> str:
     return state_str(state) + "." + attribute
 
 
+def entity_str(entity: Any) -> str:
+    """Return a user-facing string for a mapped entity, such as a mapped
+    class, :class:`_orm.Mapper`, or :func:`_orm.aliased` construct.
+
+    Also accepts a :class:`_orm.PathRegistry` directly, which is itself
+    ``inspect()``-able and implements ``path_string()``; in that case
+    this is equivalent to calling
+    :meth:`_orm.PathRegistry.path_string` directly.
+
+    """
+    return cast(_HasPathString, inspection.inspect(entity)).path_string()
+
+
 def object_mapper(instance: _T) -> Mapper[_T]:
     """Given an object, return the primary Mapper associated with the object
     instance.
@@ -438,7 +457,7 @@ def _class_to_mapper(
     # can't get mypy to see an overload for this
     insp = inspection.inspect(class_or_mapper, False)
     if insp is not None:
-        return insp.mapper  # type: ignore
+        return insp.mapper  # type: ignore[no-any-return]
     else:
         assert isinstance(class_or_mapper, type)
         raise exc.UnmappedClassError(class_or_mapper)
@@ -454,7 +473,7 @@ def _mapper_or_none(
     # can't get mypy to see an overload for this
     insp = inspection.inspect(entity, False)
     if insp is not None:
-        return insp.mapper  # type: ignore
+        return insp.mapper  # type: ignore[no-any-return]
     else:
         return None
 
@@ -618,11 +637,7 @@ class InspectionAttr:
     """
 
     _is_internal_proxy = False
-    """True if this object is an internal proxy object.
-
-    .. versionadded:: 1.2.12
-
-    """
+    """True if this object is an internal proxy object."""
 
     is_clause_element = False
     """True if this object is an instance of
@@ -806,6 +821,11 @@ class Mapped(
     if typing.TYPE_CHECKING:
 
         @overload
+        def __get__(  # type: ignore[misc]
+            self: MappedColumn[_T_co], instance: TypedColumns, owner: Any
+        ) -> Column[_T_co]: ...
+
+        @overload
         def __get__(
             self, instance: None, owner: Any
         ) -> InstrumentedAttribute[_T_co]: ...
@@ -815,7 +835,7 @@ class Mapped(
 
         def __get__(
             self, instance: Optional[object], owner: Any
-        ) -> Union[InstrumentedAttribute[_T_co], _T_co]: ...
+        ) -> Union[InstrumentedAttribute[_T_co], Column[_T_co], _T_co]: ...
 
         @classmethod
         def _empty_constructor(cls, arg1: Any) -> Mapped[_T_co]: ...

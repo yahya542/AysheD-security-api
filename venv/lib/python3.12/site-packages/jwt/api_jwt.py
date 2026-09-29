@@ -296,7 +296,7 @@ class PyJWT:
         """
         try:
             payload: dict[str, Any] = json.loads(decoded["payload"])
-        except ValueError as e:
+        except (ValueError, RecursionError) as e:
             raise DecodeError(f"Invalid payload string: {e}") from e
         if not isinstance(payload, dict):
             raise DecodeError("Invalid payload string: must be a json object")
@@ -455,7 +455,7 @@ class PyJWT:
 
     def _validate_jti(self, payload: dict[str, Any]) -> None:
         """
-        Checks whether "jti" if in the payload is valid or not
+        Checks whether "jti" in the payload is valid or not
         This is an Optional claim
 
         :param payload(dict): The payload which needs to be validated
@@ -475,7 +475,7 @@ class PyJWT:
     ) -> None:
         try:
             iat = int(payload["iat"])
-        except ValueError:
+        except (ValueError, TypeError, OverflowError):
             raise InvalidIssuedAtError(
                 "Issued At claim (iat) must be an integer."
             ) from None
@@ -490,7 +490,7 @@ class PyJWT:
     ) -> None:
         try:
             nbf = int(payload["nbf"])
-        except ValueError:
+        except (ValueError, TypeError, OverflowError):
             raise DecodeError("Not Before claim (nbf) must be an integer.") from None
 
         if nbf > (now + leeway):
@@ -504,7 +504,7 @@ class PyJWT:
     ) -> None:
         try:
             exp = int(payload["exp"])
-        except ValueError:
+        except (ValueError, TypeError, OverflowError):
             raise DecodeError(
                 "Expiration Time claim (exp) must be an integer."
             ) from None

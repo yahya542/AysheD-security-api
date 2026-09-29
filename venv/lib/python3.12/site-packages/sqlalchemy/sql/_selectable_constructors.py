@@ -10,12 +10,13 @@ from __future__ import annotations
 from typing import Any
 from typing import Optional
 from typing import overload
-from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import Union
 
 from . import coercions
 from . import roles
+from ._annotated_cols import _KeyColCC_co
+from ._annotated_cols import HasRowPos
 from ._typing import _ColumnsClauseArgument
 from ._typing import _no_kw
 from .elements import ColumnClause
@@ -31,6 +32,8 @@ from .selectable import Select
 from .selectable import TableClause
 from .selectable import TableSample
 from .selectable import Values
+from ..util.typing import TupleAny
+from ..util.typing import Unpack
 
 if TYPE_CHECKING:
     from ._typing import _FromClauseArgument
@@ -47,7 +50,8 @@ if TYPE_CHECKING:
     from ._typing import _T7
     from ._typing import _T8
     from ._typing import _T9
-    from ._typing import _TP
+    from ._typing import _Ts
+    from ._typing import _Ts2
     from ._typing import _TypedColumnClauseArgument as _TCCA
     from .functions import Function
     from .selectable import CTE
@@ -57,8 +61,10 @@ if TYPE_CHECKING:
 
 
 def alias(
-    selectable: FromClause, name: Optional[str] = None, flat: bool = False
-) -> NamedFromClause:
+    selectable: FromClause[_KeyColCC_co],
+    name: Optional[str] = None,
+    flat: bool = False,
+) -> NamedFromClause[_KeyColCC_co]:
     """Return a named alias of the given :class:`.FromClause`.
 
     For :class:`.Table` and :class:`.Join` objects, the return type is the
@@ -108,24 +114,24 @@ def cte(
 # constructors since _SelectStatementForCompoundArgument includes
 # untyped args that make it return CompoundSelect[Unpack[tuple[Never, ...]]]
 # pyright does not have this issue
-_TypedSelectable = Union["Select[_TP]", "CompoundSelect[_TP]"]
+_TypedSelectable = Union["Select[Unpack[_Ts]]", "CompoundSelect[Unpack[_Ts]]"]
 
 
 @overload
 def except_(
-    *selects: _TypedSelectable[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _TypedSelectable[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 @overload
 def except_(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 def except_(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]:
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]:
     r"""Return an ``EXCEPT`` of multiple selectables.
 
     The returned object is an instance of
@@ -140,19 +146,19 @@ def except_(
 
 @overload
 def except_all(
-    *selects: _TypedSelectable[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _TypedSelectable[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 @overload
 def except_all(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 def except_all(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]:
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]:
     r"""Return an ``EXCEPT ALL`` of multiple selectables.
 
     The returned object is an instance of
@@ -169,6 +175,7 @@ def exists(
     __argument: Optional[
         Union[_ColumnsClauseArgument[Any], SelectBase, ScalarSelect[Any]]
     ] = None,
+    /,
 ) -> Exists:
     """Construct a new :class:`_expression.Exists` construct.
 
@@ -212,19 +219,19 @@ def exists(
 
 @overload
 def intersect(
-    *selects: _TypedSelectable[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _TypedSelectable[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 @overload
 def intersect(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 def intersect(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]:
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]:
     r"""Return an ``INTERSECT`` of multiple selectables.
 
     The returned object is an instance of
@@ -239,19 +246,19 @@ def intersect(
 
 @overload
 def intersect_all(
-    *selects: _TypedSelectable[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _TypedSelectable[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 @overload
 def intersect_all(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 def intersect_all(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]:
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]:
     r"""Return an ``INTERSECT ALL`` of multiple selectables.
 
     The returned object is an instance of
@@ -386,19 +393,17 @@ def outerjoin(
 
 
 @overload
-def select(__ent0: _TCCA[_T0]) -> Select[Tuple[_T0]]: ...
+def select(__ent0: _TCCA[_T0], /) -> Select[_T0]: ...
+
+
+@overload
+def select(__ent0: _TCCA[_T0], __ent1: _TCCA[_T1], /) -> Select[_T0, _T1]: ...
 
 
 @overload
 def select(
-    __ent0: _TCCA[_T0], __ent1: _TCCA[_T1]
-) -> Select[Tuple[_T0, _T1]]: ...
-
-
-@overload
-def select(
-    __ent0: _TCCA[_T0], __ent1: _TCCA[_T1], __ent2: _TCCA[_T2]
-) -> Select[Tuple[_T0, _T1, _T2]]: ...
+    __ent0: _TCCA[_T0], __ent1: _TCCA[_T1], __ent2: _TCCA[_T2], /
+) -> Select[_T0, _T1, _T2]: ...
 
 
 @overload
@@ -407,7 +412,8 @@ def select(
     __ent1: _TCCA[_T1],
     __ent2: _TCCA[_T2],
     __ent3: _TCCA[_T3],
-) -> Select[Tuple[_T0, _T1, _T2, _T3]]: ...
+    /,
+) -> Select[_T0, _T1, _T2, _T3]: ...
 
 
 @overload
@@ -417,7 +423,8 @@ def select(
     __ent2: _TCCA[_T2],
     __ent3: _TCCA[_T3],
     __ent4: _TCCA[_T4],
-) -> Select[Tuple[_T0, _T1, _T2, _T3, _T4]]: ...
+    /,
+) -> Select[_T0, _T1, _T2, _T3, _T4]: ...
 
 
 @overload
@@ -428,7 +435,8 @@ def select(
     __ent3: _TCCA[_T3],
     __ent4: _TCCA[_T4],
     __ent5: _TCCA[_T5],
-) -> Select[Tuple[_T0, _T1, _T2, _T3, _T4, _T5]]: ...
+    /,
+) -> Select[_T0, _T1, _T2, _T3, _T4, _T5]: ...
 
 
 @overload
@@ -440,7 +448,8 @@ def select(
     __ent4: _TCCA[_T4],
     __ent5: _TCCA[_T5],
     __ent6: _TCCA[_T6],
-) -> Select[Tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6]]: ...
+    /,
+) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6]: ...
 
 
 @overload
@@ -453,7 +462,8 @@ def select(
     __ent5: _TCCA[_T5],
     __ent6: _TCCA[_T6],
     __ent7: _TCCA[_T7],
-) -> Select[Tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7]]: ...
+    /,
+) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7]: ...
 
 
 @overload
@@ -467,7 +477,8 @@ def select(
     __ent6: _TCCA[_T6],
     __ent7: _TCCA[_T7],
     __ent8: _TCCA[_T8],
-) -> Select[Tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, _T8]]: ...
+    /,
+) -> Select[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, _T8]: ...
 
 
 @overload
@@ -482,19 +493,87 @@ def select(
     __ent7: _TCCA[_T7],
     __ent8: _TCCA[_T8],
     __ent9: _TCCA[_T9],
-) -> Select[Tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, _T8, _T9]]: ...
+    /,
+    *entities: _ColumnsClauseArgument[Any],
+) -> Select[
+    _T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, _T8, _T9, Unpack[TupleAny]
+]: ...
 
 
 # END OVERLOADED FUNCTIONS select
+@overload
+def select(
+    __table: FromClause[HasRowPos[Unpack[_Ts]]],  # type: ignore[type-var]
+) -> Select[Unpack[_Ts]]: ...
+
+
+# NOTE: this seems to currently be interpreted by mypy as not allowed.
+# https://peps.python.org/pep-0646/#multiple-type-variable-tuples-not-allowed
+# https://github.com/python/mypy/issues/20188
+@overload
+def select(
+    __table: FromClause[HasRowPos[Unpack[_Ts]]],  # type: ignore[type-var]
+    __table2: FromClause[HasRowPos[Unpack[_Ts2]]],  # type: ignore[type-var]
+) -> Select[Unpack[_Ts], Unpack[_Ts2]]: ...  # type: ignore[misc]
+
+
+@overload
+def select(
+    __table: FromClause[HasRowPos[Unpack[_Ts]]],  # type: ignore[type-var]
+    __ent0: _TCCA[_T0],
+) -> Select[Unpack[_Ts], _T0]: ...
+
+
+@overload
+def select(
+    __table: FromClause[HasRowPos[Unpack[_Ts]]],  # type: ignore[type-var]
+    __ent0: _TCCA[_T0],
+    __ent1: _TCCA[_T1],
+) -> Select[Unpack[_Ts], _T0, _T1]: ...
+
+
+@overload
+def select(
+    __table: FromClause[HasRowPos[Unpack[_Ts]]],  # type: ignore[type-var]
+    __ent0: _TCCA[_T0],
+    __ent1: _TCCA[_T1],
+    __ent2: _TCCA[_T2],
+) -> Select[Unpack[_Ts], _T0, _T1, _T2]: ...
+
+
+@overload
+def select(
+    __ent0: _TCCA[_T0],
+    __table: FromClause[HasRowPos[Unpack[_Ts]]],  # type: ignore[type-var]
+) -> Select[_T0, Unpack[_Ts]]: ...
+
+
+@overload
+def select(
+    __ent0: _TCCA[_T0],
+    __ent1: _TCCA[_T1],
+    __table: FromClause[HasRowPos[Unpack[_Ts]]],  # type: ignore[type-var]
+) -> Select[_T0, _T1, Unpack[_Ts]]: ...
+
+
+@overload
+def select(
+    __ent0: _TCCA[_T0],
+    __ent1: _TCCA[_T1],
+    __ent2: _TCCA[_T2],
+    __table: FromClause[HasRowPos[Unpack[_Ts]]],  # type: ignore[type-var]
+) -> Select[_T0, _T1, _T2, Unpack[_Ts]]: ...
 
 
 @overload
 def select(
     *entities: _ColumnsClauseArgument[Any], **__kw: Any
-) -> Select[Any]: ...
+) -> Select[Unpack[TupleAny]]: ...
 
 
-def select(*entities: _ColumnsClauseArgument[Any], **__kw: Any) -> Select[Any]:
+def select(
+    *entities: _ColumnsClauseArgument[Any], **__kw: Any
+) -> Select[Unpack[TupleAny]]:
     r"""Construct a new :class:`_expression.Select`.
 
 
@@ -553,8 +632,6 @@ def table(name: str, *columns: ColumnClause[Any], **kw: Any) -> TableClause:
 
     :param schema: The schema name for this table.
 
-        .. versionadded:: 1.3.18 :func:`_expression.table` can now
-           accept a ``schema`` argument.
     """
 
     return TableClause(name, *columns, **kw)
@@ -612,19 +689,19 @@ def tablesample(
 
 @overload
 def union(
-    *selects: _TypedSelectable[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _TypedSelectable[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 @overload
 def union(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 def union(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]:
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]:
     r"""Return a ``UNION`` of multiple selectables.
 
     The returned object is an instance of
@@ -646,19 +723,19 @@ def union(
 
 @overload
 def union_all(
-    *selects: _TypedSelectable[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _TypedSelectable[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 @overload
 def union_all(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]: ...
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]: ...
 
 
 def union_all(
-    *selects: _SelectStatementForCompoundArgument[_TP],
-) -> CompoundSelect[_TP]:
+    *selects: _SelectStatementForCompoundArgument[Unpack[_Ts]],
+) -> CompoundSelect[Unpack[_Ts]]:
     r"""Return a ``UNION ALL`` of multiple selectables.
 
     The returned object is an instance of

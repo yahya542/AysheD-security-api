@@ -19,7 +19,9 @@ from typing import Callable
 from typing import Dict
 from typing import Generic
 from typing import Iterable
+from typing import Literal
 from typing import Optional
+from typing import Protocol
 from typing import Set
 from typing import Tuple
 from typing import TYPE_CHECKING
@@ -44,14 +46,14 @@ from .path_registry import PathRegistry
 from .. import exc as sa_exc
 from .. import inspection
 from .. import util
-from ..util.typing import Literal
-from ..util.typing import Protocol
+from ..util.typing import TupleAny
+from ..util.typing import Unpack
 
 if TYPE_CHECKING:
     from ._typing import _IdentityKeyType
     from ._typing import _InstanceDict
     from ._typing import _LoaderCallable
-    from .attributes import AttributeImpl
+    from .attributes import _AttributeImpl
     from .attributes import History
     from .base import PassiveFlag
     from .collections import _AdaptedCollectionProtocol
@@ -92,7 +94,10 @@ class _InstallLoaderCallableProto(Protocol[_O]):
     """
 
     def __call__(
-        self, state: InstanceState[_O], dict_: _InstanceDict, row: Row[Any]
+        self,
+        state: InstanceState[_O],
+        dict_: _InstanceDict,
+        row: Row[Unpack[TupleAny]],
     ) -> None: ...
 
 
@@ -264,8 +269,6 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
             :class:`.Session`, use the :attr:`.InstanceState.was_deleted`
             accessor.
 
-        .. versionadded: 1.1
-
         .. seealso::
 
             :ref:`session_object_states`
@@ -331,8 +334,6 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
     def _track_last_known_value(self, key: str) -> None:
         """Track the last known value of a particular key after expiration
         operations.
-
-        .. versionadded:: 1.3
 
         """
 
@@ -534,7 +535,7 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
         del obj
 
         self._cleanup(self.obj)
-        self.obj = lambda: None  # type: ignore
+        self.obj = lambda: None  # type: ignore[assignment]
 
     def _cleanup(self, ref: weakref.ref[_O]) -> None:
         """Weakref callback cleanup.
@@ -599,7 +600,7 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
     def get_history(self, key: str, passive: PassiveFlag) -> History:
         return self.manager[key].impl.get_history(self, self.dict, passive)
 
-    def get_impl(self, key: str) -> AttributeImpl:
+    def get_impl(self, key: str) -> _AttributeImpl:
         return self.manager[key].impl
 
     def _get_pending_mutation(self, key: str) -> PendingCollection:
@@ -643,7 +644,7 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
             self.obj = weakref.ref(inst, self._cleanup)
             self.class_ = inst.__class__
         else:
-            self.obj = lambda: None  # type: ignore
+            self.obj = lambda: None  # type: ignore[assignment]
             self.class_ = state_dict["class_"]
 
         self.committed_state = state_dict.get("committed_state", {})
@@ -703,7 +704,9 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
             fixed_impl = impl
 
             def _set_callable(
-                state: InstanceState[_O], dict_: _InstanceDict, row: Row[Any]
+                state: InstanceState[_O],
+                dict_: _InstanceDict,
+                row: Row[Unpack[TupleAny]],
             ) -> None:
                 if "callables" not in state.__dict__:
                     state.callables = {}
@@ -715,7 +718,9 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
         else:
 
             def _set_callable(
-                state: InstanceState[_O], dict_: _InstanceDict, row: Row[Any]
+                state: InstanceState[_O],
+                dict_: _InstanceDict,
+                row: Row[Unpack[TupleAny]],
             ) -> None:
                 if "callables" not in state.__dict__:
                     state.callables = {}
@@ -890,7 +895,7 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
     def _modified_event(
         self,
         dict_: _InstanceDict,
-        attr: Optional[AttributeImpl],
+        attr: Optional[_AttributeImpl],
         previous: Any,
         collection: bool = False,
         is_userland: bool = False,
@@ -989,7 +994,9 @@ class InstanceState(interfaces.InspectionAttrInfo, Generic[_O]):
                 del self.callables[key]
 
     def _commit_all(
-        self, dict_: _InstanceDict, instance_dict: Optional[IdentityMap] = None
+        self,
+        dict_: _InstanceDict,
+        instance_dict: Optional[IdentityMap] = None,
     ) -> None:
         """commit all attributes unconditionally.
 

@@ -26,6 +26,7 @@ from typing import ClassVar
 from typing import Dict
 from typing import Iterable
 from typing import List
+from typing import Literal
 from typing import NamedTuple
 from typing import Optional
 from typing import overload
@@ -33,6 +34,7 @@ from typing import Sequence
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
+from typing import TypeGuard
 from typing import TypeVar
 from typing import Union
 
@@ -45,6 +47,7 @@ from .base import ATTR_EMPTY
 from .base import ATTR_WAS_SET
 from .base import CALLABLES_OK
 from .base import DEFERRED_HISTORY_LOAD
+from .base import DONT_SET
 from .base import INCLUDE_PENDING_MUTATIONS  # noqa
 from .base import INIT_OK
 from .base import instance_dict as instance_dict
@@ -89,9 +92,7 @@ from ..sql import visitors
 from ..sql.cache_key import HasCacheKey
 from ..sql.visitors import _TraverseInternalsType
 from ..sql.visitors import InternalTraversal
-from ..util.typing import Literal
 from ..util.typing import Self
-from ..util.typing import TypeGuard
 
 if TYPE_CHECKING:
     from ._typing import _EntityType
@@ -106,7 +107,7 @@ if TYPE_CHECKING:
     from .relationships import RelationshipProperty
     from .state import InstanceState
     from .util import AliasedInsp
-    from .writeonly import WriteOnlyAttributeImpl
+    from .writeonly import _WriteOnlyAttributeImpl
     from ..event.base import _Dispatch
     from ..sql._typing import _ColumnExpressionArgument
     from ..sql._typing import _DMLColumnArgument
@@ -184,7 +185,7 @@ class QueryableAttribute(
     class_: _ExternalEntityType[Any]
     key: str
     parententity: _InternalEntityType[Any]
-    impl: AttributeImpl
+    impl: _AttributeImpl
     comparator: interfaces.PropComparator[_T_co]
     _of_type: Optional[_InternalEntityType[Any]]
     _extra_criteria: Tuple[ColumnElement[bool], ...]
@@ -200,7 +201,7 @@ class QueryableAttribute(
         key: str,
         parententity: _InternalEntityType[_O],
         comparator: interfaces.PropComparator[_T_co],
-        impl: Optional[AttributeImpl] = None,
+        impl: Optional[_AttributeImpl] = None,
         of_type: Optional[_InternalEntityType[Any]] = None,
         extra_criteria: Tuple[ColumnElement[bool], ...] = (),
     ):
@@ -213,7 +214,7 @@ class QueryableAttribute(
         # interim class manager setup, there's a check for None to see if it
         # needs to be populated, so we assign None here leaving the attribute
         # in a temporarily not-type-correct state
-        self.impl = impl  # type: ignore
+        self.impl = impl  # type: ignore[assignment]
 
         assert comparator is not None
         self.comparator = comparator
@@ -230,7 +231,7 @@ class QueryableAttribute(
                 if key in base:
                     self.dispatch._update(base[key].dispatch)
                     if base[key].dispatch._active_history:
-                        self.dispatch._active_history = True  # type: ignore
+                        self.dispatch._active_history = True  # type: ignore[attr-defined]  # noqa: E501
 
     _cache_key_traversal = [
         ("key", visitors.ExtendedInternalTraversal.dp_string),
@@ -391,6 +392,11 @@ class QueryableAttribute(
 
         return self.comparator._bulk_update_tuples(value)
 
+    def _bulk_dml_setter(self, key: str) -> Optional[Callable[..., Any]]:
+        """return a callable that will process a bulk INSERT value"""
+
+        return self.comparator._bulk_dml_setter(key)
+
     def adapt_to_entity(self, adapt_to_entity: AliasedInsp[Any]) -> Self:
         assert not self._of_type
         return self.__class__(
@@ -528,11 +534,11 @@ class InstrumentedAttribute(QueryableAttribute[_T_co]):
     def __doc__(self) -> Optional[str]:
         return self._doc
 
-    @__doc__.setter  # type: ignore
+    @__doc__.setter  # type: ignore[no-redef]
     def __doc__(self, value: Optional[str]) -> None:
         self._doc = value
 
-    @__doc__.classlevel  # type: ignore
+    @__doc__.classlevel  # type: ignore[no-redef]
     def __doc__(cls) -> Optional[str]:
         return super().__doc__
 
@@ -570,7 +576,7 @@ class InstrumentedAttribute(QueryableAttribute[_T_co]):
 
 
 @dataclasses.dataclass(frozen=True)
-class AdHocHasEntityNamespace(HasCacheKey):
+class _AdHocHasEntityNamespace(HasCacheKey):
     _traverse_internals: ClassVar[_TraverseInternalsType] = [
         ("_entity_namespace", InternalTraversal.dp_has_cache_key),
     ]
@@ -586,7 +592,7 @@ class AdHocHasEntityNamespace(HasCacheKey):
         return self._entity_namespace.entity_namespace
 
 
-def create_proxied_attribute(
+def _create_proxied_attribute(
     descriptor: Any,
 ) -> Callable[..., QueryableAttribute[Any]]:
     """Create an QueryableAttribute / user descriptor hybrid.
@@ -665,7 +671,7 @@ def create_proxied_attribute(
             else:
                 # used by hybrid attributes which try to remain
                 # agnostic of any ORM concepts like mappers
-                return AdHocHasEntityNamespace(self._parententity)
+                return _AdHocHasEntityNamespace(self._parententity)
 
         @property
         def property(self):
@@ -801,7 +807,7 @@ class AttributeEventToken:
 
     __slots__ = "impl", "op", "parent_token"
 
-    def __init__(self, attribute_impl: AttributeImpl, op: util.symbol):
+    def __init__(self, attribute_impl: _AttributeImpl, op: util.symbol):
         self.impl = attribute_impl
         self.op = op
         self.parent_token = self.impl.parent_token
@@ -825,7 +831,7 @@ AttributeEvent = AttributeEventToken  # legacy
 Event = AttributeEventToken  # legacy
 
 
-class AttributeImpl:
+class _AttributeImpl:
     """internal implementation for instrumented attributes."""
 
     collection: bool
@@ -1055,20 +1061,9 @@ class AttributeImpl:
     def _default_value(
         self, state: InstanceState[Any], dict_: _InstanceDict
     ) -> Any:
-        """Produce an empty value for an uninitialized scalar attribute."""
+        """Produce an empty value for an uninitialized attribute."""
 
-        assert self.key not in dict_, (
-            "_default_value should only be invoked for an "
-            "uninitialized or expired attribute"
-        )
-
-        value = None
-        for fn in self.dispatch.init_scalar:
-            ret = fn(state, value, dict_)
-            if ret is not ATTR_EMPTY:
-                value = ret
-
-        return value
+        raise NotImplementedError()
 
     def get(
         self,
@@ -1212,7 +1207,7 @@ class AttributeImpl:
         return value
 
 
-class ScalarAttributeImpl(AttributeImpl):
+class _ScalarAttributeImpl(_AttributeImpl):
     """represents a scalar value-holding InstrumentedAttribute."""
 
     default_accepts_scalar_loader = True
@@ -1221,14 +1216,37 @@ class ScalarAttributeImpl(AttributeImpl):
     collection = False
     dynamic = False
 
-    __slots__ = "_replace_token", "_append_token", "_remove_token"
+    __slots__ = (
+        "_default_scalar_value",
+        "_replace_token",
+        "_append_token",
+        "_remove_token",
+    )
 
-    def __init__(self, *arg, **kw):
+    def __init__(self, *arg, default_scalar_value=None, **kw):
         super().__init__(*arg, **kw)
+        self._default_scalar_value = default_scalar_value
         self._replace_token = self._append_token = AttributeEventToken(
             self, OP_REPLACE
         )
         self._remove_token = AttributeEventToken(self, OP_REMOVE)
+
+    def _default_value(
+        self, state: InstanceState[Any], dict_: _InstanceDict
+    ) -> Any:
+        """Produce an empty value for an uninitialized scalar attribute."""
+
+        assert self.key not in dict_, (
+            "_default_value should only be invoked for an "
+            "uninitialized or expired attribute"
+        )
+        value = self._default_scalar_value
+        for fn in self.dispatch.init_scalar:
+            ret = fn(state, value, dict_)
+            if ret is not ATTR_EMPTY:
+                value = ret
+
+        return value
 
     def delete(self, state: InstanceState[Any], dict_: _InstanceDict) -> None:
         if self.dispatch._active_history:
@@ -1278,6 +1296,9 @@ class ScalarAttributeImpl(AttributeImpl):
         check_old: Optional[object] = None,
         pop: bool = False,
     ) -> None:
+        if value is DONT_SET:
+            return
+
         if self.dispatch._active_history:
             old = self.get(state, dict_, PASSIVE_RETURN_NO_VALUE)
         else:
@@ -1315,7 +1336,7 @@ class ScalarAttributeImpl(AttributeImpl):
             fn(state, value, initiator or self._remove_token)
 
 
-class ScalarObjectAttributeImpl(ScalarAttributeImpl):
+class _ScalarObjectAttributeImpl(_ScalarAttributeImpl):
     """represents a scalar-holding InstrumentedAttribute,
     where the target object is also instrumented.
 
@@ -1444,6 +1465,9 @@ class ScalarObjectAttributeImpl(ScalarAttributeImpl):
     ) -> None:
         """Set a value on the given InstanceState."""
 
+        if value is DONT_SET:
+            return
+
         if self.dispatch._active_history:
             old = self.get(
                 state,
@@ -1526,7 +1550,7 @@ class ScalarObjectAttributeImpl(ScalarAttributeImpl):
         return value
 
 
-class HasCollectionAdapter:
+class _HasCollectionAdapter:
     __slots__ = ()
 
     collection: bool
@@ -1598,14 +1622,14 @@ class HasCollectionAdapter:
 if TYPE_CHECKING:
 
     def _is_collection_attribute_impl(
-        impl: AttributeImpl,
-    ) -> TypeGuard[CollectionAttributeImpl]: ...
+        impl: _AttributeImpl,
+    ) -> TypeGuard[_CollectionAttributeImpl]: ...
 
 else:
     _is_collection_attribute_impl = operator.attrgetter("collection")
 
 
-class CollectionAttributeImpl(HasCollectionAdapter, AttributeImpl):
+class _CollectionAttributeImpl(_HasCollectionAdapter, _AttributeImpl):
     """A collection-holding attribute that instruments changes in membership.
 
     Only handles collections of instrumented objects.
@@ -1928,6 +1952,10 @@ class CollectionAttributeImpl(HasCollectionAdapter, AttributeImpl):
         pop: bool = False,
         _adapt: bool = True,
     ) -> None:
+
+        if value is DONT_SET:
+            return
+
         iterable = orig_iterable = value
         new_keys = None
 
@@ -1935,33 +1963,32 @@ class CollectionAttributeImpl(HasCollectionAdapter, AttributeImpl):
         # not trigger a lazy load of the old collection.
         new_collection, user_data = self._initialize_collection(state)
         if _adapt:
-            if new_collection._converter is not None:
-                iterable = new_collection._converter(iterable)
+            setting_type = util.duck_type_collection(iterable)
+            receiving_type = self._duck_typed_as
+
+            if setting_type is not receiving_type:
+                given = (
+                    "None" if iterable is None else iterable.__class__.__name__
+                )
+                wanted = (
+                    "None"
+                    if self._duck_typed_as is None
+                    else self._duck_typed_as.__name__
+                )
+                raise TypeError(
+                    "Incompatible collection type: %s is not %s-like"
+                    % (given, wanted)
+                )
+
+            # If the object is an adapted collection, return the (iterable)
+            # adapter.
+            if hasattr(iterable, "_sa_iterator"):
+                iterable = iterable._sa_iterator()
+            elif setting_type is dict:
+                new_keys = list(iterable)
+                iterable = iterable.values()
             else:
-                setting_type = util.duck_type_collection(iterable)
-                receiving_type = self._duck_typed_as
-
-                if setting_type is not receiving_type:
-                    given = (
-                        iterable is None
-                        and "None"
-                        or iterable.__class__.__name__
-                    )
-                    wanted = self._duck_typed_as.__name__
-                    raise TypeError(
-                        "Incompatible collection type: %s is not %s-like"
-                        % (given, wanted)
-                    )
-
-                # If the object is an adapted collection, return the (iterable)
-                # adapter.
-                if hasattr(iterable, "_sa_iterator"):
-                    iterable = iterable._sa_iterator()
-                elif setting_type is dict:
-                    new_keys = list(iterable)
-                    iterable = iterable.values()
-                else:
-                    iterable = iter(iterable)
+                iterable = iter(iterable)
         elif util.duck_type_collection(iterable) is dict:
             new_keys = list(value)
 
@@ -2103,7 +2130,7 @@ class CollectionAttributeImpl(HasCollectionAdapter, AttributeImpl):
         return user_data._sa_adapter
 
 
-def backref_listeners(
+def _backref_listeners(
     attribute: QueryableAttribute[Any], key: str, uselist: bool
 ) -> None:
     """Apply listeners to synchronize a two-way relationship."""
@@ -2405,7 +2432,7 @@ class History(NamedTuple):
     @classmethod
     def from_scalar_attribute(
         cls,
-        attribute: ScalarAttributeImpl,
+        attribute: _ScalarAttributeImpl,
         state: InstanceState[Any],
         current: Any,
     ) -> History:
@@ -2446,7 +2473,7 @@ class History(NamedTuple):
     @classmethod
     def from_object_attribute(
         cls,
-        attribute: ScalarObjectAttributeImpl,
+        attribute: _ScalarObjectAttributeImpl,
         state: InstanceState[Any],
         current: Any,
         original: Any = _NO_HISTORY,
@@ -2485,7 +2512,7 @@ class History(NamedTuple):
     @classmethod
     def from_collection(
         cls,
-        attribute: CollectionAttributeImpl,
+        attribute: _CollectionAttributeImpl,
         state: InstanceState[Any],
         current: Any,
     ) -> History:
@@ -2576,7 +2603,7 @@ def has_parent(
     return manager.has_parent(state, key, optimistic)
 
 
-def register_attribute(
+def _register_attribute(
     class_: Type[_O],
     key: str,
     *,
@@ -2585,20 +2612,20 @@ def register_attribute(
     doc: Optional[str] = None,
     **kw: Any,
 ) -> InstrumentedAttribute[_T]:
-    desc = register_descriptor(
+    desc = _register_descriptor(
         class_, key, comparator=comparator, parententity=parententity, doc=doc
     )
-    register_attribute_impl(class_, key, **kw)
+    _register_attribute_impl(class_, key, **kw)
     return desc
 
 
-def register_attribute_impl(
+def _register_attribute_impl(
     class_: Type[_O],
     key: str,
     uselist: bool = False,
     callable_: Optional[_LoaderCallable] = None,
     useobject: bool = False,
-    impl_class: Optional[Type[AttributeImpl]] = None,
+    impl_class: Optional[Type[_AttributeImpl]] = None,
     backref: Optional[str] = None,
     **kw: Any,
 ) -> QueryableAttribute[Any]:
@@ -2615,35 +2642,35 @@ def register_attribute_impl(
         "_Dispatch[QueryableAttribute[Any]]", manager[key].dispatch
     )  # noqa: E501
 
-    impl: AttributeImpl
+    impl: _AttributeImpl
 
     if impl_class:
         # TODO: this appears to be the WriteOnlyAttributeImpl /
         # DynamicAttributeImpl constructor which is hardcoded
-        impl = cast("Type[WriteOnlyAttributeImpl]", impl_class)(
+        impl = cast("Type[_WriteOnlyAttributeImpl]", impl_class)(
             class_, key, dispatch, **kw
         )
     elif uselist:
-        impl = CollectionAttributeImpl(
+        impl = _CollectionAttributeImpl(
             class_, key, callable_, dispatch, typecallable=typecallable, **kw
         )
     elif useobject:
-        impl = ScalarObjectAttributeImpl(
+        impl = _ScalarObjectAttributeImpl(
             class_, key, callable_, dispatch, **kw
         )
     else:
-        impl = ScalarAttributeImpl(class_, key, callable_, dispatch, **kw)
+        impl = _ScalarAttributeImpl(class_, key, callable_, dispatch, **kw)
 
     manager[key].impl = impl
 
     if backref:
-        backref_listeners(manager[key], backref, uselist)
+        _backref_listeners(manager[key], backref, uselist)
 
     manager.post_configure_attribute(key)
     return manager[key]
 
 
-def register_descriptor(
+def _register_descriptor(
     class_: Type[Any],
     key: str,
     *,
@@ -2657,13 +2684,13 @@ def register_descriptor(
         class_, key, comparator=comparator, parententity=parententity
     )
 
-    descriptor.__doc__ = doc  # type: ignore
+    descriptor.__doc__ = doc  # type: ignore[method-assign]
 
     manager.instrument_attribute(key, descriptor)
     return descriptor
 
 
-def unregister_attribute(class_: Type[Any], key: str) -> None:
+def _unregister_attribute(class_: Type[Any], key: str) -> None:
     manager_of_class(class_).uninstrument_attribute(key)
 
 
@@ -2701,7 +2728,7 @@ def init_state_collection(
     attr = state.manager[key].impl
 
     if TYPE_CHECKING:
-        assert isinstance(attr, HasCollectionAdapter)
+        assert isinstance(attr, _HasCollectionAdapter)
 
     old = dict_.pop(key, None)  # discard old collection
     if old is not None:
@@ -2762,8 +2789,6 @@ def set_attribute(
      an existing event listening function where an :class:`.Event` object
      is being supplied; the object may be used to track the origin of the
      chain of events.
-
-     .. versionadded:: 1.2.3
 
     """
     state, dict_ = instance_state(instance), instance_dict(instance)
@@ -2832,8 +2857,6 @@ def flag_dirty(instance: object) -> None:
     will be able to see the object in the :attr:`.Session.dirty` collection and
     may establish changes on it, which will then be included in the SQL
     emitted.
-
-    .. versionadded:: 1.2
 
     .. seealso::
 

@@ -32,6 +32,8 @@ from ..sql import compiler
 from ..util import immutabledict
 
 if typing.TYPE_CHECKING:
+    from typing import Literal
+
     from .base import Engine
     from .interfaces import _ExecuteOptions
     from .interfaces import _ParamStyle
@@ -42,7 +44,6 @@ if typing.TYPE_CHECKING:
     from ..pool import _CreatorWRecFnType
     from ..pool import _ResetStyleArgType
     from ..pool import Pool
-    from ..util.typing import Literal
 
 
 @overload
@@ -262,8 +263,6 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
         will not be displayed in INFO logging nor will they be formatted into
         the string representation of :class:`.StatementError` objects.
 
-        .. versionadded:: 1.3.8
-
         .. seealso::
 
             :ref:`dbengine_logging` - further detail on how to configure
@@ -323,19 +322,13 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
     :param json_deserializer: for dialects that support the
         :class:`_types.JSON`
         datatype, this is a Python callable that will convert a JSON string
-        to a Python object.  By default, the Python ``json.loads`` function is
-        used.
-
-        .. versionchanged:: 1.3.7  The SQLite dialect renamed this from
-           ``_json_deserializer``.
+        to a Python object.  By default, either the driver's built-in
+        capabilities are used, or if none are available, the Python
+        ``json.loads`` function is used.
 
     :param json_serializer: for dialects that support the :class:`_types.JSON`
-        datatype, this is a Python callable that will render a given object
-        as JSON.   By default, the Python ``json.dumps`` function is used.
-
-        .. versionchanged:: 1.3.7  The SQLite dialect renamed this from
-           ``_json_serializer``.
-
+        datatype, this is a Python callable that will render a given object as
+        JSON.   By default, the Python ``json.dumps`` function is used.
 
     :param label_length=None: optional integer value which limits
         the size of dynamically generated column labels to that many
@@ -372,8 +365,6 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
         case of a new database version for which this value has changed but
         SQLAlchemy's dialect has not been adjusted, the value may be passed
         here.
-
-        .. versionadded:: 1.3.9
 
         .. seealso::
 
@@ -432,8 +423,6 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
         "pre-ping" feature that tests connections for liveness upon
         each checkout.
 
-        .. versionadded:: 1.2
-
         .. seealso::
 
             :ref:`pool_disconnects_pessimistic`
@@ -486,8 +475,6 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
         use.   When planning for server-side timeouts, ensure that a recycle or
         pre-ping strategy is in use to gracefully   handle stale connections.
 
-          .. versionadded:: 1.3
-
           .. seealso::
 
             :ref:`pool_use_lifo`
@@ -496,8 +483,6 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
 
     :param plugins: string list of plugin names to load.  See
         :class:`.CreateEnginePlugin` for background.
-
-        .. versionadded:: 1.2.3
 
     :param query_cache_size: size of the cache used to cache the SQL string
      form of queries.  Set to zero to disable caching.
@@ -554,7 +539,7 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
         strat = kwargs.pop("strategy")
         if strat == "mock":
             # this case is deprecated
-            return create_mock_engine(url, **kwargs)  # type: ignore
+            return create_mock_engine(url, **kwargs)  # type: ignore[return-value]  # noqa: E501
         else:
             raise exc.ArgumentError("unknown strategy: %r" % strat)
 
@@ -581,7 +566,7 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
             return value
 
     else:
-        pop_kwarg = kwargs.pop  # type: ignore
+        pop_kwarg = kwargs.pop  # type: ignore[assignment]
 
     dialect_args = {}
     # consume dialect arguments from kwargs
@@ -632,13 +617,6 @@ def create_engine(url: Union[str, _url.URL], **kwargs: Any) -> Engine:
     # assemble connection arguments
     cargs_tup, _cparams = dialect.create_connect_args(u)
     cparams = util.immutabledict(_cparams).union(pop_kwarg("connect_args", {}))
-
-    if "async_fallback" in cparams and util.asbool(cparams["async_fallback"]):
-        util.warn_deprecated(
-            "The async_fallback dialect argument is deprecated and will be "
-            "removed in SQLAlchemy 2.1.",
-            "2.0",
-        )
 
     # look for existing pool or create
     pool = pop_kwarg("pool", None)

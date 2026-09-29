@@ -318,9 +318,9 @@ class index_property(hybrid_property[_T]):
         else:
             return self.default
 
-    def fget(self, __instance: Any) -> _T:
+    def fget(self, instance: Any, /) -> _T:
         attr_name = self.attr_name
-        column_value = getattr(__instance, attr_name)
+        column_value = getattr(instance, attr_name)
         if column_value is None:
             return self._fget_default()
         try:

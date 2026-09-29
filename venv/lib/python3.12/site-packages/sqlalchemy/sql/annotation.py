@@ -17,12 +17,14 @@ related in any way to the pep-593 concept of "Annotated".
 
 from __future__ import annotations
 
+from operator import itemgetter
 import typing
 from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Dict
 from typing import FrozenSet
+from typing import Literal
 from typing import Mapping
 from typing import Optional
 from typing import overload
@@ -38,7 +40,6 @@ from .visitors import anon_map
 from .visitors import ExternallyTraversible
 from .visitors import InternalTraversal
 from .. import util
-from ..util.typing import Literal
 from ..util.typing import Self
 
 if TYPE_CHECKING:
@@ -103,12 +104,14 @@ class SupportsAnnotations(ExternallyTraversible):
                         else value
                     ),
                 )
-                for key, value in [
-                    (key, self._annotations[key])
-                    for key in sorted(self._annotations)
-                ]
+                for key, value in sorted(
+                    self._annotations.items(), key=_get_item0
+                )
             ),
         )
+
+
+_get_item0 = itemgetter(0)
 
 
 class SupportsWrappingAnnotations(SupportsAnnotations):
@@ -126,14 +129,14 @@ class SupportsWrappingAnnotations(SupportsAnnotations):
         updated by the given dictionary.
 
         """
-        return Annotated._as_annotated_instance(self, values)  # type: ignore
+        return Annotated._as_annotated_instance(self, values)  # type: ignore[return-value]  # noqa: E501
 
     def _with_annotations(self, values: _AnnotationDict) -> Self:
         """return a copy of this ClauseElement with annotations
         replaced by the given dictionary.
 
         """
-        return Annotated._as_annotated_instance(self, values)  # type: ignore
+        return Annotated._as_annotated_instance(self, values)  # type: ignore[return-value]  # noqa: E501
 
     @overload
     def _deannotate(
@@ -237,7 +240,7 @@ class SupportsCloneAnnotations(SupportsWrappingAnnotations):
             # clone is used when we are also copying
             # the expression for a deep deannotation
             new = self._clone()
-            new._annotations = util.immutabledict()
+            new._annotations = util.EMPTY_DICT
             new.__dict__.pop("_annotations_cache_key", None)
             return new
         else:
@@ -475,7 +478,7 @@ def _deep_annotate(
 
     if element is not None:
         element = cast(_SA, clone(element))
-    clone = None  # type: ignore  # remove gc cycles
+    clone = None  # type: ignore[assignment]  # remove gc cycles
     return element
 
 
@@ -515,7 +518,7 @@ def _deep_deannotate(
 
     if element is not None:
         element = cast(_SA, clone(element))
-    clone = None  # type: ignore  # remove gc cycles
+    clone = None  # type: ignore[assignment]  # remove gc cycles
     return element
 
 
@@ -570,9 +573,9 @@ def _new_annotation_type(
     # some classes include this even if they have traverse_internals
     # e.g. BindParameter, add it if present.
     if cls.__dict__.get("inherit_cache", False):
-        anno_cls.inherit_cache = True  # type: ignore
+        anno_cls.inherit_cache = True  # type: ignore[attr-defined]
     elif "inherit_cache" in cls.__dict__:
-        anno_cls.inherit_cache = cls.__dict__["inherit_cache"]  # type: ignore
+        anno_cls.inherit_cache = cls.__dict__["inherit_cache"]  # type: ignore[attr-defined]  # noqa: E501
 
     anno_cls._is_column_operators = issubclass(cls, operators.ColumnOperators)
 

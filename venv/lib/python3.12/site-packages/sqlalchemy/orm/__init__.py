@@ -56,6 +56,7 @@ from .context import FromStatement as FromStatement
 from .context import QueryContext as QueryContext
 from .decl_api import add_mapped_attribute as add_mapped_attribute
 from .decl_api import as_declarative as as_declarative
+from .decl_api import as_typed_table as as_typed_table
 from .decl_api import declarative_base as declarative_base
 from .decl_api import declarative_mixin as declarative_mixin
 from .decl_api import DeclarativeBase as DeclarativeBase
@@ -67,6 +68,8 @@ from .decl_api import mapped_as_dataclass as mapped_as_dataclass
 from .decl_api import MappedAsDataclass as MappedAsDataclass
 from .decl_api import registry as registry
 from .decl_api import synonym_for as synonym_for
+from .decl_api import TypeResolve as TypeResolve
+from .decl_api import unmapped_dataclass as unmapped_dataclass
 from .decl_base import MappedClassProtocol as MappedClassProtocol
 from .descriptor_props import Composite as Composite
 from .descriptor_props import CompositeProperty as CompositeProperty
@@ -78,6 +81,7 @@ from .events import InstanceEvents as InstanceEvents
 from .events import InstrumentationEvents as InstrumentationEvents
 from .events import MapperEvents as MapperEvents
 from .events import QueryEvents as QueryEvents
+from .events import RegistryEvents as RegistryEvents
 from .events import SessionEvents as SessionEvents
 from .identity import IdentityMap as IdentityMap
 from .instrumentation import ClassManager as ClassManager
@@ -154,6 +158,7 @@ from .strategy_options import with_expression as with_expression
 from .unitofwork import UOWTransaction as UOWTransaction
 from .util import Bundle as Bundle
 from .util import CascadeOptions as CascadeOptions
+from .util import DictBundle as DictBundle
 from .util import LoaderCriteriaOption as LoaderCriteriaOption
 from .util import object_mapper as object_mapper
 from .util import polymorphic_union as polymorphic_union

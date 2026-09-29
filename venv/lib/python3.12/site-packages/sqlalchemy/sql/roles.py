@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from typing import Any
 from typing import Generic
+from typing import Literal
 from typing import Optional
 from typing import TYPE_CHECKING
 from typing import TypeVar
 
 from .. import util
-from ..util.typing import Literal
 
 if TYPE_CHECKING:
     from ._typing import _PropagateAttrsType
@@ -40,6 +40,11 @@ class SQLRole:
     __slots__ = ()
     allows_lambda = False
     uses_inspection = False
+
+
+class SyntaxExtensionRole(SQLRole):
+    __slots__ = ()
+    _role_name = "Syntax extension construct"
 
 
 class UsesInspection:
@@ -100,7 +105,16 @@ class TruncatedLabelRole(StringRole, SQLRole):
     _role_name = "String SQL identifier"
 
 
-class ColumnsClauseRole(AllowsLambdaRole, UsesInspection, ColumnListRole):
+class TStringElementRole(UsesInspection, SQLRole):
+    """Role for elements that can be interpolated into a TString."""
+
+    __slots__ = ()
+    _role_name = "TString interpolatable element"
+
+
+class ColumnsClauseRole(
+    TStringElementRole, AllowsLambdaRole, UsesInspection, ColumnListRole
+):
     __slots__ = ()
     _role_name = (
         "Column expression, FROM clause, or other columns clause element"
@@ -215,12 +229,7 @@ class FromClauseRole(ColumnsClauseRole, JoinTargetRole):
     named_with_column: bool
 
 
-class StrictFromClauseRole(FromClauseRole):
-    __slots__ = ()
-    # does not allow text() or select() objects
-
-
-class AnonymizedFromClauseRole(StrictFromClauseRole):
+class AnonymizedFromClauseRole(FromClauseRole):
     __slots__ = ()
 
     if TYPE_CHECKING:

@@ -26,7 +26,10 @@ from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Dict
+from typing import Final
+from typing import Iterable
 from typing import List
+from typing import Literal
 from typing import Mapping
 from typing import MutableMapping
 from typing import MutableSequence
@@ -42,6 +45,7 @@ import weakref
 from . import characteristics
 from . import cursor as _cursor
 from . import interfaces
+from . import reflection
 from .base import Connection
 from .interfaces import CacheStats
 from .interfaces import DBAPICursor
@@ -61,16 +65,15 @@ from ..sql import type_api
 from ..sql import util as sql_util
 from ..sql._typing import is_tuple_type
 from ..sql.base import _NoArg
+from ..sql.compiler import AggregateOrderByStyle
 from ..sql.compiler import DDLCompiler
 from ..sql.compiler import InsertmanyvaluesSentinelOpts
 from ..sql.compiler import SQLCompiler
 from ..sql.elements import quoted_name
-from ..util.typing import Final
-from ..util.typing import Literal
+from ..util.typing import TupleAny
+from ..util.typing import Unpack
 
 if typing.TYPE_CHECKING:
-    from types import ModuleType
-
     from .base import Engine
     from .cursor import ResultFetchStrategy
     from .interfaces import _CoreMultiExecuteParams
@@ -86,6 +89,7 @@ if typing.TYPE_CHECKING:
     from .interfaces import DBAPIModule
     from .interfaces import DBAPIType
     from .interfaces import IsolationLevel
+    from .interfaces import TableKey
     from .row import Row
     from .url import URL
     from ..event import _ListenerFnType
@@ -99,6 +103,7 @@ if typing.TYPE_CHECKING:
     from ..sql.dml import UpdateBase
     from ..sql.elements import BindParameter
     from ..sql.schema import Column
+    from ..sql.sqltypes import _JSON_VALUE
     from ..sql.type_api import _BindProcessorType
     from ..sql.type_api import _ResultProcessorType
     from ..sql.type_api import TypeEngine
@@ -115,6 +120,141 @@ SERVER_SIDE_CURSOR_RE = re.compile(r"\s*SELECT", re.I | re.UNICODE)
     NO_CACHE_KEY,
     NO_DIALECT_SUPPORT,
 ) = list(CacheStats)
+
+
+class _BackendsMultiReflection(Dialect):
+    """Mixin providing single-table reflection wrappers that delegate to
+    the corresponding ``get_multi_*`` methods.
+
+    Used by dialects that implement native multi-table reflection
+    (PostgreSQL, Oracle, MSSQL).
+    """
+
+    @reflection.cache
+    def has_table(
+        self,
+        connection: Connection,
+        table_name: str,
+        schema: Optional[str] = None,
+        **kw: Any,
+    ) -> bool:
+        # NOTE: assume it's a subclass of DefaultDialect
+        self._ensure_has_table_connection(connection)  # type: ignore[attr-defined] # noqa: E501
+        multi_res = self.has_multi_table(
+            connection,
+            table_names=[table_name],
+            schema=schema,
+            **kw,
+        )
+        # has_multi_table returns all the input table names so it's not
+        # possible for the key to be missing
+        return dict(multi_res)[(schema, table_name)]
+
+    def _value_or_raise(self, data, table, schema):
+        try:
+            return dict(data)[(schema, table)]
+        except KeyError:
+            raise exc.NoSuchTableError(
+                f"{schema}.{table}" if schema else table
+            ) from None
+
+    @reflection.cache
+    def get_columns(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_columns(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
+
+    @reflection.cache
+    def get_table_options(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_table_options(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
+
+    @reflection.cache
+    def get_pk_constraint(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_pk_constraint(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
+
+    @reflection.cache
+    def get_foreign_keys(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_foreign_keys(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
+
+    @reflection.cache
+    def get_indexes(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_indexes(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
+
+    @reflection.cache
+    def get_unique_constraints(
+        self, connection, table_name, schema=None, **kw
+    ):
+        data = self.get_multi_unique_constraints(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
+
+    @reflection.cache
+    def get_check_constraints(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_check_constraints(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
+
+    @reflection.cache
+    def get_table_comment(self, connection, table_name, schema=None, **kw):
+        data = self.get_multi_table_comment(
+            connection,
+            schema=schema,
+            filter_names=[table_name],
+            scope=ObjectScope.ANY,
+            kind=ObjectKind.ANY,
+            **kw,
+        )
+        return self._value_or_raise(data, table_name, schema)
 
 
 class DefaultDialect(Dialect):
@@ -160,12 +300,21 @@ class DefaultDialect(Dialect):
     delete_returning_multifrom = False
     insert_returning = False
 
+    aggregate_order_by_style = AggregateOrderByStyle.INLINE
+
     cte_follows_insert = False
 
     supports_native_enum = False
     supports_native_boolean = False
     supports_native_uuid = False
     returns_native_bytes = False
+
+    supports_native_json_serialization = False
+    supports_native_json_deserialization = False
+    dialect_injects_custom_json_deserializer = False
+    _json_serializer: Callable[[_JSON_VALUE], str] | None = None
+
+    _json_deserializer: Callable[[str], _JSON_VALUE] | None = None
 
     non_native_boolean_check_constraint = True
 
@@ -297,7 +446,7 @@ class DefaultDialect(Dialect):
         self,
         paramstyle: Optional[_ParamStyle] = None,
         isolation_level: Optional[IsolationLevel] = None,
-        dbapi: Optional[ModuleType] = None,
+        dbapi: Optional[DBAPIModule] = None,
         implicit_returning: Literal[True] = True,
         supports_native_boolean: Optional[bool] = None,
         max_identifier_length: Optional[int] = None,
@@ -306,7 +455,7 @@ class DefaultDialect(Dialect):
         use_insertmanyvalues: Optional[bool] = None,
         # util.deprecated_params decorator cannot render the
         # Linting.NO_LINTING constant
-        compiler_linting: Linting = int(compiler.NO_LINTING),  # type: ignore
+        compiler_linting: Linting = int(compiler.NO_LINTING),  # type: ignore[assignment]  # noqa: E501
         server_side_cursors: bool = False,
         skip_autocommit_rollback: bool = False,
         **kwargs: Any,
@@ -378,6 +527,8 @@ class DefaultDialect(Dialect):
         if insertmanyvalues_page_size is not _NoArg.NO_ARG:
             self.insertmanyvalues_page_size = insertmanyvalues_page_size
 
+        self._check_minimum_dbapi_version()
+
     @property
     @util.deprecated(
         "2.0",
@@ -435,11 +586,85 @@ class DefaultDialect(Dialect):
     @util.memoized_property
     def loaded_dbapi(self) -> DBAPIModule:
         if self.dbapi is None:
-            raise exc.InvalidRequestError(
+            raise exc.NoDBAPILoaded(
                 f"Dialect {self} does not have a Python DBAPI established "
                 "and cannot be used for actual database interaction"
             )
         return self.dbapi
+
+    @util.memoized_property
+    def dbapi_version(self) -> util.VersionInfo:
+        # memoization applies to a successfully determined version only;
+        # memoized_property does not cache when the function raises, so a
+        # DBAPI which is established after this dialect was constructed is
+        # still picked up
+        if self.dbapi is None:
+            raise exc.NoDBAPILoaded(
+                f"Dialect {self.name}+{self.driver} has no DBAPI module "
+                "loaded; no DBAPI version is available"
+            )
+
+        try:
+            version = self.retrieve_dbapi_version(self.dbapi)
+        except NotImplementedError as ne:
+            raise NotImplementedError(
+                f"Dialect {self.name}+{self.driver} does not implement "
+                "retrieve_dbapi_version(); no DBAPI version is available"
+            ) from ne
+
+        if not version:
+            # the DBAPI is loaded but publishes no version of its own; as
+            # with a DBAPI that isn't loaded, this is not an error on the
+            # part of the dialect
+            # asyncio dialects have a wrapper object here rather than a
+            # module, which has no __name__
+            dbapi_name = getattr(self.dbapi, "__name__", self.driver)
+            raise exc.NoDBAPILoaded(
+                f"Dialect {self.name}+{self.driver} could not determine a "
+                f"version for its DBAPI module {dbapi_name!r}"
+            )
+
+        return version
+
+    @property
+    def _dbapi_version_or_none(self) -> Optional[util.VersionInfo]:
+        """:attr:`.Dialect.dbapi_version`, or None if it can't be
+        determined.
+
+        For use by dialect startup checks, which run before a DBAPI is
+        necessarily present and which must not fail when no version is
+        available.  Only :class:`.exc.NoDBAPILoaded` is accommodated;
+        ``NotImplementedError``, indicating a dialect which does not
+        implement :meth:`.Dialect.retrieve_dbapi_version` at all, is a bug
+        in that dialect and is allowed to propagate.  Deliberately not
+        memoized itself; the underlying :attr:`.Dialect.dbapi_version`
+        memoizes the success case.
+
+        """
+        try:
+            return self.dbapi_version
+        except exc.NoDBAPILoaded:
+            return None
+
+    def _check_minimum_dbapi_version(self) -> None:
+        """Enforce :attr:`.Dialect.minimum_dbapi_version`, if present.
+
+        Takes place as the dialect is constructed.  No check occurs when
+        the version of the DBAPI is not available at all.
+
+        """
+        minimum = self.minimum_dbapi_version
+        if minimum is None:
+            return
+
+        version = self._dbapi_version_or_none
+        if version is not None and version < minimum:
+            dbapi_name = getattr(self.dbapi, "__name__", self.driver)
+            raise exc.InvalidRequestError(
+                f"Dialect {self.name}+{self.driver} requires version "
+                f"{minimum} or greater of the {dbapi_name} DBAPI; "
+                f"version {version} is installed"
+            )
 
     @util.memoized_property
     def _bind_typing_render_casts(self):
@@ -498,7 +723,13 @@ class DefaultDialect(Dialect):
 
     @classmethod
     def get_pool_class(cls, url: URL) -> Type[Pool]:
-        return getattr(cls, "poolclass", pool.QueuePool)
+        default: Type[pool.Pool]
+        if cls.is_async:
+            default = pool.AsyncAdaptedQueuePool
+        else:
+            default = pool.QueuePool
+
+        return getattr(cls, "poolclass", default)
 
     def get_dialect_pool_class(self, url: URL) -> Type[Pool]:
         return self.get_pool_class(url)
@@ -570,8 +801,6 @@ class DefaultDialect(Dialect):
         If the dialect's class level max_identifier_length should be used,
         can return None.
 
-        .. versionadded:: 1.3.9
-
         """
         return None
 
@@ -585,8 +814,6 @@ class DefaultDialect(Dialect):
 
         By default, calls the :meth:`_engine.Interfaces.get_isolation_level`
         method, propagating any exceptions raised.
-
-        .. versionadded:: 1.3.22
 
         """
         return self.get_isolation_level(dbapi_conn)
@@ -888,6 +1115,7 @@ class DefaultDialect(Dialect):
                         Dict[Tuple[Any, ...], Any],
                         Dict[Any, Any],
                     ]
+
                     if composite_sentinel:
                         rows_by_sentinel = {
                             tuple(
@@ -1143,6 +1371,17 @@ class DefaultDialect(Dialect):
                 except exc.NoSuchTableError:
                     pass
 
+    def has_multi_table(
+        self,
+        connection: Connection,
+        table_names: Sequence[str],
+        schema: Optional[str] = None,
+        **kw: Any,
+    ) -> Iterable[tuple[TableKey, bool]]:
+        for table_name in table_names:
+            exist = self.has_table(connection, table_name, schema=schema, **kw)
+            yield (schema, table_name), exist
+
     def get_multi_table_options(self, connection, **kw):
         return self._default_multi_reflect(
             self.get_table_options, connection, **kw
@@ -1218,7 +1457,7 @@ class DefaultExecutionContext(ExecutionContext):
     result_column_struct: Optional[
         Tuple[List[ResultColumnsEntry], bool, bool, bool, bool]
     ] = None
-    returned_default_rows: Optional[Sequence[Row[Any]]] = None
+    returned_default_rows: Optional[Sequence[Row[Unpack[TupleAny]]]] = None
 
     execution_options: _ExecuteOptions = util.EMPTY_DICT
 
@@ -1322,6 +1561,7 @@ class DefaultExecutionContext(ExecutionContext):
         invoked_statement: Executable,
         extracted_parameters: Optional[Sequence[BindParameter[Any]]],
         cache_hit: CacheStats = CacheStats.CACHING_DISABLED,
+        param_dict: _CoreSingleExecuteParams | None = None,
     ) -> ExecutionContext:
         """Initialize execution context for a Compiled construct."""
 
@@ -1350,7 +1590,7 @@ class DefaultExecutionContext(ExecutionContext):
         self.is_text = compiled.isplaintext
 
         if ii or iu or id_:
-            dml_statement = compiled.compile_state.statement  # type: ignore
+            dml_statement = compiled.compile_state.statement  # type: ignore[union-attr]  # noqa: E501
             if TYPE_CHECKING:
                 assert isinstance(dml_statement, UpdateBase)
             self.is_crud = True
@@ -1410,6 +1650,7 @@ class DefaultExecutionContext(ExecutionContext):
                 compiled.construct_params(
                     extracted_parameters=extracted_parameters,
                     escape_names=False,
+                    _collected_params=param_dict,
                 )
             ]
         else:
@@ -1419,6 +1660,7 @@ class DefaultExecutionContext(ExecutionContext):
                     escape_names=False,
                     _group_number=grp,
                     extracted_parameters=extracted_parameters,
+                    _collected_params=param_dict,
                 )
                 for grp, m in enumerate(parameters)
             ]
@@ -1462,7 +1704,7 @@ class DefaultExecutionContext(ExecutionContext):
 
             self._expanded_parameters = expanded_state.parameter_expansion
 
-            flattened_processors = dict(processors)  # type: ignore
+            flattened_processors = dict(processors)  # type: ignore[arg-type]
             flattened_processors.update(expanded_state.processors)
             positiontup = expanded_state.positiontup
         elif compiled.positional:
@@ -1963,11 +2205,8 @@ class DefaultExecutionContext(ExecutionContext):
             strategy = _cursor._NO_CURSOR_DML
         elif self._num_sentinel_cols:
             assert self.execute_style is ExecuteStyle.INSERTMANYVALUES
-            # strip out the sentinel columns from cursor description
-            # a similar logic is done to the rows only in CursorResult
-            cursor_description = cursor_description[
-                0 : -self._num_sentinel_cols
-            ]
+            # the sentinel columns are handled in CursorResult._init_metadata
+            # using essentially _reduce
 
         result: _cursor.CursorResult[Any] = _cursor.CursorResult(
             self, strategy, cursor_description
@@ -2211,7 +2450,7 @@ class DefaultExecutionContext(ExecutionContext):
             parameters = self.dialect.execute_sequence_format(
                 [
                     (
-                        processors[key](compiled_params[key])  # type: ignore
+                        processors[key](compiled_params[key])  # type: ignore[operator]  # noqa: E501
                         if key in processors
                         else compiled_params[key]
                     )
@@ -2221,7 +2460,7 @@ class DefaultExecutionContext(ExecutionContext):
         else:
             parameters = {
                 key: (
-                    processors[key](compiled_params[key])  # type: ignore
+                    processors[key](compiled_params[key])  # type: ignore[assignment, operator]  # noqa: E501
                     if key in processors
                     else compiled_params[key]
                 )
@@ -2275,12 +2514,6 @@ class DefaultExecutionContext(ExecutionContext):
          to the current column default invocation.   When ``False``, the
          raw parameters of the statement are returned including the
          naming convention used in the case of multi-valued INSERT.
-
-        .. versionadded:: 1.2  added
-           :meth:`.DefaultExecutionContext.get_current_parameters`
-           which provides more functionality over the existing
-           :attr:`.DefaultExecutionContext.current_parameters`
-           attribute.
 
         .. seealso::
 

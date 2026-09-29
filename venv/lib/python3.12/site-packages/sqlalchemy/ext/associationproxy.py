@@ -30,6 +30,7 @@ from typing import Iterable
 from typing import Iterator
 from typing import KeysView
 from typing import List
+from typing import Literal
 from typing import Mapping
 from typing import MutableMapping
 from typing import MutableSequence
@@ -37,7 +38,9 @@ from typing import MutableSet
 from typing import NoReturn
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Set
+from typing import SupportsIndex
 from typing import Tuple
 from typing import Type
 from typing import TypeVar
@@ -60,16 +63,14 @@ from ..orm.interfaces import _DEFAULT_ATTRIBUTE_OPTIONS
 from ..sql import operators
 from ..sql import or_
 from ..sql.base import _NoArg
-from ..util.typing import Literal
-from ..util.typing import Protocol
 from ..util.typing import Self
-from ..util.typing import SupportsIndex
 from ..util.typing import SupportsKeysAndGetItem
 
 if typing.TYPE_CHECKING:
     from ..orm.interfaces import MapperProperty
     from ..orm.interfaces import PropComparator
     from ..orm.mapper import Mapper
+    from ..orm.util import AliasedInsp
     from ..sql._typing import _ColumnExpressionArgument
     from ..sql._typing import _InfoType
 
@@ -153,8 +154,6 @@ def association_proxy(
         Normally, removing the proxied target will not remove the proxy
         source, as this object may have other state that is still to be
         kept.
-
-        .. versionadded:: 1.3
 
         .. seealso::
 
@@ -417,7 +416,7 @@ class AssociationProxy(
             id(self),
         )
         if info:
-            self.info = info  # type: ignore
+            self.info = info  # type: ignore[misc]
 
         if (
             attribute_options
@@ -492,11 +491,6 @@ class AssociationProxy(
          to look at the type of the actual destination object to get the
          complete path.
 
-        .. versionadded:: 1.3 - :class:`.AssociationProxy` no longer stores
-           any state specific to a particular parent class; the state is now
-           stored in per-class :class:`.AssociationProxyInstance` objects.
-
-
         """
         return self._as_instance(class_, obj)
 
@@ -523,9 +517,9 @@ class AssociationProxy(
             # class, only on subclasses of it, which might be
             # different.  only return for the specific
             # object's current value
-            return inst._non_canonical_get_for_object(obj)  # type: ignore
+            return inst._non_canonical_get_for_object(obj)  # type: ignore[no-any-return]  # noqa: E501
         else:
-            return inst  # type: ignore  # TODO
+            return inst  # type: ignore[no-any-return]  # TODO
 
     def _calc_owner(self, target_cls: Any) -> Any:
         # we might be getting invoked for a subclass
@@ -603,8 +597,6 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
         # view if proxy object is scalar or not
         >>> proxy_state.scalar
         False
-
-    .. versionadded:: 1.3
 
     """  # noqa
 
@@ -718,7 +710,7 @@ class AssociationProxyInstance(SQLORMOperations[_T]):
 
     @property
     def _comparator(self) -> PropComparator[Any]:
-        return getattr(  # type: ignore
+        return getattr(  # type: ignore[no-any-return]
             self.owning_class, self.target_collection
         ).comparator
 
@@ -1241,6 +1233,11 @@ class ObjectAssociationProxyInstance(AssociationProxyInstance[_T]):
     _target_is_object: bool = True
     _is_canonical = True
 
+    def adapt_to_entity(
+        self, aliased_insp: AliasedInsp[Any]
+    ) -> AliasedAssociationProxyInstance[_T]:
+        return AliasedAssociationProxyInstance(self, aliased_insp)
+
     def contains(self, other: Any, **kw: Any) -> ColumnElement[bool]:
         """Produce a proxied 'contains' expression using EXISTS.
 
@@ -1291,6 +1288,44 @@ class ObjectAssociationProxyInstance(AssociationProxyInstance[_T]):
         # is only allowed with a scalar.
         return self._comparator.has(
             getattr(self.target_class, self.value_attr) != obj
+        )
+
+
+class AliasedAssociationProxyInstance(ObjectAssociationProxyInstance[_T]):
+    def __init__(
+        self,
+        parent_instance: ObjectAssociationProxyInstance[_T],
+        aliased_insp: AliasedInsp[Any],
+    ) -> None:
+        self.parent = parent_instance.parent
+        self.owning_class = parent_instance.owning_class
+        self.aliased_insp = aliased_insp
+        self.target_collection = parent_instance.target_collection
+        self.collection_class = None
+        self.target_class = parent_instance.target_class
+        self.value_attr = parent_instance.value_attr
+
+    @property
+    def _comparator(self) -> PropComparator[Any]:
+        return getattr(  # type: ignore[no-any-return]
+            self.aliased_insp.entity, self.target_collection
+        ).comparator
+
+    @property
+    def local_attr(self) -> SQLORMOperations[Any]:
+        """The 'local' class attribute referenced by this
+        :class:`.AssociationProxyInstance`.
+
+        .. seealso::
+
+            :attr:`.AssociationProxyInstance.attr`
+
+            :attr:`.AssociationProxyInstance.remote_attr`
+
+        """
+        return cast(
+            "SQLORMOperations[Any]",
+            getattr(self.aliased_insp.entity, self.target_collection),
         )
 
 
@@ -1704,16 +1739,18 @@ class _AssociationDict(_AssociationCollection[_VT], MutableMapping[_KT, _VT]):
         return repr(dict(self))
 
     @overload
-    def get(self, __key: _KT) -> Optional[_VT]: ...
+    def get(self, __key: _KT, /) -> Optional[_VT]: ...
 
     @overload
-    def get(self, __key: _KT, default: Union[_VT, _T]) -> Union[_VT, _T]: ...
+    def get(
+        self, __key: _KT, /, default: Union[_VT, _T]
+    ) -> Union[_VT, _T]: ...
 
     def get(
-        self, key: _KT, default: Optional[Union[_VT, _T]] = None
+        self, __key: _KT, /, default: Optional[Union[_VT, _T]] = None
     ) -> Union[_VT, _T, None]:
         try:
-            return self[key]
+            return self[__key]
         except KeyError:
             return default
 
@@ -1725,7 +1762,7 @@ class _AssociationDict(_AssociationCollection[_VT], MutableMapping[_KT, _VT]):
         # compatible with None.".
         if key not in self.col:
             self.col[key] = self._create(key, default)
-            return default  # type: ignore
+            return default  # type: ignore[return-value]
         else:
             return self[key]
 
@@ -1739,14 +1776,14 @@ class _AssociationDict(_AssociationCollection[_VT], MutableMapping[_KT, _VT]):
         return ValuesView(self)
 
     @overload
-    def pop(self, __key: _KT) -> _VT: ...
+    def pop(self, __key: _KT, /) -> _VT: ...
 
     @overload
     def pop(
-        self, __key: _KT, default: Union[_VT, _T] = ...
+        self, __key: _KT, /, default: Union[_VT, _T] = ...
     ) -> Union[_VT, _T]: ...
 
-    def pop(self, __key: _KT, *arg: Any, **kw: Any) -> Union[_VT, _T]:
+    def pop(self, __key: _KT, /, *arg: Any, **kw: Any) -> Union[_VT, _T]:
         member = self.col.pop(__key, *arg, **kw)
         return self._get(member)
 
@@ -1842,19 +1879,19 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
             yield self._get(member)
         return
 
-    def add(self, __element: _T) -> None:
+    def add(self, __element: _T, /) -> None:
         if __element not in self:
             self.col.add(self._create(__element))
 
     # for discard and remove, choosing a more expensive check strategy rather
     # than call self.creator()
-    def discard(self, __element: _T) -> None:
+    def discard(self, __element: _T, /) -> None:
         for member in self.col:
             if self._get(member) == __element:
                 self.col.discard(member)
                 break
 
-    def remove(self, __element: _T) -> None:
+    def remove(self, __element: _T, /) -> None:
         for member in self.col:
             if self._get(member) == __element:
                 self.col.discard(member)
@@ -1890,11 +1927,11 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
         for member in removals:
             remover(member)
 
-    def __ior__(  # type: ignore
+    def __ior__(  # type: ignore[override]
         self, other: AbstractSet[_S]
     ) -> MutableSet[Union[_T, _S]]:
         if not collections._set_binops_check_strict(self, other):
-            raise NotImplementedError()
+            return NotImplemented
         for value in other:
             self.add(value)
         return self
@@ -1906,12 +1943,16 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
         return set(self).union(*s)
 
     def __or__(self, __s: AbstractSet[_S]) -> MutableSet[Union[_T, _S]]:
+        if not collections._set_binops_check_strict(self, __s):
+            return NotImplemented
         return self.union(__s)
 
     def difference(self, *s: Iterable[Any]) -> MutableSet[_T]:
         return set(self).difference(*s)
 
     def __sub__(self, s: AbstractSet[Any]) -> MutableSet[_T]:
+        if not collections._set_binops_check_strict(self, s):
+            return NotImplemented
         return self.difference(s)
 
     def difference_update(self, *s: Iterable[Any]) -> None:
@@ -1921,7 +1962,7 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
 
     def __isub__(self, s: AbstractSet[Any]) -> Self:
         if not collections._set_binops_check_strict(self, s):
-            raise NotImplementedError()
+            return NotImplemented
         for value in s:
             self.discard(value)
         return self
@@ -1930,6 +1971,8 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
         return set(self).intersection(*s)
 
     def __and__(self, s: AbstractSet[Any]) -> MutableSet[_T]:
+        if not collections._set_binops_check_strict(self, s):
+            return NotImplemented
         return self.intersection(s)
 
     def intersection_update(self, *s: Iterable[Any]) -> None:
@@ -1945,7 +1988,7 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
 
     def __iand__(self, s: AbstractSet[Any]) -> Self:
         if not collections._set_binops_check_strict(self, s):
-            raise NotImplementedError()
+            return NotImplemented
         want = self.intersection(s)
         have: Set[_T] = set(self)
 
@@ -1961,6 +2004,8 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
         return set(self).symmetric_difference(__s)
 
     def __xor__(self, s: AbstractSet[_S]) -> MutableSet[Union[_T, _S]]:
+        if not collections._set_binops_check_strict(self, s):
+            return NotImplemented
         return self.symmetric_difference(s)
 
     def symmetric_difference_update(self, other: Iterable[Any]) -> None:
@@ -1973,9 +2018,9 @@ class _AssociationSet(_AssociationSingleItem[_T], MutableSet[_T]):
         for value in add:
             self.add(value)
 
-    def __ixor__(self, other: AbstractSet[_S]) -> MutableSet[Union[_T, _S]]:  # type: ignore  # noqa: E501
+    def __ixor__(self, other: AbstractSet[_S]) -> MutableSet[Union[_T, _S]]:  # type: ignore[override]  # noqa: E501
         if not collections._set_binops_check_strict(self, other):
-            raise NotImplementedError()
+            return NotImplemented
 
         self.symmetric_difference_update(other)
         return self

@@ -24,10 +24,12 @@ from typing import Generic
 from typing import Iterable
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import Mapping
 from typing import NoReturn
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Sequence
 from typing import Set
 from typing import Tuple
@@ -36,33 +38,13 @@ from typing import Union
 from typing import ValuesView
 import weakref
 
-from ._has_cy import HAS_CYEXTENSION
+from ._collections_cy import IdentitySet as IdentitySet
+from ._collections_cy import OrderedSet as OrderedSet
+from ._collections_cy import unique_list as unique_list  # noqa: F401
+from ._immutabledict_cy import immutabledict as immutabledict
+from ._immutabledict_cy import ImmutableDictBase as ImmutableDictBase
+from ._immutabledict_cy import ReadOnlyContainer as ReadOnlyContainer
 from .typing import is_non_string_iterable
-from .typing import Literal
-from .typing import Protocol
-
-if typing.TYPE_CHECKING or not HAS_CYEXTENSION:
-    from ._py_collections import immutabledict as immutabledict
-    from ._py_collections import IdentitySet as IdentitySet
-    from ._py_collections import ReadOnlyContainer as ReadOnlyContainer
-    from ._py_collections import ImmutableDictBase as ImmutableDictBase
-    from ._py_collections import OrderedSet as OrderedSet
-    from ._py_collections import unique_list as unique_list
-else:
-    from sqlalchemy.cyextension.immutabledict import (
-        ReadOnlyContainer as ReadOnlyContainer,
-    )
-    from sqlalchemy.cyextension.immutabledict import (
-        ImmutableDictBase as ImmutableDictBase,
-    )
-    from sqlalchemy.cyextension.immutabledict import (
-        immutabledict as immutabledict,
-    )
-    from sqlalchemy.cyextension.collections import IdentitySet as IdentitySet
-    from sqlalchemy.cyextension.collections import OrderedSet as OrderedSet
-    from sqlalchemy.cyextension.collections import (  # noqa
-        unique_list as unique_list,
-    )
 
 _T = TypeVar("_T", bound=Any)
 _KT = TypeVar("_KT", bound=Any)
@@ -145,7 +127,7 @@ class FacadeDict(ImmutableDictBase[_KT, _VT]):
     """A dictionary that is not publicly mutable."""
 
     def __new__(cls, *args: Any) -> FacadeDict[Any, Any]:
-        new = ImmutableDictBase.__new__(cls)
+        new: FacadeDict[Any, Any] = ImmutableDictBase.__new__(cls)
         return new
 
     def copy(self) -> NoReturn:
@@ -288,7 +270,7 @@ sort_dictionary = _ordered_dictionary_sort
 
 
 class WeakSequence(Sequence[_T]):
-    def __init__(self, __elements: Sequence[_T] = ()):
+    def __init__(self, __elements: Sequence[_T] = (), /):
         # adapted from weakref.WeakKeyDictionary, prevent reference
         # cycles in the collection itself
         def _remove(item, selfref=weakref.ref(self)):
@@ -316,13 +298,7 @@ class WeakSequence(Sequence[_T]):
         return self._storage[index]()
 
 
-class OrderedIdentitySet(IdentitySet):
-    def __init__(self, iterable: Optional[Iterable[Any]] = None):
-        IdentitySet.__init__(self)
-        self._members = OrderedDict()
-        if iterable:
-            for o in iterable:
-                self.add(o)
+OrderedIdentitySet = IdentitySet
 
 
 class PopulateDict(Dict[_KT, _VT]):
@@ -412,7 +388,7 @@ def coerce_generator_arg(arg: Any) -> List[Any]:
 
 def to_list(x: Any, default: Optional[List[Any]] = None) -> List[Any]:
     if x is None:
-        return default  # type: ignore
+        return default  # type: ignore[return-value]
     if not is_non_string_iterable(x):
         return [x]
     elif isinstance(x, list):
@@ -563,7 +539,7 @@ class LRUCache(typing.MutableMapping[_KT, _VT]):
             while len(self) > self.capacity + self.capacity * self.threshold:
                 if size_alert:
                     size_alert = False
-                    self.size_alert(self)  # type: ignore
+                    self.size_alert(self)  # type: ignore[misc]
                 by_counter = sorted(
                     self._data.values(),
                     key=operator.itemgetter(2),

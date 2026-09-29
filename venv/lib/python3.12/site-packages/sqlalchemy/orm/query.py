@@ -31,10 +31,12 @@ from typing import Generic
 from typing import Iterable
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import Mapping
 from typing import Optional
 from typing import overload
 from typing import Sequence
+from typing import SupportsIndex
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
@@ -50,8 +52,8 @@ from .base import _assertions
 from .context import _column_descriptions
 from .context import _determine_last_joined_entity
 from .context import _legacy_filter_by_entity_zero
+from .context import _ORMCompileState
 from .context import FromStatement
-from .context import ORMCompileState
 from .context import QueryContext
 from .interfaces import ORMColumnDescription
 from .interfaces import ORMColumnsClauseRole
@@ -75,7 +77,6 @@ from ..sql import Select
 from ..sql import util as sql_util
 from ..sql import visitors
 from ..sql._typing import _FromClauseArgument
-from ..sql._typing import _TP
 from ..sql.annotation import SupportsCloneAnnotations
 from ..sql.base import _entity_namespace_key
 from ..sql.base import _generative
@@ -92,9 +93,12 @@ from ..sql.selectable import HasPrefixes
 from ..sql.selectable import HasSuffixes
 from ..sql.selectable import LABEL_STYLE_TABLENAME_PLUS_COL
 from ..sql.selectable import SelectLabelStyle
-from ..util.typing import Literal
+from ..util import deprecated
+from ..util import warn_deprecated
 from ..util.typing import Self
-from ..util.typing import SupportsIndex
+from ..util.typing import TupleAny
+from ..util.typing import TypeVarTuple
+from ..util.typing import Unpack
 
 if TYPE_CHECKING:
     from ._typing import _EntityType
@@ -135,6 +139,7 @@ if TYPE_CHECKING:
     from ..sql._typing import _TypedColumnClauseArgument as _TCCA
     from ..sql.base import CacheableOptions
     from ..sql.base import ExecutableOption
+    from ..sql.base import SyntaxExtension
     from ..sql.dml import UpdateBase
     from ..sql.elements import ColumnElement
     from ..sql.elements import Label
@@ -152,6 +157,7 @@ if TYPE_CHECKING:
 __all__ = ["Query", "QueryContext"]
 
 _T = TypeVar("_T", bound=Any)
+_Ts = TypeVarTuple("_Ts")
 
 
 @inspection._self_inspects
@@ -206,8 +212,10 @@ class Query(
 
     _memoized_select_entities = ()
 
+    _syntax_extensions: Tuple[SyntaxExtension, ...] = ()
+
     _compile_options: Union[Type[CacheableOptions], CacheableOptions] = (
-        ORMCompileState.default_compile_options
+        _ORMCompileState.default_compile_options
     )
 
     _with_options: Tuple[ExecutableOption, ...]
@@ -273,7 +281,7 @@ class Query(
         # for the query(Entity).with_session(session) API which is likely in
         # some old recipes, however these are legacy as select() can now be
         # used.
-        self.session = session  # type: ignore
+        self.session = session  # type: ignore[assignment]
         self._set_entities(entities)
 
     def _set_propagate_attrs(self, values: Mapping[str, Any]) -> Self:
@@ -296,6 +304,11 @@ class Query(
             for ent in util.to_list(entities)
         ]
 
+    @deprecated(
+        "2.1.0",
+        "The :meth:`.Query.tuples` method is deprecated, :class:`.Row` "
+        "now behaves like a tuple and can unpack types directly.",
+    )
     def tuples(self: Query[_O]) -> Query[Tuple[_O]]:
         """return a tuple-typed form of this :class:`.Query`.
 
@@ -317,10 +330,13 @@ class Query(
 
         .. seealso::
 
+            :ref:`change_10635` - describes a migration path from this
+            workaround for SQLAlchemy 2.1.
+
             :meth:`.Result.tuples` - v2 equivalent method.
 
         """
-        return self.only_return_tuples(True)  # type: ignore
+        return self.only_return_tuples(True)  # type: ignore[return-value]
 
     def _entity_from_pre_ent_zero(self) -> Optional[_InternalEntityType[Any]]:
         if not self._raw_columns:
@@ -329,14 +345,14 @@ class Query(
         ent = self._raw_columns[0]
 
         if "parententity" in ent._annotations:
-            return ent._annotations["parententity"]  # type: ignore
+            return ent._annotations["parententity"]  # type: ignore[no-any-return]  # noqa: E501
         elif "bundle" in ent._annotations:
-            return ent._annotations["bundle"]  # type: ignore
+            return ent._annotations["bundle"]  # type: ignore[no-any-return]
         else:
             # label, other SQL expression
             for element in visitors.iterate(ent):
                 if "parententity" in element._annotations:
-                    return element._annotations["parententity"]  # type: ignore  # noqa: E501
+                    return element._annotations["parententity"]  # type: ignore[no-any-return]  # noqa: E501
             else:
                 return None
 
@@ -351,16 +367,15 @@ class Query(
                 "a single mapped class." % methname
             )
 
-        return self._raw_columns[0]._annotations["parententity"]  # type: ignore  # noqa: E501
+        return self._raw_columns[0]._annotations["parententity"]  # type: ignore[no-any-return]  # noqa: E501
 
     def _set_select_from(
         self, obj: Iterable[_FromClauseArgument], set_base_alias: bool
     ) -> None:
         fa = [
             coercions.expect(
-                roles.StrictFromClauseRole,
+                roles.FromClauseRole,
                 elem,
-                allow_select=True,
                 apply_propagate_attrs=self,
             )
             for elem in obj
@@ -536,7 +551,9 @@ class Query(
 
         return stmt
 
-    def _final_statement(self, legacy_query_style: bool = True) -> Select[Any]:
+    def _final_statement(
+        self, legacy_query_style: bool = True
+    ) -> Select[Unpack[TupleAny]]:
         """Return the 'final' SELECT statement for this :class:`.Query`.
 
         This is used by the testing suite only and is fairly inefficient.
@@ -552,7 +569,7 @@ class Query(
 
         return q._compile_state(
             use_legacy_query_style=legacy_query_style
-        ).statement  # type: ignore
+        ).statement  # type: ignore[return-value]
 
     def _statement_20(
         self, for_statement: bool = False, use_legacy_query_style: bool = True
@@ -565,7 +582,7 @@ class Query(
                 new_query = fn(self)
                 if new_query is not None and new_query is not self:
                     self = new_query
-                    if not fn._bake_ok:  # type: ignore
+                    if not fn._bake_ok:  # type: ignore[attr-defined]
                         self._compile_options += {"_bake_ok": False}
 
         compile_options = self._compile_options
@@ -580,7 +597,7 @@ class Query(
             stmt = FromStatement(self._raw_columns, self._statement)
             stmt.__dict__.update(
                 _with_options=self._with_options,
-                _with_context_options=self._with_context_options,
+                _with_context_options=self._compile_state_funcs,
                 _compile_options=compile_options,
                 _execution_options=self._execution_options,
                 _propagate_attrs=self._propagate_attrs,
@@ -588,11 +605,14 @@ class Query(
         else:
             # Query / select() internal attributes are 99% cross-compatible
             stmt = Select._create_raw_select(**self.__dict__)
+
             stmt.__dict__.update(
                 _label_style=self._label_style,
                 _compile_options=compile_options,
                 _propagate_attrs=self._propagate_attrs,
             )
+            for ext in self._syntax_extensions:
+                stmt._apply_syntax_extension_to_self(ext)
             stmt.__dict__.pop("session", None)
 
         # ensure the ORM context is used to compile the statement, even
@@ -818,7 +838,7 @@ class Query(
     @overload
     def only_return_tuples(
         self: Query[_O], value: Literal[True]
-    ) -> RowReturningQuery[Tuple[_O]]: ...
+    ) -> RowReturningQuery[_O]: ...
 
     @overload
     def only_return_tuples(
@@ -854,8 +874,6 @@ class Query(
         Returns True if this query returns a single entity for each instance
         in its result list, and False if this query returns a tuple of entities
         for each result.
-
-        .. versionadded:: 1.3.11
 
         .. seealso::
 
@@ -1111,12 +1129,6 @@ class Query(
 
             my_object = query.get({"id": 5, "version_id": 10})
 
-         .. versionadded:: 1.3 the :meth:`_query.Query.get`
-            method now optionally
-            accepts a dictionary of attribute names to values in order to
-            indicate a primary key identifier.
-
-
         :return: The object instance, or ``None``.
 
         """  # noqa: E501
@@ -1124,7 +1136,7 @@ class Query(
 
         # we still implement _get_impl() so that baked query can override
         # it
-        return self._get_impl(ident, loading.load_on_pk_identity)
+        return self._get_impl(ident, loading._load_on_pk_identity)
 
     def _get_impl(
         self,
@@ -1159,11 +1171,11 @@ class Query(
             :attr:`.ORMExecuteState.lazy_loaded_from`
 
         """
-        return self.load_options._lazy_loaded_from  # type: ignore
+        return self.load_options._lazy_loaded_from  # type: ignore[no-any-return]  # noqa: E501
 
     @property
     def _current_path(self) -> PathRegistry:
-        return self._compile_options._current_path  # type: ignore
+        return self._compile_options._current_path  # type: ignore[no-any-return]  # noqa: E501
 
     @_generative
     def correlate(
@@ -1295,16 +1307,16 @@ class Query(
             for prop in mapper.iterate_properties:
                 if (
                     isinstance(prop, relationships.RelationshipProperty)
-                    and prop.mapper is entity_zero.mapper  # type: ignore
+                    and prop.mapper is entity_zero.mapper  # type: ignore[union-attr]  # noqa: E501
                 ):
-                    property = prop  # type: ignore  # noqa: A001
+                    property = prop  # type: ignore[assignment]  # noqa: A001
                     break
             else:
                 raise sa_exc.InvalidRequestError(
                     "Could not locate a property which relates instances "
                     "of class '%s' to instances of class '%s'"
                     % (
-                        entity_zero.mapper.class_.__name__,  # type: ignore
+                        entity_zero.mapper.class_.__name__,  # type: ignore[union-attr]  # noqa: E501
                         instance.__class__.__name__,
                     )
                 )
@@ -1312,8 +1324,8 @@ class Query(
         return self.filter(
             with_parent(
                 instance,
-                property,  # type: ignore
-                entity_zero.entity,  # type: ignore
+                property,  # type: ignore[arg-type]
+                entity_zero.entity,  # type: ignore[union-attr]
             )
         )
 
@@ -1413,6 +1425,7 @@ class Query(
             "_having_criteria",
             "_prefixes",
             "_suffixes",
+            "_syntax_extensions",
         ):
             self.__dict__.pop(attr, None)
         self._set_select_from([fromclause], set_entity_from)
@@ -1461,7 +1474,7 @@ class Query(
 
         """
         try:
-            return next(self._values_no_warn(column))[0]  # type: ignore
+            return next(self._values_no_warn(column))[0]  # type: ignore[arg-type, call-overload]  # noqa: E501
         except StopIteration:
             return None
 
@@ -1481,13 +1494,13 @@ class Query(
 
     @overload
     def with_entities(
-        self, __ent0: _TCCA[_T0], __ent1: _TCCA[_T1]
-    ) -> RowReturningQuery[Tuple[_T0, _T1]]: ...
+        self, __ent0: _TCCA[_T0], __ent1: _TCCA[_T1], /
+    ) -> RowReturningQuery[_T0, _T1]: ...
 
     @overload
     def with_entities(
-        self, __ent0: _TCCA[_T0], __ent1: _TCCA[_T1], __ent2: _TCCA[_T2]
-    ) -> RowReturningQuery[Tuple[_T0, _T1, _T2]]: ...
+        self, __ent0: _TCCA[_T0], __ent1: _TCCA[_T1], __ent2: _TCCA[_T2], /
+    ) -> RowReturningQuery[_T0, _T1, _T2]: ...
 
     @overload
     def with_entities(
@@ -1496,7 +1509,8 @@ class Query(
         __ent1: _TCCA[_T1],
         __ent2: _TCCA[_T2],
         __ent3: _TCCA[_T3],
-    ) -> RowReturningQuery[Tuple[_T0, _T1, _T2, _T3]]: ...
+        /,
+    ) -> RowReturningQuery[_T0, _T1, _T2, _T3]: ...
 
     @overload
     def with_entities(
@@ -1506,7 +1520,8 @@ class Query(
         __ent2: _TCCA[_T2],
         __ent3: _TCCA[_T3],
         __ent4: _TCCA[_T4],
-    ) -> RowReturningQuery[Tuple[_T0, _T1, _T2, _T3, _T4]]: ...
+        /,
+    ) -> RowReturningQuery[_T0, _T1, _T2, _T3, _T4]: ...
 
     @overload
     def with_entities(
@@ -1517,7 +1532,8 @@ class Query(
         __ent3: _TCCA[_T3],
         __ent4: _TCCA[_T4],
         __ent5: _TCCA[_T5],
-    ) -> RowReturningQuery[Tuple[_T0, _T1, _T2, _T3, _T4, _T5]]: ...
+        /,
+    ) -> RowReturningQuery[_T0, _T1, _T2, _T3, _T4, _T5]: ...
 
     @overload
     def with_entities(
@@ -1529,7 +1545,8 @@ class Query(
         __ent4: _TCCA[_T4],
         __ent5: _TCCA[_T5],
         __ent6: _TCCA[_T6],
-    ) -> RowReturningQuery[Tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6]]: ...
+        /,
+    ) -> RowReturningQuery[_T0, _T1, _T2, _T3, _T4, _T5, _T6]: ...
 
     @overload
     def with_entities(
@@ -1542,7 +1559,11 @@ class Query(
         __ent5: _TCCA[_T5],
         __ent6: _TCCA[_T6],
         __ent7: _TCCA[_T7],
-    ) -> RowReturningQuery[Tuple[_T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7]]: ...
+        /,
+        *entities: _ColumnsClauseArgument[Any],
+    ) -> RowReturningQuery[
+        _T0, _T1, _T2, _T3, _T4, _T5, _T6, _T7, Unpack[TupleAny]
+    ]: ...
 
     # END OVERLOADED FUNCTIONS self.with_entities
 
@@ -1590,7 +1611,7 @@ class Query(
         # Query has all the same fields as Select for this operation
         # this could in theory be based on a protocol but not sure if it's
         # worth it
-        _MemoizedSelectEntities._generate_for_statement(self)  # type: ignore
+        _MemoizedSelectEntities._generate_for_statement(self)  # type: ignore[arg-type]  # noqa: E501
         self._set_entities(entities)
         return self
 
@@ -1653,12 +1674,12 @@ class Query(
         if self._compile_options._current_path:
             # opting for lower method overhead for the checks
             for opt in opts:
-                if not opt._is_core and opt._is_legacy_option:  # type: ignore
-                    opt.process_query_conditionally(self)  # type: ignore
+                if not opt._is_core and opt._is_legacy_option:  # type: ignore[attr-defined]  # noqa: E501
+                    opt.process_query_conditionally(self)  # type: ignore[attr-defined]  # noqa: E501
         else:
             for opt in opts:
-                if not opt._is_core and opt._is_legacy_option:  # type: ignore
-                    opt.process_query(self)  # type: ignore
+                if not opt._is_core and opt._is_legacy_option:  # type: ignore[attr-defined]  # noqa: E501
+                    opt.process_query(self)  # type: ignore[attr-defined]
 
         self._with_options += opts
         return self
@@ -1689,8 +1710,6 @@ class Query(
     def get_execution_options(self) -> _ImmutableExecuteOptions:
         """Get the non-SQL options which will take effect during execution.
 
-        .. versionadded:: 1.3
-
         .. seealso::
 
             :meth:`_query.Query.execution_options`
@@ -1711,6 +1730,7 @@ class Query(
         stream_results: bool = False,
         max_row_buffer: int = ...,
         yield_per: int = ...,
+        driver_column_names: bool = ...,
         insertmanyvalues_page_size: int = ...,
         schema_translate_map: Optional[SchemaTranslateMapType] = ...,
         populate_existing: bool = False,
@@ -1845,7 +1865,7 @@ class Query(
 
     @_generative
     def params(
-        self, __params: Optional[Dict[str, Any]] = None, **kw: Any
+        self, __params: Optional[Dict[str, Any]] = None, /, **kw: Any
     ) -> Self:
         r"""Add values for bind parameters which may have been
         specified in filter().
@@ -1980,6 +2000,14 @@ class Query(
         entity of the query, or the last entity that was the
         target of a call to :meth:`_query.Query.join`.
 
+        .. note::
+
+            :class:`_query.Query` is a legacy construct as of SQLAlchemy 2.0.
+            See :meth:`_sql.Select.filter_by` for the comparable method on
+            2.0-style :func:`_sql.select` constructs, where the behavior has
+            been enhanced in version 2.1 to search across all FROM clause
+            entities. See :ref:`change_8601` for background.
+
         .. seealso::
 
             :meth:`_query.Query.filter` - filter on SQL expressions.
@@ -2002,6 +2030,7 @@ class Query(
             Literal[None, False, _NoArg.NO_ARG],
             _ColumnExpressionOrStrLabelArgument[Any],
         ] = _NoArg.NO_ARG,
+        /,
         *clauses: _ColumnExpressionOrStrLabelArgument[Any],
     ) -> Self:
         """Apply one or more ORDER BY criteria to the query and return
@@ -2053,6 +2082,7 @@ class Query(
             Literal[None, False, _NoArg.NO_ARG],
             _ColumnExpressionOrStrLabelArgument[Any],
         ] = _NoArg.NO_ARG,
+        /,
         *clauses: _ColumnExpressionOrStrLabelArgument[Any],
     ) -> Self:
         """Apply one or more GROUP BY criterion to the query and return
@@ -2673,17 +2703,44 @@ class Query(
          the PostgreSQL dialect will render a ``DISTINCT ON (<expressions>)``
          construct.
 
-         .. deprecated:: 1.4 Using \*expr in other dialects is deprecated
-            and will raise :class:`_exc.CompileError` in a future version.
+         .. deprecated:: 2.1 Passing expressions to
+           :meth:`_orm.Query.distinct` is deprecated, use
+           :func:`_postgresql.distinct_on` instead.
 
         """
         if expr:
+            warn_deprecated(
+                "Passing expression to ``distinct`` to generate a DISTINCT "
+                "ON clause is deprecated. Use instead the "
+                "``postgresql.distinct_on`` function as an extension.",
+                "2.1",
+            )
             self._distinct = True
             self._distinct_on = self._distinct_on + tuple(
                 coercions.expect(roles.ByOfRole, e) for e in expr
             )
         else:
             self._distinct = True
+        return self
+
+    @_generative
+    def ext(self, extension: SyntaxExtension) -> Self:
+        """Applies a SQL syntax extension to this statement.
+
+        .. seealso::
+
+            :ref:`examples_syntax_extensions`
+
+            :func:`_mysql.limit` - DML LIMIT for MySQL
+
+            :func:`_postgresql.distinct_on` - DISTINCT ON for PostgreSQL
+
+        .. versionadded:: 2.1
+
+        """
+
+        extension = coercions.expect(roles.SyntaxExtensionRole, extension)
+        self._syntax_extensions += (extension,)
         return self
 
     def all(self) -> List[_T]:
@@ -2708,11 +2765,11 @@ class Query(
 
             :meth:`_engine.Result.scalars` - v2 comparable method.
         """
-        return self._iter().all()  # type: ignore
+        return self._iter().all()  # type: ignore[return-value]
 
     @_generative
     @_assertions(_no_clauseelement_condition)
-    def from_statement(self, statement: ExecutableReturnsRows) -> Self:
+    def from_statement(self, statement: roles.SelectStatementRole) -> Self:
         """Execute the given SELECT statement and return results.
 
         This method bypasses all internal statement compilation, and the
@@ -2729,10 +2786,10 @@ class Query(
             :meth:`_sql.Select.from_statement` - v2 comparable method.
 
         """
-        statement = coercions.expect(
+        _statement = coercions.expect(
             roles.SelectStatementRole, statement, apply_propagate_attrs=self
         )
-        self._statement = statement
+        self._statement = _statement
         return self
 
     def first(self) -> Optional[_T]:
@@ -2761,9 +2818,9 @@ class Query(
         """
         # replicates limit(1) behavior
         if self._statement is not None:
-            return self._iter().first()  # type: ignore
+            return self._iter().first()  # type: ignore[return-value]
         else:
-            return self.limit(1)._iter().first()  # type: ignore
+            return self.limit(1)._iter().first()  # type: ignore[return-value]
 
     def one_or_none(self) -> Optional[_T]:
         """Return at most one result or raise an exception.
@@ -2789,7 +2846,7 @@ class Query(
             :meth:`_engine.Result.scalar_one_or_none` - v2 comparable method.
 
         """
-        return self._iter().one_or_none()  # type: ignore
+        return self._iter().one_or_none()  # type: ignore[return-value]
 
     def one(self) -> _T:
         """Return exactly one result or raise an exception.
@@ -2812,7 +2869,7 @@ class Query(
             :meth:`_engine.Result.scalar_one` - v2 comparable method.
 
         """
-        return self._iter().one()  # type: ignore
+        return self._iter().one()  # type: ignore[return-value]
 
     def scalar(self) -> Any:
         """Return the first element of the first result or None
@@ -2849,7 +2906,7 @@ class Query(
     def __iter__(self) -> Iterator[_T]:
         result = self._iter()
         try:
-            yield from result  # type: ignore
+            yield from result  # type: ignore[misc]
         except GeneratorExit:
             # issue #8710 - direct iteration is not reusable after
             # an iterable block is broken, so close the result
@@ -2884,7 +2941,7 @@ class Query(
 
         try:
             bind = (
-                self._get_bind_args(statement, self.session.get_bind)
+                self.session.get_bind(clause=statement)
                 if self.session
                 else None
             )
@@ -2892,9 +2949,6 @@ class Query(
             bind = None
 
         return str(statement.compile(bind))
-
-    def _get_bind_args(self, statement: Any, fn: Any, **kw: Any) -> Any:
-        return fn(clause=statement, **kw)
 
     @property
     def column_descriptions(self) -> List[ORMColumnDescription]:
@@ -2986,7 +3040,7 @@ class Query(
 
         # legacy: automatically set scalars, unique
         if result._attributes.get("is_single_entity", False):
-            result = result.scalars()  # type: ignore
+            result = result.scalars()  # type: ignore[assignment]
 
         if result._attributes.get("filtered", False):
             result = result.unique()
@@ -3149,7 +3203,7 @@ class Query(
 
         """
         col = sql.func.count(sql.literal_column("*"))
-        return (  # type: ignore
+        return (  # type: ignore[no-any-return]
             self._legacy_from_self(col).enable_eagerloads(False).scalar()
         )
 
@@ -3206,12 +3260,16 @@ class Query(
 
                 self = bulk_del.query
 
-        delete_ = sql.delete(*self._raw_columns)  # type: ignore
+        delete_ = sql.delete(*self._raw_columns)  # type: ignore[arg-type]
 
         if delete_args:
             delete_ = delete_.with_dialect_options(**delete_args)
 
         delete_._where_criteria = self._where_criteria
+
+        for ext in self._syntax_extensions:
+            delete_._apply_syntax_extension_to_self(ext)
+
         result = cast(
             "CursorResult[Any]",
             self.session.execute(
@@ -3222,7 +3280,7 @@ class Query(
                 ),
             ),
         )
-        bulk_del.result = result  # type: ignore
+        bulk_del.result = result  # type: ignore[attr-defined]
         self.session.dispatch.after_bulk_delete(bulk_del)
         result.close()
 
@@ -3295,17 +3353,21 @@ class Query(
                     bulk_ud.query = new_query
             self = bulk_ud.query
 
-        upd = sql.update(*self._raw_columns)  # type: ignore
+        upd = sql.update(*self._raw_columns)  # type: ignore[arg-type]
 
         ppo = update_args.pop("preserve_parameter_order", False)
         if ppo:
-            upd = upd.ordered_values(*values)  # type: ignore
+            upd = upd.ordered_values(*values)  # type: ignore[arg-type]
         else:
             upd = upd.values(values)
         if update_args:
             upd = upd.with_dialect_options(**update_args)
 
         upd._where_criteria = self._where_criteria
+
+        for ext in self._syntax_extensions:
+            upd._apply_syntax_extension_to_self(ext)
+
         result = cast(
             "CursorResult[Any]",
             self.session.execute(
@@ -3316,14 +3378,14 @@ class Query(
                 ),
             ),
         )
-        bulk_ud.result = result  # type: ignore
+        bulk_ud.result = result  # type: ignore[attr-defined]
         self.session.dispatch.after_bulk_update(bulk_ud)
         result.close()
         return result.rowcount
 
     def _compile_state(
         self, for_statement: bool = False, **kw: Any
-    ) -> ORMCompileState:
+    ) -> _ORMCompileState:
         """Create an out-of-compiler ORMCompileState object.
 
         The ORMCompileState object is normally created directly as a result
@@ -3348,8 +3410,8 @@ class Query(
         # query._statement is not None as we have the ORM Query here
         # however this is the more general path.
         compile_state_cls = cast(
-            ORMCompileState,
-            ORMCompileState._get_plugin_class_for_plugin(stmt, "orm"),
+            _ORMCompileState,
+            _ORMCompileState._get_plugin_class_for_plugin(stmt, "orm"),
         )
 
         return compile_state_cls._create_orm_context(
@@ -3386,7 +3448,7 @@ class AliasOption(interfaces.LoaderOption):
 
         """
 
-    def process_compile_state(self, compile_state: ORMCompileState) -> None:
+    def process_compile_state(self, compile_state: _ORMCompileState) -> None:
         pass
 
 
@@ -3459,8 +3521,8 @@ class BulkDelete(BulkUD):
         self.delete_kwargs = delete_kwargs
 
 
-class RowReturningQuery(Query[Row[_TP]]):
+class RowReturningQuery(Query[Row[Unpack[_Ts]]]):
     if TYPE_CHECKING:
 
-        def tuples(self) -> Query[_TP]:  # type: ignore
+        def tuples(self) -> Query[Tuple[Unpack[_Ts]]]:  # type: ignore[override]  # noqa: E501
             ...

@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
+from importlib import metadata as importlib_metadata
 import inspect
 import operator
 import platform
@@ -21,7 +22,6 @@ import sysconfig
 import typing
 from typing import Any
 from typing import Callable
-from typing import cast
 from typing import Dict
 from typing import Iterable
 from typing import List
@@ -31,16 +31,11 @@ from typing import Sequence
 from typing import Set
 from typing import Tuple
 from typing import Type
-from typing import TypeVar
 
 py314b1 = sys.version_info >= (3, 14, 0, "beta", 1)
 py314 = sys.version_info >= (3, 14)
 py313 = sys.version_info >= (3, 13)
 py312 = sys.version_info >= (3, 12)
-py311 = sys.version_info >= (3, 11)
-py310 = sys.version_info >= (3, 10)
-py39 = sys.version_info >= (3, 9)
-py38 = sys.version_info >= (3, 8)
 pypy = platform.python_implementation() == "PyPy"
 cpython = platform.python_implementation() == "CPython"
 freethreading = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
@@ -54,111 +49,39 @@ has_refcount_gc = bool(cpython)
 
 dottedgetter = operator.attrgetter
 
-_T_co = TypeVar("_T_co", covariant=True)
 
+# use sys.version_info to enable mypy version narrowing
+if sys.version_info >= (3, 14):
 
-if py314:
-    # vendor a minimal form of get_annotations per
-    # https://github.com/python/cpython/issues/133684#issuecomment-2863841891
-
-    from annotationlib import call_annotate_function  # type: ignore[import-not-found,unused-ignore]  # noqa: E501
-    from annotationlib import Format
-
-    def _get_and_call_annotate(obj, format):  # noqa: A002
-        annotate = getattr(obj, "__annotate__", None)
-        if annotate is not None:
-            ann = call_annotate_function(annotate, format, owner=obj)
-            if not isinstance(ann, dict):
-                raise ValueError(f"{obj!r}.__annotate__ returned a non-dict")
-            return ann
-        return None
-
-    # this is ported from py3.13.0a7
-    _BASE_GET_ANNOTATIONS = type.__dict__["__annotations__"].__get__
-
-    def _get_dunder_annotations(obj):
-        if isinstance(obj, type):
-            try:
-                ann = _BASE_GET_ANNOTATIONS(obj)
-            except AttributeError:
-                # For static types, the descriptor raises AttributeError.
-                return {}
-        else:
-            ann = getattr(obj, "__annotations__", None)
-            if ann is None:
-                return {}
-
-        if not isinstance(ann, dict):
-            raise ValueError(
-                f"{obj!r}.__annotations__ is neither a dict nor None"
-            )
-        return dict(ann)
-
-    def _vendored_get_annotations(
-        obj: Any, *, format: Format  # noqa: A002
-    ) -> Mapping[str, Any]:
-        """A sparse implementation of annotationlib.get_annotations()"""
-
-        try:
-            ann = _get_dunder_annotations(obj)
-        except Exception:
-            pass
-        else:
-            if ann is not None:
-                return dict(ann)
-
-        # But if __annotations__ threw a NameError, we try calling __annotate__
-        ann = _get_and_call_annotate(obj, format)
-        if ann is None:
-            # If that didn't work either, we have a very weird object:
-            # evaluating
-            # __annotations__ threw NameError and there is no __annotate__.
-            # In that case,
-            # we fall back to trying __annotations__ again.
-            ann = _get_dunder_annotations(obj)
-
-        if ann is None:
-            if isinstance(obj, type) or callable(obj):
-                return {}
-            raise TypeError(f"{obj!r} does not have annotations")
-
-        if not ann:
-            return {}
-
-        return dict(ann)
+    import annotationlib
+    from string.templatelib import Template as Template
 
     def get_annotations(obj: Any) -> Mapping[str, Any]:
-        # FORWARDREF has the effect of giving us ForwardRefs and not
-        # actually trying to evaluate the annotations.  We need this so
-        # that the annotations act as much like
-        # "from __future__ import annotations" as possible, which is going
-        # away in future python as a separate mode
-        return _vendored_get_annotations(obj, format=Format.FORWARDREF)
-
-elif py310:
-
-    def get_annotations(obj: Any) -> Mapping[str, Any]:
-        return inspect.get_annotations(obj)
+        return annotationlib.get_annotations(
+            obj, format=annotationlib.Format.FORWARDREF
+        )
 
 else:
 
     def get_annotations(obj: Any) -> Mapping[str, Any]:
-        # it's been observed that cls.__annotations__ can be non present.
-        # it's not clear what causes this, running under tox py37/38 it
-        # happens, running straight pytest it doesnt
+        return inspect.get_annotations(obj)
 
-        # https://docs.python.org/3/howto/annotations.html#annotations-howto
-        if isinstance(obj, type):
-            ann = obj.__dict__.get("__annotations__", None)
-        else:
-            ann = getattr(obj, "__annotations__", None)
+    class Template:
+        """Minimal Template for Python < 3.14 (test usage only)."""
 
-        from . import _collections
+        def __init__(self, *parts: Any):
+            self._parts = parts
 
-        if ann is None:
-            return _collections.EMPTY_DICT
-        else:
-            return cast("Mapping[str, Any]", ann)
+        @property
+        def strings(self) -> Tuple[str, ...]:
+            return tuple(p for p in self._parts if isinstance(p, str))
+
+        @property
+        def interpolations(self) -> Tuple[Any, ...]:
+            return tuple(p for p in self._parts if not isinstance(p, str))
+
+        def __iter__(self) -> Any:
+            return iter(self._parts)
 
 
 class FullArgSpec(typing.NamedTuple):
@@ -209,55 +132,10 @@ def inspect_getfullargspec(func: Callable[..., Any]) -> FullArgSpec:
     )
 
 
-if py39:
-    # python stubs don't have a public type for this. not worth
-    # making a protocol
-    def md5_not_for_security() -> Any:
-        return hashlib.md5(usedforsecurity=False)
-
-else:
-
-    def md5_not_for_security() -> Any:
-        return hashlib.md5()
-
-
-if typing.TYPE_CHECKING or py38:
-    from importlib import metadata as importlib_metadata
-else:
-    import importlib_metadata  # noqa
-
-
-if typing.TYPE_CHECKING or py39:
-    # pep 584 dict union
-    dict_union = operator.or_  # noqa
-else:
-
-    def dict_union(a: dict, b: dict) -> dict:
-        a = a.copy()
-        a.update(b)
-        return a
-
-
-if py310:
-    anext_ = anext
-else:
-    _NOT_PROVIDED = object()
-    from collections.abc import AsyncIterator
-
-    async def anext_(async_iterator, default=_NOT_PROVIDED):  # type: ignore[misc]  # noqa: E501
-        """vendored from https://github.com/python/cpython/pull/8895"""
-
-        if not isinstance(async_iterator, AsyncIterator):
-            raise TypeError(
-                f"anext expected an AsyncIterator, got {type(async_iterator)}"
-            )
-        anxt = type(async_iterator).__anext__
-        try:
-            return await anxt(async_iterator)
-        except StopAsyncIteration:
-            if default is _NOT_PROVIDED:
-                raise
-            return default
+# python stubs don't have a public type for this. not worth
+# making a protocol
+def md5_not_for_security() -> Any:
+    return hashlib.md5(usedforsecurity=False)
 
 
 def importlib_metadata_get(group):

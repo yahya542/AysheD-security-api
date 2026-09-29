@@ -13,14 +13,17 @@ from typing import Callable
 from typing import Dict
 from typing import Generic
 from typing import Iterable
+from typing import Literal
 from typing import Mapping
 from typing import NoReturn
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Set
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
+from typing import TypeAlias
 from typing import TypeVar
 from typing import Union
 
@@ -28,9 +31,9 @@ from . import roles
 from .. import exc
 from .. import util
 from ..inspection import Inspectable
-from ..util.typing import Literal
-from ..util.typing import Protocol
-from ..util.typing import TypeAlias
+from ..util.typing import TupleAny
+from ..util.typing import TypeVarTuple
+from ..util.typing import Unpack
 
 if TYPE_CHECKING:
     from datetime import date
@@ -38,6 +41,7 @@ if TYPE_CHECKING:
     from datetime import time
     from datetime import timedelta
     from decimal import Decimal
+    from typing import TypeGuard
     from uuid import UUID
 
     from .base import Executable
@@ -74,10 +78,11 @@ if TYPE_CHECKING:
     from ..engine import Dialect
     from ..engine import Engine
     from ..engine.mock import MockConnection
-    from ..util.typing import TypeGuard
 
 _T = TypeVar("_T", bound=Any)
 _T_co = TypeVar("_T_co", bound=Any, covariant=True)
+_Ts = TypeVarTuple("_Ts")
+_Ts2 = TypeVarTuple("_Ts2")
 
 
 _CE = TypeVar("_CE", bound="ColumnElement[Any]")
@@ -172,8 +177,6 @@ _TypedColumnClauseArgument = Union[
     Type[_T],
 ]
 
-_TP = TypeVar("_TP", bound=Tuple[Any, ...])
-
 _T0 = TypeVar("_T0", bound=Any)
 _T1 = TypeVar("_T1", bound=Any)
 _T2 = TypeVar("_T2", bound=Any)
@@ -265,8 +268,8 @@ come from the ORM.
 """
 
 _SelectStatementForCompoundArgument = Union[
-    "Select[_TP]",
-    "CompoundSelect[_TP]",
+    "Select[Unpack[_Ts]]",
+    "CompoundSelect[Unpack[_Ts]]",
     roles.CompoundElementRole,
 ]
 """SELECT statement acceptable by ``union()`` and other SQL set operations"""
@@ -287,6 +290,7 @@ the DMLColumnRole to be able to accommodate.
 
 """
 
+
 _DMLKey = TypeVar("_DMLKey", bound=_DMLColumnArgument)
 _DMLColumnKeyMapping = Mapping[_DMLKey, Any]
 
@@ -295,6 +299,20 @@ _DDLColumnArgument = Union[str, "Column[Any]", roles.DDLConstraintColumnRole]
 """DDL column.
 
 used for :class:`.PrimaryKeyConstraint`, :class:`.UniqueConstraint`, etc.
+
+"""
+
+_DDLColumnReferenceArgument = Union[
+    _DDLColumnArgument,
+    Tuple[Optional[str], str, Optional[str]],
+    Tuple[str, Optional[str]],
+]
+"""DDL column reference, as used by :class:`.ForeignKey`.
+
+In addition to the forms accepted by ``_DDLColumnArgument``, the target may
+be given as a ``(schema, table_name, column_name)`` or ``(table_name,
+column_name)`` tuple, which is the only form that can express a name that
+itself contains a dot.
 
 """
 
@@ -356,7 +374,7 @@ if TYPE_CHECKING:
 
     def is_select_statement(
         t: Union[Executable, ReturnsRows],
-    ) -> TypeGuard[Select[Any]]: ...
+    ) -> TypeGuard[Select[Unpack[TupleAny]]]: ...
 
     def is_table(t: FromClause) -> TypeGuard[TableClause]: ...
 
@@ -395,7 +413,7 @@ def is_has_clause_element(s: object) -> TypeGuard[_HasClauseElement[Any]]:
 
 
 def is_insert_update(c: ClauseElement) -> TypeGuard[ValuesBase]:
-    return c.is_dml and (c.is_insert or c.is_update)  # type: ignore
+    return c.is_dml and (c.is_insert or c.is_update)  # type: ignore[attr-defined]  # noqa: E501
 
 
 def _no_kw() -> exc.ArgumentError:
@@ -479,4 +497,4 @@ def NotNullable(
 
     .. versionadded:: 2.0.20
     """
-    return val  # type: ignore
+    return val  # type: ignore[return-value]

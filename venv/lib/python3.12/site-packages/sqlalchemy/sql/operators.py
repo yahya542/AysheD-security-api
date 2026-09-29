@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from enum import auto
+from enum import Flag
 from enum import IntEnum
 from operator import add as _uncast_add
 from operator import and_ as _uncast_and_
@@ -25,11 +27,13 @@ from operator import inv as _uncast_inv
 from operator import le as _uncast_le
 from operator import lshift as _uncast_lshift
 from operator import lt as _uncast_lt
+from operator import matmul as _uncast_matmul
 from operator import mod as _uncast_mod
 from operator import mul as _uncast_mul
 from operator import ne as _uncast_ne
 from operator import neg as _uncast_neg
 from operator import or_ as _uncast_or_
+from operator import pow as _uncast_pow
 from operator import rshift as _uncast_rshift
 from operator import sub as _uncast_sub
 from operator import truediv as _uncast_truediv
@@ -39,8 +43,11 @@ from typing import Callable
 from typing import cast
 from typing import Dict
 from typing import Generic
+from typing import Hashable
+from typing import Literal
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Set
 from typing import Tuple
 from typing import Type
@@ -50,8 +57,6 @@ from typing import Union
 
 from .. import exc
 from .. import util
-from ..util.typing import Literal
-from ..util.typing import Protocol
 
 if typing.TYPE_CHECKING:
     from ._typing import ColumnExpressionArgument
@@ -63,7 +68,59 @@ _T = TypeVar("_T", bound=Any)
 _FN = TypeVar("_FN", bound=Callable[..., Any])
 
 
-class OperatorType(Protocol):
+class OperatorClass(Flag):
+    """Describes a class of SQLAlchemy built-in operators that should be
+    available on a particular type.
+
+    The :class:`.OperatorClass` should be present on the
+    :attr:`.TypeEngine.operator_classes` attribute of any particular type.
+
+    The enums here can be ORed together to provide sets of operators merged
+    together.
+
+    .. versionadded:: 2.1
+
+    """
+
+    UNSPECIFIED = auto()
+    BASE = auto()
+    BOOLEAN_ALGEBRA = auto()
+    COMPARISON = auto()
+    INDEXABLE = auto()  # noqa: F811
+    CONTAINS = auto()
+    CONCATENABLE = auto()
+    STRING_MATCH = auto()
+    MATH = auto()
+    BITWISE = auto()
+    DATE_ARITHEMETIC = auto()
+    JSON_GETITEM = auto()
+
+    STRING = (
+        BASE | COMPARISON | STRING_MATCH | CONTAINS | CONCATENABLE | INDEXABLE
+    )
+    INTEGER = BASE | COMPARISON | MATH | BITWISE
+    NUMERIC = BASE | COMPARISON | MATH | BITWISE
+    BOOLEAN = BASE | COMPARISON | BOOLEAN_ALGEBRA | COMPARISON
+    BINARY = BASE | COMPARISON | CONTAINS | CONCATENABLE | INDEXABLE
+    DATETIME = BASE | COMPARISON | DATE_ARITHEMETIC
+    JSON = BASE | COMPARISON | INDEXABLE | JSON_GETITEM
+    ARRAY = BASE | COMPARISON | CONTAINS | CONCATENABLE | INDEXABLE
+    TUPLE = BASE | COMPARISON | CONTAINS | CONCATENABLE | INDEXABLE
+
+    ANY = (
+        STRING
+        | INTEGER
+        | NUMERIC
+        | BOOLEAN
+        | DATETIME
+        | BINARY
+        | JSON
+        | ARRAY
+        | TUPLE
+    )
+
+
+class OperatorType(Hashable, Protocol):
     """describe an op() function."""
 
     __slots__ = ()
@@ -109,11 +166,13 @@ inv = cast(OperatorType, _uncast_inv)
 le = cast(OperatorType, _uncast_le)
 lshift = cast(OperatorType, _uncast_lshift)
 lt = cast(OperatorType, _uncast_lt)
+matmul = cast(OperatorType, _uncast_matmul)
 mod = cast(OperatorType, _uncast_mod)
 mul = cast(OperatorType, _uncast_mul)
 ne = cast(OperatorType, _uncast_ne)
 neg = cast(OperatorType, _uncast_neg)
 or_ = cast(OperatorType, _uncast_or_)
+pow_ = cast(OperatorType, _uncast_pow)
 rshift = cast(OperatorType, _uncast_rshift)
 sub = cast(OperatorType, _uncast_sub)
 truediv = cast(OperatorType, _uncast_truediv)
@@ -204,6 +263,11 @@ class Operators:
         """
         return self.operate(inv)
 
+    def _null_operate(self, other: Any) -> Operators:
+        """A 'null' operation available on all types, used for testing."""
+
+        return self.operate(null_op, other)
+
     def op(
         self,
         opstring: str,
@@ -213,6 +277,8 @@ class Operators:
             Union[Type[TypeEngine[Any]], TypeEngine[Any]]
         ] = None,
         python_impl: Optional[Callable[..., Any]] = None,
+        operator_class: OperatorClass = OperatorClass.BASE,
+        visit_name: Optional[str] = None,
     ) -> Callable[[Any], Operators]:
         """Produce a generic operator function.
 
@@ -288,6 +354,13 @@ class Operators:
 
          .. versionadded:: 2.0
 
+        :param operator_class: optional :class:`.OperatorClass` which will be
+         applied to the :class:`.custom_op` created, which provides hints
+         as to which datatypes are appropriate for this operator.   Defaults
+         to :attr:`.OperatorClass.BASE` which is appropriate for all
+         datatypes.
+
+         .. versionadded:: 2.1
 
         .. seealso::
 
@@ -297,13 +370,26 @@ class Operators:
 
             :ref:`relationship_custom_operator`
 
+        :param visit_name: string name indicating a series of methods that
+         maybe be implemented by a :class:`.Dialect`, specifically using its
+         :class:`.SQLCompiler` implementation.  The naming scheme is
+         ``visit_<visit_name>_op_[binary|unary]``; e.g. using the visit name
+         ``hstore`` means that a binary expression using the operator will
+         attempt to locate a method ``visit_hstore_op_binary()`` on the
+         target dialect's compiler class, which can then provide a compilation
+         string for the full binary expression.
+
+         .. versionadded:: 2.1
+
         """
         operator = custom_op(
             opstring,
-            precedence,
-            is_comparison,
-            return_type,
+            precedence=precedence,
+            is_comparison=is_comparison,
+            return_type=return_type,
             python_impl=python_impl,
+            operator_class=operator_class,
+            visit_name=visit_name,
         )
 
         def against(other: Any) -> Operators:
@@ -414,11 +500,14 @@ class custom_op(OperatorType, Generic[_T]):
         "eager_grouping",
         "return_type",
         "python_impl",
+        "operator_class",
+        "visit_name",
     )
 
     def __init__(
         self,
         opstring: str,
+        *,
         precedence: int = 0,
         is_comparison: bool = False,
         return_type: Optional[
@@ -427,7 +516,14 @@ class custom_op(OperatorType, Generic[_T]):
         natural_self_precedent: bool = False,
         eager_grouping: bool = False,
         python_impl: Optional[Callable[..., Any]] = None,
+        operator_class: OperatorClass = OperatorClass.BASE,
+        visit_name: Optional[str] = None,
     ):
+        """Create a new :class:`.custom_op`.
+
+        See :meth:`.Operators.op` for parameter information.
+
+        """
         self.opstring = opstring
         self.precedence = precedence
         self.is_comparison = is_comparison
@@ -437,6 +533,8 @@ class custom_op(OperatorType, Generic[_T]):
             return_type._to_instance(return_type) if return_type else None
         )
         self.python_impl = python_impl
+        self.operator_class = operator_class
+        self.visit_name = visit_name
 
     def __eq__(self, other: Any) -> bool:
         return (
@@ -456,6 +554,7 @@ class custom_op(OperatorType, Generic[_T]):
             self.natural_self_precedent,
             self.eager_grouping,
             self.return_type._static_cache_key if self.return_type else None,
+            self.operator_class,
         )
 
     @overload
@@ -484,9 +583,9 @@ class custom_op(OperatorType, Generic[_T]):
         **kwargs: Any,
     ) -> Operators:
         if hasattr(left, "__sa_operate__"):
-            return left.operate(self, right, *other, **kwargs)  # type: ignore
+            return left.operate(self, right, *other, **kwargs)  # type: ignore[no-any-return]  # noqa: E501
         elif self.python_impl:
-            return self.python_impl(left, right, *other, **kwargs)  # type: ignore  # noqa: E501
+            return self.python_impl(left, right, *other, **kwargs)  # type: ignore[no-any-return]  # noqa: E501
         else:
             raise exc.InvalidRequestError(
                 f"Custom operator {self.opstring!r} can't be used with "
@@ -495,7 +594,72 @@ class custom_op(OperatorType, Generic[_T]):
             )
 
 
-class ColumnOperators(Operators):
+class OrderingOperators(Operators):
+    """defines ORDER BY operators, which can operate as single expressions
+    or comma-separated lists
+
+    """
+
+    __slots__ = ()
+
+    if typing.TYPE_CHECKING:
+
+        def operate(
+            self, op: OperatorType, *other: Any, **kwargs: Any
+        ) -> OrderingOperators: ...
+
+        def reverse_operate(
+            self, op: OperatorType, other: Any, **kwargs: Any
+        ) -> OrderingOperators: ...
+
+    def desc(self) -> OrderingOperators:
+        """Produce a :func:`_expression.desc` clause against the
+        parent object."""
+        return self.operate(desc_op)
+
+    def asc(self) -> OrderingOperators:
+        """Produce a :func:`_expression.asc` clause against the
+        parent object."""
+        return self.operate(asc_op)
+
+    def nulls_first(self) -> OrderingOperators:
+        """Produce a :func:`_expression.nulls_first` clause against the
+        parent object.
+
+        .. versionchanged:: 1.4 The ``nulls_first()`` operator is
+           renamed from ``nullsfirst()`` in previous releases.
+           The previous name remains available for backwards compatibility.
+        """
+        return self.operate(nulls_first_op)
+
+    # deprecated 1.4; see #5435
+    if TYPE_CHECKING:
+
+        def nullsfirst(self) -> OrderingOperators: ...
+
+    else:
+        nullsfirst = nulls_first
+
+    def nulls_last(self) -> OrderingOperators:
+        """Produce a :func:`_expression.nulls_last` clause against the
+        parent object.
+
+        .. versionchanged:: 1.4 The ``nulls_last()`` operator is
+           renamed from ``nullslast()`` in previous releases.
+           The previous name remains available for backwards compatibility.
+        """
+        return self.operate(nulls_last_op)
+
+    # deprecated 1.4; see #5429
+    if TYPE_CHECKING:
+
+        def nullslast(self) -> OrderingOperators: ...
+
+    else:
+        nullslast = nulls_last
+
+
+class ColumnOperators(OrderingOperators):
     """Defines boolean, comparison, and other operators for
     :class:`_expression.ColumnElement` expressions.
 
@@ -659,7 +823,7 @@ class ColumnOperators(Operators):
         return self.operate(getitem, index)
 
     def __lshift__(self, other: Any) -> ColumnOperators:
-        """implement the << operator.
+        """Implement the ``<<`` operator.
 
         Not used by SQLAlchemy core, this is provided
         for custom operator systems which want to use
@@ -667,14 +831,50 @@ class ColumnOperators(Operators):
         """
         return self.operate(lshift, other)
 
+    def __rlshift__(self, other: Any) -> ColumnOperators:
+        """Implement the ``<<`` operator in reverse.
+
+        Not used by SQLAlchemy core, this is provided
+        for custom operator systems which want to use
+        << as an extension point.
+        """
+        return self.reverse_operate(lshift, other)
+
     def __rshift__(self, other: Any) -> ColumnOperators:
-        """implement the >> operator.
+        """Implement the ``>>`` operator.
 
         Not used by SQLAlchemy core, this is provided
         for custom operator systems which want to use
         >> as an extension point.
         """
         return self.operate(rshift, other)
+
+    def __rrshift__(self, other: Any) -> ColumnOperators:
+        """Implement the ``>>`` operator in reverse.
+
+        Not used by SQLAlchemy core, this is provided
+        for custom operator systems which want to use
+        >> as an extension point.
+        """
+        return self.reverse_operate(rshift, other)
+
+    def __matmul__(self, other: Any) -> ColumnOperators:
+        """Implement the ``@`` operator.
+
+        Not used by SQLAlchemy core, this is provided
+        for custom operator systems which want to use
+        @ as an extension point.
+        """
+        return self.operate(matmul, other)
+
+    def __rmatmul__(self, other: Any) -> ColumnOperators:
+        """Implement the ``@`` operator in reverse.
+
+        Not used by SQLAlchemy core, this is provided
+        for custom operator systems which want to use
+        @ as an extension point.
+        """
+        return self.reverse_operate(matmul, other)
 
     def concat(self, other: Any) -> ColumnOperators:
         """Implement the 'concat' operator.
@@ -908,8 +1108,6 @@ class ColumnOperators(Operators):
 
             WHERE COL IN (?, ?, ?)
 
-          .. versionadded:: 1.2 added "expanding" bound parameters
-
           If an empty list is passed, a special "empty list" expression,
           which is specific to the database in use, is rendered.  On
           SQLite this would be:
@@ -917,9 +1115,6 @@ class ColumnOperators(Operators):
           .. sourcecode:: sql
 
             WHERE COL IN (SELECT 1 FROM (SELECT 1) WHERE 1!=1)
-
-          .. versionadded:: 1.3 "expanding" bound parameters now support
-             empty lists
 
         * a :func:`_expression.select` construct, which is usually a
           correlated scalar select::
@@ -957,11 +1152,6 @@ class ColumnOperators(Operators):
         .. versionchanged:: 1.4 The ``not_in()`` operator is renamed from
            ``notin_()`` in previous releases.  The previous name remains
            available for backwards compatibility.
-
-        .. versionchanged:: 1.2  The :meth:`.ColumnOperators.in_` and
-           :meth:`.ColumnOperators.not_in` operators
-           now produce a "static" expression for an empty IN sequence
-           by default.
 
         .. seealso::
 
@@ -1736,62 +1926,28 @@ class ColumnOperators(Operators):
             flags=flags,
         )
 
-    def desc(self) -> ColumnOperators:
-        """Produce a :func:`_expression.desc` clause against the
-        parent object."""
-        return self.operate(desc_op)
-
-    def asc(self) -> ColumnOperators:
-        """Produce a :func:`_expression.asc` clause against the
-        parent object."""
-        return self.operate(asc_op)
-
-    def nulls_first(self) -> ColumnOperators:
-        """Produce a :func:`_expression.nulls_first` clause against the
-        parent object.
-
-        .. versionchanged:: 1.4 The ``nulls_first()`` operator is
-           renamed from ``nullsfirst()`` in previous releases.
-           The previous name remains available for backwards compatibility.
-        """
-        return self.operate(nulls_first_op)
-
-    # deprecated 1.4; see #5435
-    if TYPE_CHECKING:
-
-        def nullsfirst(self) -> ColumnOperators: ...
-
-    else:
-        nullsfirst = nulls_first
-
-    def nulls_last(self) -> ColumnOperators:
-        """Produce a :func:`_expression.nulls_last` clause against the
-        parent object.
-
-        .. versionchanged:: 1.4 The ``nulls_last()`` operator is
-           renamed from ``nullslast()`` in previous releases.
-           The previous name remains available for backwards compatibility.
-        """
-        return self.operate(nulls_last_op)
-
-    # deprecated 1.4; see #5429
-    if TYPE_CHECKING:
-
-        def nullslast(self) -> ColumnOperators: ...
-
-    else:
-        nullslast = nulls_last
-
-    def collate(self, collation: str) -> ColumnOperators:
+    def collate(
+        self, collation: str, collation_schema: Optional[str] = None
+    ) -> ColumnOperators:
         """Produce a :func:`_expression.collate` clause against
         the parent object, given the collation string.
+
+        :param collation: the name of the collation.
+
+        :param collation_schema: optional, the name of the schema in which
+          the collation is defined, for use with database backends that
+          support schema-qualified collations, currently PostgreSQL.
+
+          .. versionadded:: 2.1
 
         .. seealso::
 
             :func:`_expression.collate`
 
         """
-        return self.operate(collate, collation)
+        return self.operate(
+            collate, collation, collation_schema=collation_schema
+        )
 
     def __radd__(self, other: Any) -> ColumnOperators:
         """Implement the ``+`` operator in reverse.
@@ -1948,6 +2104,29 @@ class ColumnOperators(Operators):
         """
         return self.reverse_operate(floordiv, other)
 
+    def __pow__(self, other: Any) -> ColumnOperators:
+        """Implement the ``**`` operator.
+
+        In a column context, produces the clause ``pow(a, b)``, or a similar
+        dialect-specific expression.
+
+        .. versionadded:: 2.1
+
+        """
+        return self.operate(pow_, other)
+
+    def __rpow__(self, other: Any) -> ColumnOperators:
+        """Implement the ``**`` operator in reverse.
+
+        .. seealso::
+
+            :meth:`.ColumnOperators.__pow__`.
+
+        .. versionadded:: 2.1
+
+        """
+        return self.reverse_operate(pow_, other)
+
 
 _commutative: Set[Any] = {eq, ne, add, mul}
 _comparison: Set[Any] = {eq, ne, lt, gt, ge, le}
@@ -2063,8 +2242,8 @@ else:
 
 
 @_operator_fn
-def collate(a: Any, b: Any) -> Any:
-    return a.collate(b)
+def collate(a: Any, b: Any, collation_schema: Optional[str] = None) -> Any:
+    return a.collate(b, collation_schema=collation_schema)
 
 
 @_operator_fn
@@ -2472,6 +2651,18 @@ def bitwise_rshift_op(a: Any, b: Any) -> Any:
     return a.bitwise_rshift(b)
 
 
+@_operator_fn
+def null_op(a: Any, b: Any) -> Any:
+    """a 'null' operator that provides a boolean operation.
+
+    Does not compile in a SQL context, used for testing operators only.
+
+    .. versionadded:: 2.1
+
+    """
+    return a._null_operate(b)
+
+
 def is_comparison(op: OperatorType) -> bool:
     return op in _comparison or isinstance(op, custom_op) and op.is_comparison
 
@@ -2551,6 +2742,7 @@ _PRECEDENCE: Dict[OperatorType, int] = {
     getitem: 15,
     json_getitem_op: 15,
     json_path_getitem_op: 15,
+    pow_: 15,
     mul: 8,
     truediv: 8,
     floordiv: 8,
@@ -2564,6 +2756,7 @@ _PRECEDENCE: Dict[OperatorType, int] = {
     bitwise_and_op: 7,
     bitwise_lshift_op: 7,
     bitwise_rshift_op: 7,
+    null_op: 7,
     filter_op: 6,
     concat_op: 5,
     match_op: 5,
@@ -2603,6 +2796,99 @@ _PRECEDENCE: Dict[OperatorType, int] = {
     exists: 0,
     _asbool: -10,
 }
+
+
+# Mapping of OperatorType objects to their corresponding OperatorClass
+# Derived from unified_operator_lookup in default_comparator.py
+_OPERATOR_CLASSES: util.immutabledict[OperatorType, OperatorClass] = (
+    util.immutabledict(
+        {
+            # BASE operators
+            null_op: OperatorClass.BASE,
+            # COMPARISON operators
+            lt: OperatorClass.COMPARISON,
+            le: OperatorClass.COMPARISON,
+            ne: OperatorClass.COMPARISON,
+            gt: OperatorClass.COMPARISON,
+            ge: OperatorClass.COMPARISON,
+            eq: OperatorClass.COMPARISON,
+            is_distinct_from: OperatorClass.COMPARISON,
+            is_not_distinct_from: OperatorClass.COMPARISON,
+            in_op: OperatorClass.COMPARISON,
+            not_in_op: OperatorClass.COMPARISON,
+            is_: OperatorClass.COMPARISON,
+            is_not: OperatorClass.COMPARISON,
+            between_op: OperatorClass.COMPARISON,
+            not_between_op: OperatorClass.COMPARISON,
+            desc_op: OperatorClass.COMPARISON,
+            asc_op: OperatorClass.COMPARISON,
+            nulls_first_op: OperatorClass.COMPARISON,
+            nulls_last_op: OperatorClass.COMPARISON,
+            distinct_op: OperatorClass.COMPARISON,
+            any_op: OperatorClass.COMPARISON,
+            all_op: OperatorClass.COMPARISON,
+            # BOOLEAN_ALGEBRA operators
+            and_: OperatorClass.BOOLEAN_ALGEBRA,
+            or_: OperatorClass.BOOLEAN_ALGEBRA,
+            inv: OperatorClass.BOOLEAN_ALGEBRA | OperatorClass.BITWISE,
+            # CONCATENABLE | MATH | DATE_ARITHMETIC | BITWISE operators
+            add: OperatorClass.CONCATENABLE
+            | OperatorClass.MATH
+            | OperatorClass.DATE_ARITHEMETIC
+            | OperatorClass.BITWISE,
+            # CONCATENABLE | BITWISE operators
+            concat_op: OperatorClass.CONCATENABLE | OperatorClass.BITWISE,
+            # INDEXABLE operators
+            getitem: OperatorClass.INDEXABLE,
+            # CONTAINS operators
+            contains_op: OperatorClass.CONTAINS,
+            icontains_op: OperatorClass.CONTAINS,
+            contains: OperatorClass.CONTAINS,
+            not_contains_op: OperatorClass.CONTAINS,
+            not_icontains_op: OperatorClass.CONTAINS,
+            # STRING_MATCH operators
+            like_op: OperatorClass.STRING_MATCH,
+            ilike_op: OperatorClass.STRING_MATCH,
+            not_like_op: OperatorClass.STRING_MATCH,
+            not_ilike_op: OperatorClass.STRING_MATCH,
+            startswith_op: OperatorClass.STRING_MATCH,
+            istartswith_op: OperatorClass.STRING_MATCH,
+            endswith_op: OperatorClass.STRING_MATCH,
+            iendswith_op: OperatorClass.STRING_MATCH,
+            not_startswith_op: OperatorClass.STRING_MATCH,
+            not_istartswith_op: OperatorClass.STRING_MATCH,
+            not_endswith_op: OperatorClass.STRING_MATCH,
+            not_iendswith_op: OperatorClass.STRING_MATCH,
+            collate: OperatorClass.STRING_MATCH,
+            match_op: OperatorClass.STRING_MATCH,
+            not_match_op: OperatorClass.STRING_MATCH,
+            regexp_match_op: OperatorClass.STRING_MATCH,
+            not_regexp_match_op: OperatorClass.STRING_MATCH,
+            regexp_replace_op: OperatorClass.STRING_MATCH,
+            # BITWISE operators
+            lshift: OperatorClass.BITWISE,
+            rshift: OperatorClass.BITWISE,
+            bitwise_xor_op: OperatorClass.BITWISE,
+            bitwise_or_op: OperatorClass.BITWISE,
+            bitwise_and_op: OperatorClass.BITWISE,
+            bitwise_not_op: OperatorClass.BITWISE,
+            bitwise_lshift_op: OperatorClass.BITWISE,
+            bitwise_rshift_op: OperatorClass.BITWISE,
+            # MATH operators
+            matmul: OperatorClass.MATH,
+            pow_: OperatorClass.MATH,
+            neg: OperatorClass.MATH,
+            mul: OperatorClass.MATH,
+            sub: OperatorClass.MATH | OperatorClass.DATE_ARITHEMETIC,
+            truediv: OperatorClass.MATH,
+            floordiv: OperatorClass.MATH,
+            mod: OperatorClass.MATH,
+            # JSON_GETITEM operators
+            json_path_getitem_op: OperatorClass.JSON_GETITEM,
+            json_getitem_op: OperatorClass.JSON_GETITEM,
+        }
+    )
+)
 
 
 def is_precedent(

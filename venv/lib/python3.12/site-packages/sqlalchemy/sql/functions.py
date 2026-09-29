@@ -22,6 +22,7 @@ from typing import Sequence
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
+from typing import TypeAlias
 from typing import TypeVar
 from typing import Union
 
@@ -36,10 +37,13 @@ from . import util as sqlutil
 from ._typing import is_table_value_type
 from .base import _entity_namespace
 from .base import ColumnCollection
-from .base import Executable
+from .base import ExecutableStatement
 from .base import Generative
 from .base import HasMemoized
+from .base import ReadOnlyColumnCollection
+from .base import WriteableColumnCollection
 from .elements import _type_from_args
+from .elements import AggregateOrderBy
 from .elements import BinaryExpression
 from .elements import BindParameter
 from .elements import Cast
@@ -59,7 +63,6 @@ from .sqltypes import TableValueType
 from .type_api import TypeEngine
 from .visitors import InternalTraversal
 from .. import util
-from ..util.typing import TypeAlias
 
 if TYPE_CHECKING:
     from ._typing import _ByArgument
@@ -69,7 +72,9 @@ if TYPE_CHECKING:
     from ._typing import _StarOrOne
     from ._typing import _TypeEngineArgument
     from .base import _EntityNamespace
+    from .elements import _FrameIntTuple
     from .elements import ClauseElement
+    from .elements import FrameClause
     from .elements import KeyedColumnElement
     from .elements import TableValuedColumn
     from .operators import OperatorType
@@ -111,7 +116,9 @@ def register_function(
     reg[identifier] = fn
 
 
-class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
+class FunctionElement(
+    ColumnElement[_T], ExecutableStatement, FromClause, Generative
+):
     """Base for SQL function-oriented constructs.
 
     This is a `generic type <https://peps.python.org/pep-0484/#generics>`_,
@@ -137,9 +144,11 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
         ("clause_expr", InternalTraversal.dp_clauseelement),
         ("_with_ordinality", InternalTraversal.dp_boolean),
         ("_table_value_type", InternalTraversal.dp_has_cache_key),
-    ] + Executable._executable_traverse_internals
+    ] + ExecutableStatement._executable_traverse_internals
 
     packagenames: Tuple[str, ...] = ()
+
+    monotonic: bool = False
 
     _has_args = False
     _with_ordinality = False
@@ -385,7 +394,9 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
         return self.alias(name=name, joins_implicitly=joins_implicitly).column
 
     @util.ro_non_memoized_property
-    def columns(self) -> ColumnCollection[str, KeyedColumnElement[Any]]:  # type: ignore[override]  # noqa: E501
+    def columns(
+        self,
+    ) -> ReadOnlyColumnCollection[str, KeyedColumnElement[Any]]:
         r"""The set of columns exported by this :class:`.FunctionElement`.
 
         This is a placeholder collection that allows the function to be
@@ -411,12 +422,12 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
         return self.c
 
     @util.ro_memoized_property
-    def c(self) -> ColumnCollection[str, KeyedColumnElement[Any]]:  # type: ignore[override]  # noqa: E501
+    def c(self) -> ReadOnlyColumnCollection[str, KeyedColumnElement[Any]]:
         """synonym for :attr:`.FunctionElement.columns`."""
 
-        return ColumnCollection(
+        return WriteableColumnCollection(
             columns=[(col.key, col) for col in self._all_selected_columns]
-        )
+        ).as_readonly()
 
     @property
     def _all_selected_columns(self) -> Sequence[KeyedColumnElement[Any]]:
@@ -447,11 +458,12 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
     def over(
         self,
         *,
-        partition_by: Optional[_ByArgument] = None,
-        order_by: Optional[_ByArgument] = None,
-        rows: Optional[Tuple[Optional[int], Optional[int]]] = None,
-        range_: Optional[Tuple[Optional[int], Optional[int]]] = None,
-        groups: Optional[Tuple[Optional[int], Optional[int]]] = None,
+        partition_by: _ByArgument | None = None,
+        order_by: _ByArgument | None = None,
+        rows: _FrameIntTuple | FrameClause | None = None,
+        range_: _FrameIntTuple | FrameClause | None = None,
+        groups: _FrameIntTuple | FrameClause | None = None,
+        exclude: str | None = None,
     ) -> Over[_T]:
         """Produce an OVER clause against this function.
 
@@ -484,7 +496,34 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
             rows=rows,
             range_=range_,
             groups=groups,
+            exclude=exclude,
         )
+
+    def aggregate_order_by(
+        self, *order_by: _ColumnExpressionArgument[Any]
+    ) -> AggregateOrderBy[_T]:
+        r"""Produce a :class:`.AggregateOrderBy` object against a function.
+
+        Used for aggregating functions such as :class:`_functions.array_agg`,
+        ``group_concat``, ``json_agg`` on backends that support ordering via an
+        embedded ORDER BY parameter, e.g. PostgreSQL, MySQL/MariaDB, SQLite.
+        When used on backends like Oracle and SQL Server, SQL compilation uses
+        that of :class:`.WithinGroup`.
+
+        See :func:`_expression.aggregate_order_by` for a full description.
+
+        .. versionadded:: 2.1 Generalized the PostgreSQL-specific
+          :func:`_postgresql.aggregate_order_by` function to a method on
+          :class:`.Function` that is backend agnostic.
+
+        .. seealso::
+
+            :class:`_functions.aggregate_strings` - backend-agnostic string
+            concatenation function which also supports ORDER BY
+
+        """
+
+        return AggregateOrderBy(self, *order_by)
 
     def within_group(
         self, *order_by: _ColumnExpressionArgument[Any]
@@ -493,7 +532,11 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
 
         Used against so-called "ordered set aggregate" and "hypothetical
         set aggregate" functions, including :class:`.percentile_cont`,
-        :class:`.rank`, :class:`.dense_rank`, etc.
+        :class:`.rank`, :class:`.dense_rank`, etc.  This feature is typically
+        used by PostgreSQL, Oracle Database, and Microsoft SQL Server.
+
+        For simple ORDER BY expressions within aggregate functions on
+        PostgreSQL, MySQL/MariaDB, SQLite, see :func:`_sql.aggregate_order_by`.
 
         See :func:`_expression.within_group` for a full description.
 
@@ -616,8 +659,6 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
         :param right_index: the integer 1-based index of the function argument
          that serves as the "right" side of the expression.
 
-        .. versionadded:: 1.3
-
         .. seealso::
 
             :ref:`relationship_custom_operator_sql_function` -
@@ -724,7 +765,7 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
             joins_implicitly=joins_implicitly,
         )
 
-    def select(self) -> Select[Tuple[_T]]:
+    def select(self) -> Select[_T]:
         """Produce a :func:`_expression.select` construct
         against this :class:`.FunctionElement`.
 
@@ -733,7 +774,7 @@ class FunctionElement(Executable, ColumnElement[_T], FromClause, Generative):
             s = select(function_element)
 
         """
-        s: Select[Any] = Select(self)
+        s: Select[_T] = Select(self)
         if self._execution_options:
             s = s.execution_options(**self._execution_options)
         return s
@@ -855,7 +896,7 @@ class ScalarFunctionColumn(NamedColumn[_T]):
 
         # if type is None, we get NULLTYPE, which is our _T.  But I don't
         # know how to get the overloads to express that correctly
-        self.type = type_api.to_instance(type_)  # type: ignore
+        self.type = type_api.to_instance(type_)  # type: ignore[assignment]
 
 
 class _FunctionGenerator:
@@ -956,7 +997,7 @@ class _FunctionGenerator:
         # passthru __ attributes; fixes pydoc
         if name.startswith("__"):
             try:
-                return self.__dict__[name]  # type: ignore
+                return self.__dict__[name]  # type: ignore[no-any-return]
             except KeyError:
                 raise AttributeError(name)
 
@@ -1006,7 +1047,15 @@ class _FunctionGenerator:
         def aggregate_strings(self) -> Type[_aggregate_strings_func]: ...
 
         @property
+        def all(self) -> Type[_all__func[Any]]:  # noqa: A001
+            ...
+
+        @property
         def ansifunction(self) -> Type[_AnsiFunction_func[Any]]: ...
+
+        @property
+        def any(self) -> Type[_any__func[Any]]:  # noqa: A001
+            ...
 
         # set ColumnElement[_T] as a separate overload, to appease
         # mypy which seems to not want to accept _T from
@@ -1218,6 +1267,42 @@ class _FunctionGenerator:
         @property
         def percentile_disc(self) -> Type[_percentile_disc_func[Any]]: ...
 
+        # set ColumnElement[_T] as a separate overload, to appease
+        # mypy which seems to not want to accept _T from
+        # _ColumnExpressionArgument. Seems somewhat related to the covariant
+        # _HasClauseElement as of mypy 1.15
+
+        @overload
+        def pow(  # noqa: A001
+            self,
+            col: ColumnElement[_T],
+            *args: _ColumnExpressionOrLiteralArgument[Any],
+            **kwargs: Any,
+        ) -> _pow_func[_T]: ...
+
+        @overload
+        def pow(  # noqa: A001
+            self,
+            col: _ColumnExpressionArgument[_T],
+            *args: _ColumnExpressionOrLiteralArgument[Any],
+            **kwargs: Any,
+        ) -> _pow_func[_T]: ...
+
+        @overload
+        def pow(  # noqa: A001
+            self,
+            col: _T,
+            *args: _ColumnExpressionOrLiteralArgument[Any],
+            **kwargs: Any,
+        ) -> _pow_func[_T]: ...
+
+        def pow(  # noqa: A001
+            self,
+            col: _ColumnExpressionOrLiteralArgument[_T],
+            *args: _ColumnExpressionOrLiteralArgument[Any],
+            **kwargs: Any,
+        ) -> _pow_func[_T]: ...
+
         @property
         def random(self) -> Type[_random_func]: ...
 
@@ -1229,6 +1314,9 @@ class _FunctionGenerator:
 
         @property
         def session_user(self) -> Type[_session_user_func]: ...
+
+        @property
+        def some(self) -> Type[_some_func[Any]]: ...
 
         # set ColumnElement[_T] as a separate overload, to appease
         # mypy which seems to not want to accept _T from
@@ -1350,6 +1438,7 @@ class Function(FunctionElement[_T]):
         *clauses: _ColumnExpressionOrLiteralArgument[_T],
         type_: None = ...,
         packagenames: Optional[Tuple[str, ...]] = ...,
+        monotonic: bool = ...,
     ) -> None: ...
 
     @overload
@@ -1359,6 +1448,7 @@ class Function(FunctionElement[_T]):
         *clauses: _ColumnExpressionOrLiteralArgument[Any],
         type_: _TypeEngineArgument[_T] = ...,
         packagenames: Optional[Tuple[str, ...]] = ...,
+        monotonic: bool = ...,
     ) -> None: ...
 
     def __init__(
@@ -1367,6 +1457,7 @@ class Function(FunctionElement[_T]):
         *clauses: _ColumnExpressionOrLiteralArgument[Any],
         type_: Optional[_TypeEngineArgument[_T]] = None,
         packagenames: Optional[Tuple[str, ...]] = None,
+        monotonic: bool = False,
     ) -> None:
         """Construct a :class:`.Function`.
 
@@ -1376,10 +1467,11 @@ class Function(FunctionElement[_T]):
         """
         self.packagenames = packagenames or ()
         self.name = name
+        self.monotonic = monotonic
 
         # if type is None, we get NULLTYPE, which is our _T.  But I don't
         # know how to get the overloads to express that correctly
-        self.type = type_api.to_instance(type_)  # type: ignore
+        self.type = type_api.to_instance(type_)  # type: ignore[assignment]
 
         FunctionElement.__init__(self, *clauses)
 
@@ -1506,12 +1598,6 @@ class GenericFunction(Function[_T]):
 
         connection.scalar(select(func.as_utc()))
 
-    .. versionadded:: 1.3.13  The :class:`.quoted_name` construct is now
-       recognized for quoting when used with the "name" attribute of the
-       object, so that quoting can be forced on or off for the function
-       name.
-
-
     """
 
     coerce_arguments = True
@@ -1570,13 +1656,13 @@ class GenericFunction(Function[_T]):
             )
         )
 
-        self.type = type_api.to_instance(  # type: ignore
+        self.type = type_api.to_instance(  # type: ignore[assignment]
             kwargs.pop("type_", None) or getattr(self, "type", None)
         )
 
 
-register_function("cast", Cast)  # type: ignore
-register_function("extract", Extract)  # type: ignore
+register_function("cast", Cast)  # type: ignore[arg-type]
+register_function("extract", Extract)  # type: ignore[arg-type]
 
 
 class next_value(GenericFunction[int]):
@@ -1601,7 +1687,7 @@ class next_value(GenericFunction[int]):
             seq, schema.Sequence
         ), "next_value() accepts a Sequence object as input."
         self.sequence = seq
-        self.type = sqltypes.to_instance(  # type: ignore
+        self.type = sqltypes.to_instance(  # type: ignore[assignment]
             seq.data_type or getattr(self, "type", None)
         )
 
@@ -1625,6 +1711,23 @@ class AnsiFunction(GenericFunction[_T]):
         self, *args: _ColumnExpressionArgument[Any], **kwargs: Any
     ) -> None:
         GenericFunction.__init__(self, *args, **kwargs)
+
+
+class CollectionAggregateFunction(GenericFunction[_T]):
+    """Define a function that acts as a collection aggregate modifier.
+
+    Collection aggregate functions such as ``ANY``, ``ALL``, and ``SOME``
+    modify the semantics of comparison operators, so negation of comparisons
+    involving these functions must use ``NOT`` rather than flipping the
+    comparison operator.
+
+    .. versionadded:: 2.1
+
+    """
+
+    _is_collection_aggregate = True
+    _register = False
+    inherit_cache = True
 
 
 class ReturnTypeFromArgs(GenericFunction[_T]):
@@ -1712,7 +1815,7 @@ class ReturnTypeFromOptionalArgs(ReturnTypeFromArgs[_T]):
         *args: _ColumnExpressionOrLiteralArgument[Optional[_T]],
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)  # type: ignore
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
 
 
 class coalesce(ReturnTypeFromOptionalArgs[_T]):
@@ -1747,6 +1850,23 @@ class now(GenericFunction[datetime.datetime]):
     """
 
     type = sqltypes.DateTime()
+    inherit_cache = True
+
+
+class pow(ReturnTypeFromArgs[_T]):  # noqa: A001
+    """The SQL POW() function which performs the power operator.
+
+    E.g.:
+
+    .. sourcecode:: pycon+sql
+
+        >>> print(select(func.pow(2, 8)))
+        {printsql}SELECT pow(:pow_2, :pow_3) AS pow_1
+
+    .. versionadded:: 2.1
+
+    """
+
     inherit_cache = True
 
 
@@ -1940,6 +2060,50 @@ class array_agg(ReturnTypeFromArgs[Sequence[_T]]):
         super().__init__(*fn_args, **kwargs)
 
 
+class any_(CollectionAggregateFunction[_T]):
+    """The SQL ANY() collection aggregate function.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :func:`_expression.any_` - standalone ANY expression
+
+    """
+
+    name = "any"
+    identifier = "any"
+    inherit_cache = True
+
+
+class all_(CollectionAggregateFunction[_T]):
+    """The SQL ALL() collection aggregate function.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :func:`_expression.all_` - standalone ALL expression
+
+    """
+
+    name = "all"
+    identifier = "all"
+    inherit_cache = True
+
+
+class some(CollectionAggregateFunction[_T]):
+    """The SQL SOME() collection aggregate function.
+
+    SOME is a synonym for ANY in the SQL standard.
+
+    .. versionadded:: 2.1
+
+    """
+
+    inherit_cache = True
+
+
 class OrderedSetAgg(GenericFunction[_T]):
     """Define a function where the return type is based on the sort
     expression type as defined by the expression passed to the
@@ -2072,8 +2236,6 @@ class cube(GenericFunction[_T]):
             func.sum(table.c.value), table.c.col_1, table.c.col_2
         ).group_by(func.cube(table.c.col_1, table.c.col_2))
 
-    .. versionadded:: 1.2
-
     """
 
     _has_args = True
@@ -2089,8 +2251,6 @@ class rollup(GenericFunction[_T]):
         stmt = select(
             func.sum(table.c.value), table.c.col_1, table.c.col_2
         ).group_by(func.rollup(table.c.col_1, table.c.col_2))
-
-    .. versionadded:: 1.2
 
     """
 
@@ -2121,8 +2281,6 @@ class grouping_sets(GenericFunction[_T]):
             )
         )
 
-    .. versionadded:: 1.2
-
     """  # noqa: E501
 
     _has_args = True
@@ -2142,18 +2300,37 @@ class aggregate_strings(GenericFunction[str]):
 
         stmt = select(func.aggregate_strings(table.c.str_col, "."))
 
-    The return type of this function is :class:`.String`.
+    .. versionadded:: 2.0.21
 
-    .. versionadded: 2.0.21
+    To add ordering to the expression, use the
+    :meth:`_functions.FunctionElement.aggregate_order_by` modifier method,
+    which will emit ORDER BY within the appropriate part of the column
+    expression (varies by backend)::
 
-    """
+        stmt = select(
+            func.aggregate_strings(table.c.str_col, ".").aggregate_order_by(
+                table.c.str_col
+            )
+        )
+
+    .. versionadded:: 2.1 added :meth:`_functions.FunctionElement.aggregate_order_by`
+       for all aggregate functions.
+
+    :param clause: the SQL expression to be concatenated
+
+    :param separator: separator string
+
+
+    """  # noqa: E501
 
     type = sqltypes.String()
     _has_args = True
     inherit_cache = True
 
     def __init__(
-        self, clause: _ColumnExpressionArgument[Any], separator: str
+        self,
+        clause: _ColumnExpressionArgument[Any],
+        separator: str,
     ) -> None:
         super().__init__(clause, separator)
 
@@ -2162,7 +2339,9 @@ class aggregate_strings(GenericFunction[str]):
 # name. See https://github.com/sqlalchemy/sqlalchemy/issues/13167
 # START GENERATED FUNCTION ALIASES
 _aggregate_strings_func: TypeAlias = aggregate_strings
+_all__func: TypeAlias = all_[_T]
 _AnsiFunction_func: TypeAlias = AnsiFunction[_T]
+_any__func: TypeAlias = any_[_T]
 _array_agg_func: TypeAlias = array_agg[_T]
 _Cast_func: TypeAlias = Cast[_T]
 _char_length_func: TypeAlias = char_length
@@ -2189,10 +2368,12 @@ _OrderedSetAgg_func: TypeAlias = OrderedSetAgg[_T]
 _percent_rank_func: TypeAlias = percent_rank
 _percentile_cont_func: TypeAlias = percentile_cont[_T]
 _percentile_disc_func: TypeAlias = percentile_disc[_T]
+_pow_func: TypeAlias = pow[_T]
 _random_func: TypeAlias = random
 _rank_func: TypeAlias = rank
 _rollup_func: TypeAlias = rollup[_T]
 _session_user_func: TypeAlias = session_user
+_some_func: TypeAlias = some[_T]
 _sum_func: TypeAlias = sum[_T]
 _sysdate_func: TypeAlias = sysdate
 _user_func: TypeAlias = user

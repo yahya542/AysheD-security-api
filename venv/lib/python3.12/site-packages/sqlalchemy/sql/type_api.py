@@ -14,31 +14,34 @@ import typing
 from typing import Any
 from typing import Callable
 from typing import cast
+from typing import ClassVar
 from typing import Dict
 from typing import Generic
 from typing import Mapping
-from typing import NewType
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Sequence
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
+from typing import TypedDict
+from typing import TypeGuard
 from typing import TypeVar
 from typing import Union
 
+from sqlalchemy.util.typing import _MatchedOnType
 from .base import SchemaEventTarget
 from .cache_key import CacheConst
 from .cache_key import NO_CACHE
+from .operators import _OPERATOR_CLASSES
 from .operators import ColumnOperators
+from .operators import custom_op
+from .operators import OperatorClass
 from .visitors import Visitable
 from .. import exc
 from .. import util
-from ..util.typing import Protocol
 from ..util.typing import Self
-from ..util.typing import TypeAliasType
-from ..util.typing import TypedDict
-from ..util.typing import TypeGuard
 
 # these are back-assigned by sqltypes.
 if typing.TYPE_CHECKING:
@@ -57,7 +60,6 @@ if typing.TYPE_CHECKING:
     from .sqltypes import TABLEVALUE as TABLEVALUE  # noqa: F401
     from ..engine.interfaces import DBAPIModule
     from ..engine.interfaces import Dialect
-    from ..util.typing import GenericProtocol
 
 _T = TypeVar("_T", bound=Any)
 _T_co = TypeVar("_T_co", bound=Any, covariant=True)
@@ -66,10 +68,6 @@ _O = TypeVar("_O", bound=object)
 _TE = TypeVar("_TE", bound="TypeEngine[Any]")
 _CT = TypeVar("_CT", bound=Any)
 _RT = TypeVar("_RT", bound=Any)
-
-_MatchedOnType = Union[
-    "GenericProtocol[Any]", TypeAliasType, NewType, Type[Any]
-]
 
 
 class _NoValueInList(Enum):
@@ -160,6 +158,17 @@ class TypeEngine(Visitable, Generic[_T]):
 
     """
 
+    operator_classes: ClassVar[OperatorClass] = OperatorClass.UNSPECIFIED
+    """Indicate categories of operators that should be available on this type.
+
+    .. versionadded:: 2.1
+
+    .. seealso::
+
+        :class:`.OperatorClass`
+
+    """
+
     class Comparator(
         ColumnOperators,
         Generic[_CT],
@@ -185,6 +194,56 @@ class TypeEngine(Visitable, Generic[_T]):
         def __reduce__(self) -> Any:
             return self.__class__, (self.expr,)
 
+        @util.preload_module("sqlalchemy.sql.default_comparator")
+        def _resolve_operator_lookup(self, op: OperatorType) -> Tuple[
+            Callable[..., "ColumnElement[Any]"],
+            util.immutabledict[
+                str, Union["OperatorType", Callable[..., "ColumnElement[Any]"]]
+            ],
+        ]:
+            default_comparator = util.preloaded.sql_default_comparator
+
+            op_fn, addtl_kw = default_comparator.operator_lookup[op.__name__]
+
+            if op_fn is default_comparator._custom_op_operate:
+                if TYPE_CHECKING:
+                    assert isinstance(op, custom_op)
+                operator_class = op.operator_class
+            else:
+                try:
+                    operator_class = _OPERATOR_CLASSES[op]
+                except KeyError:
+                    operator_class = OperatorClass.UNSPECIFIED
+
+            if not operator_class & self.type.operator_classes:
+
+                if self.type.operator_classes is OperatorClass.UNSPECIFIED:
+                    util.warn_deprecated(
+                        f"Type object {self.type.__class__} does not refer "
+                        "to an OperatorClass in its operator_classes "
+                        "attribute. This attribute will be required in a "
+                        "future release.",
+                        "2.1",
+                    )
+                else:
+                    if isinstance(op, custom_op):
+                        op_description = f"custom operator {op.opstring!r}"
+                    else:
+                        op_description = f"operator {op.__name__!r}"
+
+                    util.warn_deprecated(
+                        f"Type object {self.type.__class__!r} does not "
+                        "include "
+                        f"{op_description} in its operator classes.  "
+                        "Using built-in operators (not including custom or "
+                        "overridden operators) outside of "
+                        "a type's stated operator classes is deprecated and "
+                        "will raise InvalidRequestError in a future release",
+                        "2.1",
+                    )
+
+            return op_fn, addtl_kw
+
         @overload
         def operate(
             self,
@@ -199,22 +258,19 @@ class TypeEngine(Visitable, Generic[_T]):
             self, op: OperatorType, *other: Any, **kwargs: Any
         ) -> ColumnElement[_CT]: ...
 
-        @util.preload_module("sqlalchemy.sql.default_comparator")
         def operate(
             self, op: OperatorType, *other: Any, **kwargs: Any
         ) -> ColumnElement[Any]:
-            default_comparator = util.preloaded.sql_default_comparator
-            op_fn, addtl_kw = default_comparator.operator_lookup[op.__name__]
+            op_fn, addtl_kw = self._resolve_operator_lookup(op)
             if kwargs:
                 addtl_kw = addtl_kw.union(kwargs)
             return op_fn(self.expr, op, *other, **addtl_kw)
 
-        @util.preload_module("sqlalchemy.sql.default_comparator")
         def reverse_operate(
             self, op: OperatorType, other: Any, **kwargs: Any
         ) -> ColumnElement[_CT]:
-            default_comparator = util.preloaded.sql_default_comparator
-            op_fn, addtl_kw = default_comparator.operator_lookup[op.__name__]
+            op_fn, addtl_kw = self._resolve_operator_lookup(op)
+
             if kwargs:
                 addtl_kw = addtl_kw.union(kwargs)
             return op_fn(self.expr, op, other, reverse=True, **addtl_kw)
@@ -288,8 +344,6 @@ class TypeEngine(Visitable, Generic[_T]):
 
     The default value of ``None`` indicates that the values stored by
     this type are self-sorting.
-
-    .. versionadded:: 1.3.8
 
     """
 
@@ -632,21 +686,22 @@ class TypeEngine(Visitable, Generic[_T]):
     @property
     def python_type(self) -> Type[Any]:
         """Return the Python type object expected to be returned
-        by instances of this type, if known.
+        by instances of this type.
 
         Basically, for those types which enforce a return type,
         or are known across the board to do such for all common
         DBAPIs (like ``int`` for example), will return that type.
 
-        If a return type is not defined, raises
-        ``NotImplementedError``.
+        By default the generic ``object`` type is returned.
 
         Note that any type also accommodates NULL in SQL which
         means you can also get back ``None`` from any type
         in practice.
 
+        .. versionchanged:: 2.1 - The default implementation now returns
+          ``object`` instead of raising ``NotImplementedError``.
         """
-        raise NotImplementedError()
+        return object
 
     def with_variant(
         self,
@@ -781,7 +836,9 @@ class TypeEngine(Visitable, Generic[_T]):
 
         return self
 
-    def _with_collation(self, collation: str) -> Self:
+    def _with_collation(
+        self, collation: str, collation_schema: Optional[str] = None
+    ) -> Self:
         """set up error handling for the collate expression"""
         raise NotImplementedError("this datatype does not support collation")
 
@@ -1098,13 +1155,24 @@ class TypeEngine(Visitable, Generic[_T]):
         # dmypy / mypy seems to sporadically keep thinking this line is
         # returning Any, which seems to be caused by the @deprecated_params
         # decorator on the DefaultDialect constructor
-        return default.StrCompileDialect()  # type: ignore
+        return default.StrCompileDialect()  # type: ignore[no-any-return]
 
     def __str__(self) -> str:
         return str(self.compile())
 
+    def repr_struct(self) -> util.GenericRepr:
+        """Return a :class:`.GenericRepr` object representing this type.
+
+        This method is used to generate the repr string for the type.
+        Subclasses can override this to customize the repr structure.
+
+        .. versionadded:: 2.1
+
+        """
+        return util.GenericRepr(self)
+
     def __repr__(self) -> str:
-        return util.generic_repr(self)
+        return str(self.repr_struct())
 
 
 class TypeEngineMixin:
@@ -1382,6 +1450,8 @@ class UserDefinedType(
 
     ensure_kwarg = "get_col_spec"
 
+    operator_classes = OperatorClass.ANY
+
     def coerce_compared_value(
         self, op: Optional[OperatorType], value: Any
     ) -> TypeEngine[Any]:
@@ -1415,8 +1485,6 @@ class Emulated(TypeEngineMixin):
 
     Current examples of :class:`.Emulated` are:  :class:`.Interval`,
     :class:`.Enum`, :class:`.Boolean`.
-
-    .. versionadded:: 1.2.0b3
 
     """
 
@@ -1475,11 +1543,7 @@ def _is_native_for_emulated(
 
 
 class NativeForEmulated(TypeEngineMixin):
-    """Indicates DB-native types supported by an :class:`.Emulated` type.
-
-    .. versionadded:: 1.2.0b3
-
-    """
+    """Indicates DB-native types supported by an :class:`.Emulated` type."""
 
     @classmethod
     def adapt_native_to_emulated(
@@ -1512,7 +1576,7 @@ class NativeForEmulated(TypeEngineMixin):
         """
 
         # dmypy seems to crash on this
-        return cls(**kw)  # type: ignore
+        return cls(**kw)  # type: ignore[return-value]
 
     # dmypy seems to crash with this, on repeated runs with changes
     # if TYPE_CHECKING:
@@ -1679,7 +1743,7 @@ class TypeDecorator(SchemaEventTarget, ExternalType, TypeEngine[_T]):
     # impl_instance.
     @util.memoized_property
     def impl_instance(self) -> TypeEngine[Any]:
-        return self.impl  # type: ignore
+        return self.impl  # type: ignore[return-value]
 
     def __init__(self, *args: Any, **kwargs: Any):
         """Construct a :class:`.TypeDecorator`.
@@ -1726,6 +1790,12 @@ class TypeDecorator(SchemaEventTarget, ExternalType, TypeEngine[_T]):
 
     """
 
+    if not TYPE_CHECKING:
+
+        @property
+        def operator_classes(self) -> OperatorClass:
+            return self.impl_instance.operator_classes
+
     class Comparator(TypeEngine.Comparator[_CT]):
         """A :class:`.TypeEngine.Comparator` that is specific to
         :class:`.TypeDecorator`.
@@ -1770,15 +1840,15 @@ class TypeDecorator(SchemaEventTarget, ExternalType, TypeEngine[_T]):
 
         return type(
             "TDComparator",
-            (TypeDecorator.Comparator, impl.comparator_factory),  # type: ignore # noqa: E501
+            (TypeDecorator.Comparator, impl.comparator_factory),  # type: ignore[arg-type, return-value] # noqa: E501
             {"__reduce__": __reduce__},
         )
 
     @property
-    def comparator_factory(  # type: ignore  # mypy properties bug
+    def comparator_factory(  # type: ignore[override]  # mypy properties bug
         self,
     ) -> _ComparatorFactory[Any]:
-        if TypeDecorator.Comparator in self.impl.comparator_factory.__mro__:  # type: ignore # noqa: E501
+        if TypeDecorator.Comparator in self.impl.comparator_factory.__mro__:  # type: ignore[attr-defined] # noqa: E501
             return self.impl_instance.comparator_factory
         else:
             # reconcile the Comparator class on the impl with that
@@ -1815,10 +1885,12 @@ class TypeDecorator(SchemaEventTarget, ExternalType, TypeEngine[_T]):
         tt.impl = tt.impl_instance = typedesc
         return tt
 
-    def _with_collation(self, collation: str) -> Self:
+    def _with_collation(
+        self, collation: str, collation_schema: Optional[str] = None
+    ) -> Self:
         tt = self._copy_with_check()
         tt.impl = tt.impl_instance = self.impl_instance._with_collation(
-            collation
+            collation, collation_schema
         )
         return tt
 
@@ -2302,11 +2374,21 @@ class TypeDecorator(SchemaEventTarget, ExternalType, TypeEngine[_T]):
 
     # mypy property bug
     @property
-    def sort_key_function(self) -> Optional[Callable[[Any], Any]]:  # type: ignore # noqa: E501
+    def sort_key_function(self) -> Optional[Callable[[Any], Any]]:  # type: ignore[override] # noqa: E501
         return self.impl_instance.sort_key_function
 
-    def __repr__(self) -> str:
-        return util.generic_repr(self, to_inspect=self.impl_instance)
+    def repr_struct(self) -> util.GenericRepr:
+        """Return a :class:`.GenericRepr` object representing this type.
+
+        For TypeDecorator, this returns a repr structure based on the
+        impl instance but with the TypeDecorator's class name.
+
+        .. versionadded:: 2.1
+
+        """
+        return self.impl_instance.repr_struct().set_class_name(
+            self.__class__.__name__
+        )
 
 
 class Variant(TypeDecorator[_T]):

@@ -1,0 +1,16 @@
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+
+# Build and metadata directories
+*.egg-info/
+
+# Database files (SQLite)
+*.db
+ayshe_auth.db
+ayshed_auth.db
+
+# Configuration files containing credentials/secrets
+config.py

@@ -51,9 +51,14 @@ The :class:`_schema.Identity` object support many options to control the
 "autoincrementing" behavior of the column, like the starting value, the
 incrementing value, etc.  In addition to the standard options, Oracle Database
 supports setting :paramref:`_schema.Identity.always` to ``None`` to use the
-default generated mode, rendering GENERATED AS IDENTITY in the DDL. It also supports
-setting :paramref:`_schema.Identity.on_null` to ``True`` to specify ON NULL
-in conjunction with a 'BY DEFAULT' identity column.
+default generated mode, rendering GENERATED AS IDENTITY in the DDL.  Oracle
+Database also supports two custom options specified using dialect kwargs:
+
+* ``oracle_on_null``: when set to ``True`` renders ``ON NULL`` in conjunction
+  with a 'BY DEFAULT' identity column.
+* ``oracle_order``: when ``True``, renders the ORDER keyword, indicating the
+  identity is definitively ordered. May be necessary to provide deterministic
+  ordering using Oracle Real Application Clusters (RAC).
 
 Using a SEQUENCE (all Oracle Database versions)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -82,6 +87,13 @@ This step is also required when using table reflection, i.e. autoload_with=engin
       Column("id", Integer, Sequence("id_seq", start=1), primary_key=True),
       autoload_with=engine,
   )
+
+In addition to the standard options, Oracle Database supports the following
+custom option specified using dialect kwargs:
+
+* ``oracle_order``: when ``True``, renders the ORDER keyword, indicating the
+  sequence is definitively ordered. May be necessary to provide deterministic
+  ordering using Oracle RAC.
 
 .. versionchanged::  1.4   Added :class:`_schema.Identity` construct
    in a :class:`_schema.Column` to specify the option of an autoincrementing
@@ -133,17 +145,6 @@ Valid values for ``isolation_level`` include:
    database-related failure, the level is assumed to be "READ COMMITTED".  No
    warning is emitted for this initial first-connect condition as it is
    expected to be a common restriction on Oracle databases.
-
-.. versionadded:: 1.3.16 added support for AUTOCOMMIT to the cx_Oracle dialect
-   as well as the notion of a default isolation level
-
-.. versionadded:: 1.3.21 Added support for SERIALIZABLE as well as live
-   reading of the isolation level.
-
-.. versionchanged:: 1.3.22 In the event that the default isolation
-   level cannot be read due to permissions on the v$transaction view as
-   is common in Oracle installations, the default isolation level is hardcoded
-   to "READ COMMITTED" which was the behavior prior to 1.3.21.
 
 .. seealso::
 
@@ -284,8 +285,18 @@ case sensitive, or was not quoted, and should be name normalized::
     >>> result.keys()
     RMKeyView(['somename'])
 
-For this case, a new feature will be available in SQLAlchemy 2.1 to disable
-the name normalization behavior in specific cases.
+For this exact scenario, SQLAlchemy offers the :paramref:`.Connection.execution_options.driver_column_names`
+execution options, which turns off name normalize for result sets::
+
+    >>> result = oracle_connection.exec_driver_sql(
+    ...     'SELECT 1 AS "SOMENAME" FROM DUAL',
+    ...     execution_options={"driver_column_names": True},
+    ... )
+    >>> result.keys()
+    RMKeyView(['SOMENAME'])
+
+.. versionadded:: 2.1 Added the :paramref:`.Connection.execution_options.driver_column_names`
+   execution option
 
 
 .. _oracle_max_identifier_lengths:
@@ -531,9 +542,6 @@ Raw information regarding these constraints can be acquired using
 :meth:`_reflection.Inspector.get_check_constraints`, and
 :meth:`_reflection.Inspector.get_indexes`.
 
-.. versionchanged:: 1.2 The Oracle Database dialect can now reflect UNIQUE and
-   CHECK constraints.
-
 When using reflection at the :class:`_schema.Table` level, the
 :class:`_schema.Table`
 will also include these constraints.
@@ -631,6 +639,49 @@ E.g. to use this datatype in a :class:`.Table` definition::
             "fp_data", Float().with_variant(oracle.BINARY_FLOAT(), "oracle")
         ),
     )
+
+.. _oracle_boolean_support:
+
+Boolean Support
+---------------
+
+.. versionadded:: 2.1
+
+Oracle Database 23ai introduced native support for the ``BOOLEAN`` datatype.
+The Oracle dialect automatically detects the database version and uses the
+native ``BOOLEAN`` type when available, or falls back to emulation using
+``SMALLINT`` on older Oracle versions.
+
+The standard :class:`_types.Boolean` type can be used in table definitions::
+
+    from sqlalchemy import Boolean, Column, Integer, Table, MetaData
+
+    metadata = MetaData()
+
+    my_table = Table(
+        "my_table",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("flag", Boolean),
+    )
+
+On Oracle 23ai and later, this will generate DDL using the native ``BOOLEAN`` type:
+
+.. code-block:: sql
+
+    CREATE TABLE my_table (
+        id INTEGER NOT NULL,
+        flag BOOLEAN,
+        PRIMARY KEY (id)
+    )
+
+On earlier Oracle versions, it will use ``SMALLINT`` for storage with appropriate
+constraints and conversions.
+
+The :class:`_types.Boolean` type is also available as ``BOOLEAN`` from the Oracle
+dialect for consistency with other type names::
+
+    from sqlalchemy.dialects.oracle import BOOLEAN
 
 DateTime Compatibility
 ----------------------
@@ -949,13 +1000,20 @@ from dataclasses import fields
 from functools import lru_cache
 from functools import wraps
 import re
+from typing import Any
+from typing import Callable
+from typing import TYPE_CHECKING
 
 from . import dictionary
+from .json import JSON
+from .json import JSONIndexType
+from .json import JSONPathType
 from .types import _OracleBoolean
 from .types import _OracleDate
 from .types import BFILE
 from .types import BINARY_DOUBLE
 from .types import BINARY_FLOAT
+from .types import BOOLEAN
 from .types import DATE
 from .types import FLOAT
 from .types import INTERVAL
@@ -984,6 +1042,7 @@ from ...engine.reflection import ReflectionDefaults
 from ...sql import and_
 from ...sql import bindparam
 from ...sql import compiler
+from ...sql import elements
 from ...sql import expression
 from ...sql import func
 from ...sql import null
@@ -993,6 +1052,8 @@ from ...sql import selectable as sa_selectable
 from ...sql import sqltypes
 from ...sql import util as sql_util
 from ...sql import visitors
+from ...sql.base import NO_ARG
+from ...sql.compiler import AggregateOrderByStyle
 from ...sql.visitors import InternalTraversal
 from ...types import BLOB
 from ...types import CHAR
@@ -1003,6 +1064,9 @@ from ...types import NCHAR
 from ...types import NVARCHAR
 from ...types import REAL
 from ...types import VARCHAR
+
+if TYPE_CHECKING:
+    from ...sql.sqltypes import _JSON_VALUE
 
 RESERVED_WORDS = set(
     "SHARE RAW DROP BETWEEN FROM DESC OPTION PRIOR LONG THEN "
@@ -1026,6 +1090,9 @@ colspecs = {
     sqltypes.Interval: INTERVAL,
     sqltypes.DateTime: DATE,
     sqltypes.Date: _OracleDate,
+    sqltypes.JSON: JSON,
+    sqltypes.JSON.JSONIndexType: JSONIndexType,
+    sqltypes.JSON.JSONPathType: JSONPathType,
 }
 
 ischema_names = {
@@ -1051,7 +1118,9 @@ ischema_names = {
     "BINARY_DOUBLE": BINARY_DOUBLE,
     "BINARY_FLOAT": BINARY_FLOAT,
     "ROWID": ROWID,
+    "BOOLEAN": BOOLEAN,
     "VECTOR": VECTOR,
+    "JSON": JSON,
 }
 
 
@@ -1198,7 +1267,10 @@ class OracleTypeCompiler(compiler.GenericTypeCompiler):
         return self.visit_NUMBER(type_, precision=19, **kw)
 
     def visit_boolean(self, type_, **kw):
-        return self.visit_SMALLINT(type_, **kw)
+        if self.dialect.supports_native_boolean:
+            return self.visit_BOOLEAN(type_, **kw)
+        else:
+            return self.visit_SMALLINT(type_, **kw)
 
     def visit_RAW(self, type_, **kw):
         if type_.length:
@@ -1220,6 +1292,18 @@ class OracleTypeCompiler(compiler.GenericTypeCompiler):
             type_.storage_type.value if type_.storage_type is not None else "*"
         )
         return f"VECTOR({dim},{storage_format},{storage_type})"
+
+    def visit_JSON(self, type_: JSON, **kw: Any) -> str:
+        use_blob = (
+            not self.dialect._supports_oracle_json
+            if getattr(type_, "use_blob", NO_ARG) is NO_ARG
+            else type_.use_blob
+        )
+
+        if use_blob:
+            return "BLOB"
+        else:
+            return "JSON"
 
 
 class OracleCompiler(compiler.SQLCompiler):
@@ -1249,6 +1333,9 @@ class OracleCompiler(compiler.SQLCompiler):
     def visit_char_length_func(self, fn, **kw):
         return "LENGTH" + self.function_argspec(fn, **kw)
 
+    def visit_pow_func(self, fn, **kw):
+        return f"POWER{self.function_argspec(fn)}"
+
     def visit_match_op_binary(self, binary, operator, **kw):
         return "CONTAINS (%s, %s)" % (
             self.process(binary.left),
@@ -1260,6 +1347,23 @@ class OracleCompiler(compiler.SQLCompiler):
 
     def visit_false(self, expr, **kw):
         return "0"
+
+    def visit_cast(self, cast, **kwargs):
+        # Oracle requires VARCHAR2 to have a length in CAST expressions
+        # Adapt String types to VARCHAR2 with appropriate length
+        type_ = cast.typeclause.type
+        if isinstance(type_, sqltypes.String) and not isinstance(
+            type_, (sqltypes.Text, sqltypes.CLOB)
+        ):
+            adapted = VARCHAR2._adapt_string_for_cast(type_)
+            type_clause = self.dialect.type_compiler_instance.process(adapted)
+        else:
+            type_clause = cast.typeclause._compiler_dispatch(self, **kwargs)
+
+        return "CAST(%s AS %s)" % (
+            cast.clause._compiler_dispatch(self, **kwargs),
+            type_clause,
+        )
 
     def get_cte_preamble(self, recursive):
         return "WITH"
@@ -1701,7 +1805,9 @@ class OracleCompiler(compiler.SQLCompiler):
             )
 
     def visit_aggregate_strings_func(self, fn, **kw):
-        return "LISTAGG%s" % self.function_argspec(fn, **kw)
+        return super().visit_aggregate_strings_func(
+            fn, use_function_name="LISTAGG", **kw
+        )
 
     def _visit_bitwise(self, binary, fn_name, custom_right=None, **kw):
         left = self.process(binary.left, **kw)
@@ -1727,6 +1833,57 @@ class OracleCompiler(compiler.SQLCompiler):
 
     def visit_bitwise_not_op_unary_operator(self, element, operator, **kw):
         raise exc.CompileError("Cannot compile bitwise_not in oracle")
+
+    def _render_json_extract_from_binary(self, binary, operator, **kw):
+        literal_kw = kw.copy()
+        literal_kw["literal_binds"] = True
+
+        left = self.process(binary.left, **kw)
+        right = self.process(binary.right, **literal_kw)
+
+        if binary.type._type_affinity is sqltypes.Boolean:
+            # RETURNING clause doesn't handle true/false to 1/0
+            # mapping, so use CASE expression for boolean
+            return (
+                f"CASE JSON_VALUE({left}, {right})"
+                f" WHEN 'true' THEN 1"
+                f" WHEN 'false' THEN 0"
+                f" ELSE CAST(JSON_VALUE({left}, {right})"
+                f" AS NUMBER(1)) END"
+            )
+        elif binary.type._type_affinity is sqltypes.Integer:
+            json_value_returning = "INTEGER"
+        elif binary.type._type_affinity in (
+            sqltypes.Numeric,
+            sqltypes.Float,
+        ):
+            if isinstance(binary.type, sqltypes.Float):
+                json_value_returning = "FLOAT"
+            else:
+                json_value_returning = (
+                    f"NUMBER({binary.type.precision}, {binary.type.scale})"
+                )
+        elif binary.type._type_affinity is sqltypes.String:
+            json_value_returning = "VARCHAR2(4000)"
+        else:
+            # binary.type._type_affinity is sqltypes.JSON
+            # or other
+            return f"JSON_QUERY({left}, {right})"
+
+        return (
+            f"JSON_VALUE({left}, {right}"
+            f" RETURNING {json_value_returning} ERROR ON ERROR)"
+        )
+
+    def visit_json_getitem_op_binary(
+        self, binary: elements.BinaryExpression[Any], operator: Any, **kw: Any
+    ) -> str:
+        return self._render_json_extract_from_binary(binary, operator, **kw)
+
+    def visit_json_path_getitem_op_binary(
+        self, binary: elements.BinaryExpression[Any], operator: Any, **kw: Any
+    ) -> str:
+        return self._render_json_extract_from_binary(binary, operator, **kw)
 
 
 class OracleDDLCompiler(compiler.DDLCompiler):
@@ -1855,8 +2012,9 @@ class OracleDDLCompiler(compiler.DDLCompiler):
         text = text.replace("NO MINVALUE", "NOMINVALUE")
         text = text.replace("NO MAXVALUE", "NOMAXVALUE")
         text = text.replace("NO CYCLE", "NOCYCLE")
-        if identity_options.order is not None:
-            text += " ORDER" if identity_options.order else " NOORDER"
+        options = identity_options.dialect_options["oracle"]
+        if options.get("order") is not None:
+            text += " ORDER" if options["order"] else " NOORDER"
         return text.strip()
 
     def visit_computed_column(self, generated, **kw):
@@ -1879,7 +2037,7 @@ class OracleDDLCompiler(compiler.DDLCompiler):
         else:
             kind = "ALWAYS" if identity.always else "BY DEFAULT"
         text = "GENERATED %s" % kind
-        if identity.on_null:
+        if identity.dialect_options["oracle"].get("on_null"):
             text += " ON NULL"
         text += " AS IDENTITY"
         options = self.get_identity_options(identity)
@@ -1925,7 +2083,7 @@ class OracleExecutionContext(default.DefaultExecutionContext):
             )
 
 
-class OracleDialect(default.DefaultDialect):
+class OracleDialect(default._BackendsMultiReflection, default.DefaultDialect):
     name = "oracle"
     supports_statement_cache = True
     supports_alter = True
@@ -1943,6 +2101,7 @@ class OracleDialect(default.DefaultDialect):
     cte_follows_insert = True
     returns_native_bytes = True
 
+    supports_native_boolean = True
     supports_sequences = True
     sequences_optional = False
     postfetch_lastrowid = False
@@ -1958,6 +2117,10 @@ class OracleDialect(default.DefaultDialect):
     supports_default_metavalue = True
     supports_empty_insert = False
     supports_identity_columns = True
+
+    _supports_oracle_json = True
+
+    aggregate_order_by_style = AggregateOrderByStyle.WITHIN_GROUP
 
     statement_compiler = OracleCompiler
     ddl_compiler = OracleDDLCompiler
@@ -1987,6 +2150,8 @@ class OracleDialect(default.DefaultDialect):
                 "vector": False,
             },
         ),
+        (sa_schema.Sequence, {"order": None}),
+        (sa_schema.Identity, {"order": None, "on_null": None}),
         (sa_selectable.Select, {"fetch_approximate": False}),
         (sa_selectable.CompoundSelect, {"fetch_approximate": False}),
     ]
@@ -2009,6 +2174,8 @@ class OracleDialect(default.DefaultDialect):
         use_nchar_for_unicode=False,
         exclude_tablespaces=("SYSTEM", "SYSAUX"),
         enable_offset_fetch=True,
+        json_serializer: Callable[[_JSON_VALUE], str] | None = None,
+        json_deserializer: Callable[[str], _JSON_VALUE] | None = None,
         **kwargs,
     ):
         default.DefaultDialect.__init__(self, **kwargs)
@@ -2019,6 +2186,8 @@ class OracleDialect(default.DefaultDialect):
         self.enable_offset_fetch = self._supports_offset_fetch = (
             enable_offset_fetch
         )
+        self._json_serializer = json_serializer
+        self._json_deserializer = json_deserializer
 
     def initialize(self, connection):
         super().initialize(connection)
@@ -2034,6 +2203,8 @@ class OracleDialect(default.DefaultDialect):
             self.colspecs.pop(sqltypes.Interval)
             self.use_ansi = False
 
+        self._supports_oracle_json = self.server_version_info >= (21,)
+        self.supports_native_boolean = self.server_version_info >= (23,)
         self.supports_identity_columns = self.server_version_info >= (12,)
         self._supports_offset_fetch = (
             self.enable_offset_fetch and self.server_version_info >= (12,)
@@ -2140,7 +2311,7 @@ class OracleDialect(default.DefaultDialect):
         )
 
     @util.memoized_property
-    def _has_table_query(self):
+    def _has_multi_table_query(self):
         # materialized views are returned by all_tables
         tables = (
             select(
@@ -2157,33 +2328,35 @@ class OracleDialect(default.DefaultDialect):
         )
 
         query = select(tables.c.table_name).where(
-            tables.c.table_name == bindparam("table_name"),
+            tables.c.table_name.in_(bindparam("table_names")),
             tables.c.owner == bindparam("owner"),
         )
         return query
 
-    @reflection.cache
-    def has_table(
-        self, connection, table_name, schema=None, dblink=None, **kw
+    def has_multi_table(
+        self, connection, table_names, schema=None, dblink=None, **kw
     ):
         """Supported kw arguments are: ``dblink`` to reflect via a db link."""
-        self._ensure_has_table_connection(connection)
 
-        if not schema:
-            schema = self.default_schema_name
-
+        owner = schema or self.default_schema_name
+        db_tns = [self.denormalize_name(tn) for tn in table_names]
         params = {
-            "table_name": self.denormalize_name(table_name),
-            "owner": self.denormalize_schema_name(schema),
+            "table_names": db_tns,
+            "owner": self.denormalize_schema_name(owner),
         }
         cursor = self._execute_reflection(
             connection,
-            self._has_table_query,
+            self._has_multi_table_query,
             dblink,
             returns_long=False,
             params=params,
         )
-        return bool(cursor.scalar())
+        existing = set(cursor.scalars().all())
+        retval = {
+            (schema, table): db_tn in existing
+            for table, db_tn in zip(table_names, db_tns)
+        }
+        return retval.items()
 
     @reflection.cache
     def has_sequence(
@@ -2567,21 +2740,6 @@ class OracleDialect(default.DefaultDialect):
         else:
             return False, {}
 
-    @reflection.cache
-    def get_table_options(self, connection, table_name, schema=None, **kw):
-        """Supported kw arguments are: ``dblink`` to reflect via a db link;
-        ``oracle_resolve_synonyms`` to resolve names to synonyms
-        """
-        data = self.get_multi_table_options(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
-
     @lru_cache()
     def _table_options_query(
         self, owner, scope, kind, has_filter_names, has_mat_views
@@ -2704,22 +2862,6 @@ class OracleDialect(default.DefaultDialect):
                     options[(schema, view)] = default()
 
         return options.items()
-
-    @reflection.cache
-    def get_columns(self, connection, table_name, schema=None, **kw):
-        """Supported kw arguments are: ``dblink`` to reflect via a db link;
-        ``oracle_resolve_synonyms`` to resolve names to synonyms
-        """
-
-        data = self.get_multi_columns(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     def _run_batches(
         self, connection, query, dblink, returns_long, mappings, all_objects
@@ -2964,7 +3106,7 @@ class OracleDialect(default.DefaultDialect):
         parts = [p.strip() for p in identity_options.split(",")]
         identity = {
             "always": parts[0] == "ALWAYS",
-            "on_null": default_on_null == "YES",
+            "oracle_on_null": default_on_null == "YES",
         }
 
         for part in parts[1:]:
@@ -2984,23 +3126,8 @@ class OracleDialect(default.DefaultDialect):
             elif "CACHE_SIZE" in option:
                 identity["cache"] = int(value)
             elif "ORDER_FLAG" in option:
-                identity["order"] = value == "Y"
+                identity["oracle_order"] = value == "Y"
         return identity
-
-    @reflection.cache
-    def get_table_comment(self, connection, table_name, schema=None, **kw):
-        """Supported kw arguments are: ``dblink`` to reflect via a db link;
-        ``oracle_resolve_synonyms`` to resolve names to synonyms
-        """
-        data = self.get_multi_table_comment(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     @lru_cache()
     def _comment_query(self, owner, scope, kind, has_filter_names):
@@ -3098,21 +3225,6 @@ class OracleDialect(default.DefaultDialect):
             )
             for table, comment in result
         )
-
-    @reflection.cache
-    def get_indexes(self, connection, table_name, schema=None, **kw):
-        """Supported kw arguments are: ``dblink`` to reflect via a db link;
-        ``oracle_resolve_synonyms`` to resolve names to synonyms
-        """
-        data = self.get_multi_indexes(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     @lru_cache()
     def _index_query(self, owner):
@@ -3281,21 +3393,6 @@ class OracleDialect(default.DefaultDialect):
             )
         )
 
-    @reflection.cache
-    def get_pk_constraint(self, connection, table_name, schema=None, **kw):
-        """Supported kw arguments are: ``dblink`` to reflect via a db link;
-        ``oracle_resolve_synonyms`` to resolve names to synonyms
-        """
-        data = self.get_multi_pk_constraint(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
-
     @lru_cache()
     def _constraint_query(self, owner):
         local = dictionary.all_cons_columns.alias("local")
@@ -3418,27 +3515,6 @@ class OracleDialect(default.DefaultDialect):
                 for obj_name in all_objects
             )
         )
-
-    @reflection.cache
-    def get_foreign_keys(
-        self,
-        connection,
-        table_name,
-        schema=None,
-        **kw,
-    ):
-        """Supported kw arguments are: ``dblink`` to reflect via a db link;
-        ``oracle_resolve_synonyms`` to resolve names to synonyms
-        """
-        data = self.get_multi_foreign_keys(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     @_handle_synonyms_decorator
     def get_multi_foreign_keys(
@@ -3574,23 +3650,6 @@ class OracleDialect(default.DefaultDialect):
             )
         )
 
-    @reflection.cache
-    def get_unique_constraints(
-        self, connection, table_name, schema=None, **kw
-    ):
-        """Supported kw arguments are: ``dblink`` to reflect via a db link;
-        ``oracle_resolve_synonyms`` to resolve names to synonyms
-        """
-        data = self.get_multi_unique_constraints(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
-
     @_handle_synonyms_decorator
     def get_multi_unique_constraints(
         self,
@@ -3714,24 +3773,6 @@ class OracleDialect(default.DefaultDialect):
             )
         else:
             return rp
-
-    @reflection.cache
-    def get_check_constraints(
-        self, connection, table_name, schema=None, include_all=False, **kw
-    ):
-        """Supported kw arguments are: ``dblink`` to reflect via a db link;
-        ``oracle_resolve_synonyms`` to resolve names to synonyms
-        """
-        data = self.get_multi_check_constraints(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            include_all=include_all,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     @_handle_synonyms_decorator
     def get_multi_check_constraints(

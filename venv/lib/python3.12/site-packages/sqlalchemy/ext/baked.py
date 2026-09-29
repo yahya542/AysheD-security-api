@@ -38,9 +38,6 @@ class Bakery:
     :meth:`.BakedQuery.bakery`.  It exists as an object
     so that the "cache" can be easily inspected.
 
-    .. versionadded:: 1.2
-
-
     """
 
     __slots__ = "cls", "cache"
@@ -276,10 +273,6 @@ class BakedQuery:
          :class:`.Session` object, that is assumed to be within the context
          of an enclosing :class:`.BakedQuery` callable.
 
-
-         .. versionadded:: 1.3
-
-
         """  # noqa: E501
 
         if isinstance(query_or_session, Session):
@@ -358,10 +351,6 @@ class Result:
            :meth:`_query.Query.params` and
            :meth:`_query.Query.execution_options`
            methods should be used.
-
-
-        .. versionadded:: 1.2
-
 
         """
         return self._using_post_criteria([fn])

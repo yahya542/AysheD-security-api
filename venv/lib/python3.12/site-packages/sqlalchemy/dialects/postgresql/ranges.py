@@ -16,6 +16,7 @@ from typing import Any
 from typing import cast
 from typing import Generic
 from typing import List
+from typing import Literal
 from typing import Optional
 from typing import overload
 from typing import Sequence
@@ -35,9 +36,8 @@ from .operators import STRICTLY_LEFT_OF
 from .operators import STRICTLY_RIGHT_OF
 from ... import types as sqltypes
 from ...sql import operators
+from ...sql.operators import OperatorClass
 from ...sql.type_api import TypeEngine
-from ...util import py310
-from ...util.typing import Literal
 
 if TYPE_CHECKING:
     from ...sql.elements import ColumnElement
@@ -48,15 +48,8 @@ _T = TypeVar("_T", bound=Any)
 
 _BoundsType = Literal["()", "[)", "(]", "[]"]
 
-if py310:
-    dc_slots = {"slots": True}
-    dc_kwonly = {"kw_only": True}
-else:
-    dc_slots = {}
-    dc_kwonly = {}
 
-
-@dataclasses.dataclass(frozen=True, **dc_slots)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Range(Generic[_T]):
     """Represent a PostgreSQL range.
 
@@ -85,32 +78,8 @@ class Range(Generic[_T]):
     upper: Optional[_T] = None
     """the upper bound"""
 
-    if TYPE_CHECKING:
-        bounds: _BoundsType = dataclasses.field(default="[)")
-        empty: bool = dataclasses.field(default=False)
-    else:
-        bounds: _BoundsType = dataclasses.field(default="[)", **dc_kwonly)
-        empty: bool = dataclasses.field(default=False, **dc_kwonly)
-
-    if not py310:
-
-        def __init__(
-            self,
-            lower: Optional[_T] = None,
-            upper: Optional[_T] = None,
-            *,
-            bounds: _BoundsType = "[)",
-            empty: bool = False,
-        ):
-            # no __slots__ either so we can update dict
-            self.__dict__.update(
-                {
-                    "lower": lower,
-                    "upper": upper,
-                    "bounds": bounds,
-                    "empty": empty,
-                }
-            )
+    bounds: _BoundsType = dataclasses.field(default="[)", kw_only=True)
+    empty: bool = dataclasses.field(default=False, kw_only=True)
 
     def __bool__(self) -> bool:
         return not self.empty
@@ -171,13 +140,13 @@ class Range(Generic[_T]):
             )
 
         if self.upper is None:
-            return (  # type: ignore
+            return (  # type: ignore[no-any-return]
                 value > self.lower
                 if self.bounds[0] == "("
                 else value >= self.lower
             )
 
-        return (  # type: ignore
+        return (  # type: ignore[no-any-return]
             value > self.lower
             if self.bounds[0] == "("
             else value >= self.lower
@@ -477,14 +446,14 @@ class Range(Generic[_T]):
                 return False
             if bound1 == "]":
                 if bound2 == "[":
-                    return value1 == value2 - step  # type: ignore
+                    return value1 == value2 - step  # type: ignore[no-any-return]  # noqa: E501
                 else:
                     return value1 == value2
             else:
                 if bound2 == "[":
                     return value1 == value2
                 else:
-                    return value1 == value2 - step  # type: ignore
+                    return value1 == value2 - step  # type: ignore[no-any-return]  # noqa: E501
         elif res == 0:
             # Cover cases like [0,0] -|- [1,] and [0,2) -|- (1,3]
             if (
@@ -704,8 +673,8 @@ class Range(Generic[_T]):
             return "empty"
 
         l, r = self.lower, self.upper
-        l = "" if l is None else l  # type: ignore
-        r = "" if r is None else r  # type: ignore
+        l = "" if l is None else l  # type: ignore[assignment]
+        r = "" if r is None else r  # type: ignore[assignment]
 
         b0, b1 = cast("Tuple[str, str]", self.bounds)
 
@@ -743,6 +712,8 @@ class AbstractRange(sqltypes.TypeEngine[_T]):
 
     render_bind_cast = True
 
+    operator_classes = OperatorClass.NUMERIC
+
     __abstract__ = True
 
     @overload
@@ -779,7 +750,7 @@ class AbstractRange(sqltypes.TypeEngine[_T]):
             # The adapt() operation here is cached per type-class-per-dialect,
             # so is not much of a performance concern
             visit_name = self.__visit_name__
-            return type(  # type: ignore
+            return type(  # type: ignore[no-any-return]
                 f"{visit_name}RangeImpl",
                 (cls, self.__class__),
                 {"__visit_name__": visit_name},

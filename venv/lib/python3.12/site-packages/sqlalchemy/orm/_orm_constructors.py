@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 import typing
+from typing import Annotated
 from typing import Any
 from typing import Callable
 from typing import Collection
 from typing import Iterable
+from typing import Literal
 from typing import Mapping
 from typing import NoReturn
 from typing import Optional
@@ -29,6 +31,7 @@ from .properties import MappedColumn
 from .properties import MappedSQLExpression
 from .query import AliasOption
 from .relationships import _RelationshipArgumentType
+from .relationships import _RelationshipBackPopulatesArgument
 from .relationships import _RelationshipDeclared
 from .relationships import _RelationshipSecondaryArgument
 from .relationships import RelationshipProperty
@@ -46,8 +49,6 @@ from ..sql.base import SchemaEventTarget
 from ..sql.schema import _InsertSentinelColumnDefault
 from ..sql.schema import SchemaConst
 from ..sql.selectable import FromClause
-from ..util.typing import Annotated
-from ..util.typing import Literal
 
 if TYPE_CHECKING:
     from ._typing import _EntityType
@@ -102,6 +103,7 @@ def mapped_column(
     __type_pos: Optional[
         Union[_TypeEngineArgument[Any], SchemaEventTarget]
     ] = None,
+    /,
     *args: SchemaEventTarget,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
@@ -632,12 +634,15 @@ def column_property(
 @overload
 def composite(
     _class_or_attr: _CompositeAttrType[Any],
+    /,
     *attrs: _CompositeAttrType[Any],
     group: Optional[str] = None,
     deferred: bool = False,
     raiseload: bool = False,
+    return_none_on: Union[_NoArg, None, Callable[..., bool]] = _NoArg.NO_ARG,
     comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
     active_history: bool = False,
+    column_template: Optional[str] = None,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
     default: Optional[Any] = _NoArg.NO_ARG,
@@ -655,12 +660,15 @@ def composite(
 @overload
 def composite(
     _class_or_attr: Type[_CC],
+    /,
     *attrs: _CompositeAttrType[Any],
     group: Optional[str] = None,
     deferred: bool = False,
     raiseload: bool = False,
+    return_none_on: Union[_NoArg, None, Callable[..., bool]] = _NoArg.NO_ARG,
     comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
     active_history: bool = False,
+    column_template: Optional[str] = None,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
     default: Optional[Any] = _NoArg.NO_ARG,
@@ -677,12 +685,15 @@ def composite(
 @overload
 def composite(
     _class_or_attr: Callable[..., _CC],
+    /,
     *attrs: _CompositeAttrType[Any],
     group: Optional[str] = None,
     deferred: bool = False,
     raiseload: bool = False,
+    return_none_on: Union[_NoArg, None, Callable[..., bool]] = _NoArg.NO_ARG,
     comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
     active_history: bool = False,
+    column_template: Optional[str] = None,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
     default: Optional[Any] = _NoArg.NO_ARG,
@@ -700,12 +711,15 @@ def composite(
     _class_or_attr: Union[
         None, Type[_CC], Callable[..., _CC], _CompositeAttrType[Any]
     ] = None,
+    /,
     *attrs: _CompositeAttrType[Any],
     group: Optional[str] = None,
     deferred: bool = False,
     raiseload: bool = False,
+    return_none_on: Union[_NoArg, None, Callable[..., bool]] = _NoArg.NO_ARG,
     comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
     active_history: bool = False,
+    column_template: Optional[str] = None,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
     default: Optional[Any] = _NoArg.NO_ARG,
@@ -745,6 +759,23 @@ def composite(
       scalar attribute should be loaded when replaced, if not
       already loaded.  See the same flag on :func:`.column_property`.
 
+    :param return_none_on=None: A callable that will be evaluated when the
+     composite object is to be constructed, which upon returning the boolean
+     value ``True`` will instead bypass the construction and cause the
+     resulting value to be None.   This typically may be assigned a lambda
+     that will evaluate to True when all the columns within the composite
+     are themselves None, e.g.::
+
+        composite(
+            MyComposite, return_none_on=lambda *cols: all(x is None for x in cols)
+        )
+
+     The above lambda for :paramref:`.composite.return_none_on` is used
+     automatically when using ORM Annotated Declarative along with an optional
+     value within the :class:`.Mapped` annotation.
+
+     .. versionadded:: 2.1
+
     :param group:
       A group name for this property when marked as deferred.
 
@@ -757,6 +788,18 @@ def composite(
     :param comparator_factory:  a class which extends
       :class:`.Composite.Comparator` which provides custom SQL
       clause generation for comparison operations.
+
+    :param column_template: A string template such as ``"person_%s"``,
+     containing exactly one ``%s`` placeholder, that's used to generate
+     column names for fields of a dataclass :paramref:`.composite.class_`
+     that don't otherwise have an explicit name.  Only supported for
+     dataclass-based composite classes.
+
+     .. seealso::
+
+        :ref:`composite_column_template`
+
+     .. versionadded:: 2.1
 
     :param doc:
       optional string that will be applied as the doc on the
@@ -801,13 +844,15 @@ def composite(
 
      .. versionadded:: 2.0.42
 
-    """
+    """  # noqa: E501
+
     if __kw:
         raise _no_kw()
 
     return Composite(
         _class_or_attr,
         *attrs,
+        return_none_on=return_none_on,
         attribute_options=_AttributeOptions(
             init,
             repr,
@@ -823,6 +868,7 @@ def composite(
         raiseload=raiseload,
         comparator_factory=comparator_factory,
         active_history=active_history,
+        column_template=column_template,
         info=info,
         doc=doc,
     )
@@ -1037,7 +1083,7 @@ def relationship(
     ] = None,
     primaryjoin: Optional[_RelationshipJoinConditionArgument] = None,
     secondaryjoin: Optional[_RelationshipJoinConditionArgument] = None,
-    back_populates: Optional[str] = None,
+    back_populates: Optional[_RelationshipBackPopulatesArgument] = None,
     order_by: _ORMOrderByArgument = False,
     backref: Optional[ORMBackrefArgument] = None,
     overlaps: Optional[str] = None,
@@ -1138,11 +1184,11 @@ def relationship(
       collection associated with the
       parent-mapped :class:`_schema.Table`.
 
-      .. warning:: When passed as a Python-evaluable string, the
-         argument is interpreted using Python's ``eval()`` function.
-         **DO NOT PASS UNTRUSTED INPUT TO THIS STRING**.
-         See :ref:`declarative_relationship_eval` for details on
-         declarative evaluation of :func:`_orm.relationship` arguments.
+      .. versionchanged:: 2.1  When passed as a string, the argument is
+         interpreted as a string name that should exist directly in the
+         registry of tables.  The Python ``eval()`` function is no longer
+         used for the :paramref:`_orm.relationship.secondary` argument when
+         passed as a string.
 
       The :paramref:`_orm.relationship.secondary` keyword argument is
       typically applied in the case where the intermediary
@@ -1460,11 +1506,6 @@ def relationship(
         issues a JOIN to the immediate parent object, specifying primary
         key identifiers using an IN clause.
 
-      * ``noload`` - no loading should occur at any time.  The related
-        collection will remain empty.   The ``noload`` strategy is not
-        recommended for general use.  For a general use "never load"
-        approach, see :ref:`write_only_relationship`
-
       * ``raise`` - lazy loading is disallowed; accessing
         the attribute, if its value were not already loaded via eager
         loading, will raise an :exc:`~sqlalchemy.exc.InvalidRequestError`.
@@ -1526,6 +1567,13 @@ def relationship(
 
             :ref:`write_only_relationship` - more generally useful approach
             for large collections that should not fully load into memory
+
+      * ``noload`` - no loading should occur at any time.  The related
+        collection will remain empty.
+
+        .. deprecated:: 2.1 The ``noload`` loader strategy is deprecated and
+           will be removed in a future release.  This option produces incorrect
+           results by returning ``None`` for related items.
 
       * True - a synonym for 'select'
 
@@ -1827,8 +1875,6 @@ def relationship(
       default, changes in state will be back-populated only if neither
       sides of a relationship is viewonly.
 
-      .. versionadded:: 1.3.17
-
       .. versionchanged:: 1.4 - A relationship that specifies
          :paramref:`_orm.relationship.viewonly` automatically implies
          that :paramref:`_orm.relationship.sync_backref` is ``False``.
@@ -1848,10 +1894,16 @@ def relationship(
          automatically detected; if it is not detected, then the
          optimization is not supported.
 
-         .. versionchanged:: 1.3.11  setting ``omit_join`` to True will now
-            emit a warning as this was not the intended use of this flag.
+    :param default: Specific to :ref:`orm_declarative_native_dataclasses`,
+     specifies an immutable scalar default value for the relationship that
+     will behave as though it is the default value for the parameter in the
+     ``__init__()`` method.  This is only supported for a ``uselist=False``
+     relationship, that is many-to-one or one-to-one, and only supports the
+     scalar value ``None``, since no other immutable value is valid for such a
+     relationship.
 
-      .. versionadded:: 1.3
+     .. versionchanged:: 2.1 the :paramref:`_orm.relationship.default`
+        parameter only supports a value of ``None``.
 
     :param init: Specific to :ref:`orm_declarative_native_dataclasses`,
      specifies if the mapped attribute should be part of the ``__init__()``
@@ -2270,8 +2322,6 @@ def query_expression(
 
     :param default_expr: Optional SQL expression object that will be used in
         all cases if not assigned later with :func:`_orm.with_expression`.
-
-    .. versionadded:: 1.2
 
     .. seealso::
 

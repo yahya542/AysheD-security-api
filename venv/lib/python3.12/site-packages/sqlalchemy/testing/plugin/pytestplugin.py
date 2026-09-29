@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import collections
 from functools import update_wrapper
-from functools import wraps
 import inspect
 import itertools
 import operator
@@ -137,7 +136,7 @@ def _log_sqlalchemy_info(session):
     import sqlalchemy
     from sqlalchemy import __version__
     from sqlalchemy.util import has_compiled_ext
-    from sqlalchemy.util._has_cy import _CYEXTENSION_MSG
+    from sqlalchemy.util._has_cython import _CYEXTENSION_MSG
 
     greet = "sqlalchemy installation"
     site = "no user site" if sys.flags.no_user_site else "user site loaded"
@@ -147,9 +146,9 @@ def _log_sqlalchemy_info(session):
     ]
 
     if has_compiled_ext():
-        from sqlalchemy.cyextension import util
+        from sqlalchemy.engine import _util_cy
 
-        msgs.append(f"compiled extension enabled, e.g. {util.__file__} ")
+        msgs.append(f"compiled extension enabled, e.g. {_util_cy.__file__} ")
     else:
         msgs.append(f"compiled extension not enabled; {_CYEXTENSION_MSG}")
 
@@ -680,28 +679,6 @@ def %(name)s%(grouped_args)s:
 
 
 class PytestFixtureFunctions(plugin_base.FixtureFunctions):
-
-    def fixture_classmethod(self, fn):
-        """a conditional `@classmethod` decorator that we use only on py3.10
-        on forward, for compatibility with pytest 9.1+."""
-
-        if pytest.version_tuple >= (9, 1):
-            return classmethod(fn)
-        else:
-            if inspect.isgeneratorfunction(fn):
-
-                @wraps(fn)
-                def wrap(self, *args, **kw):
-                    yield from fn(self.__class__, *args, **kw)
-
-            else:
-
-                @wraps(fn)
-                def wrap(self, *args, **kw):
-                    return fn(self.__class__, *args, **kw)
-
-            return wrap
-
     def skip_test_exception(self, *arg, **kw):
         return pytest.skip.Exception(*arg, **kw)
 

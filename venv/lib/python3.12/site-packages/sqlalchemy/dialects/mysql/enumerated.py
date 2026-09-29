@@ -10,9 +10,7 @@ from __future__ import annotations
 import enum
 import re
 from typing import Any
-from typing import Dict
 from typing import Optional
-from typing import Set
 from typing import Type
 from typing import TYPE_CHECKING
 from typing import Union
@@ -51,9 +49,6 @@ class ENUM(type_api.NativeForEmulated, sqltypes.Enum, _StringType):
           enums are not quoted, they will be escaped and surrounded by single
           quotes when generating the schema.  This object may also be a
           PEP-435-compliant enumerated type.
-
-          .. versionadded: 1.1 added support for PEP-435-compliant enumerated
-             types.
 
         :param strict: This flag has no effect.
 
@@ -109,8 +104,8 @@ class ENUM(type_api.NativeForEmulated, sqltypes.Enum, _StringType):
         else:
             return super()._object_value_for_elem(elem)
 
-    def __repr__(self) -> str:
-        return util.generic_repr(
+    def repr_struct(self) -> util.GenericRepr:
+        return util.GenericRepr(
             self, to_inspect=[ENUM, _StringType, sqltypes.Enum]
         )
 
@@ -177,10 +172,10 @@ class SET(_StringType):
                 "setting retrieve_as_bitwise=True"
             )
         if self.retrieve_as_bitwise:
-            self._inversed_bitmap: Dict[str, int] = {
+            self._inversed_bitmap: dict[str, int] = {
                 value: 2**idx for idx, value in enumerate(self.values)
             }
-            self._bitmap: Dict[int, str] = {
+            self._bitmap: dict[int, str] = {
                 2**idx: value for idx, value in enumerate(self.values)
             }
         length = max([len(v) for v in values] + [0])
@@ -202,7 +197,7 @@ class SET(_StringType):
     ) -> Optional[_ResultProcessorType[Any]]:
         if self.retrieve_as_bitwise:
 
-            def process(value: Union[str, int, None]) -> Optional[Set[str]]:
+            def process(value: Union[str, int, None]) -> Optional[set[str]]:
                 if value is not None:
                     value = int(value)
 
@@ -213,7 +208,7 @@ class SET(_StringType):
         else:
             super_convert = super().result_processor(dialect, coltype)
 
-            def process(value: Union[str, Set[str], None]) -> Optional[Set[str]]:  # type: ignore[misc]  # noqa: E501
+            def process(value: Union[str, set[str], None]) -> Optional[set[str]]:  # type: ignore[misc]  # noqa: E501
                 if isinstance(value, str):
                     # MySQLdb returns a string, let's parse
                     if super_convert:
@@ -262,7 +257,7 @@ class SET(_StringType):
                 if value is not None and not isinstance(value, (int, str)):
                     value = ",".join(value)
                 if super_convert:
-                    return super_convert(value)  # type: ignore
+                    return super_convert(value)  # type: ignore[arg-type, no-any-return]  # noqa: E501
                 else:
                     return value
 
@@ -272,8 +267,8 @@ class SET(_StringType):
         kw["retrieve_as_bitwise"] = self.retrieve_as_bitwise
         return util.constructor_copy(self, cls, *self.values, **kw)
 
-    def __repr__(self) -> str:
-        return util.generic_repr(
+    def repr_struct(self) -> util.GenericRepr:
+        return util.GenericRepr(
             self,
             to_inspect=[SET, _StringType],
             additional_kw=[

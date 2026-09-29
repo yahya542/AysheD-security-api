@@ -25,6 +25,7 @@ from typing import Dict
 from typing import Generic
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import Mapping
 from typing import MutableMapping
 from typing import Optional
@@ -41,7 +42,6 @@ from .attr import _JoinedListener
 from .registry import _ET
 from .registry import _EventKey
 from .. import util
-from ..util.typing import Literal
 
 _registrars: MutableMapping[str, List[Type[_HasEventsDispatch[Any]]]] = (
     util.defaultdict(list)

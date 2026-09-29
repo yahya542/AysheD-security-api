@@ -126,7 +126,7 @@ def generate_db_urls(db_urls, extra_drivers):
         --dburi postgresql://db1  \
         --dburi postgresql://db2  \
         --dburi postgresql://db2  \
-        --dbdriver=psycopg2 --dbdriver=asyncpg?async_fallback=true
+        --dbdriver=psycopg2 --dbdriver=asyncpg
 
     Noting that the default postgresql driver is psycopg2,  the output
     would be:
@@ -145,13 +145,12 @@ def generate_db_urls(db_urls, extra_drivers):
     we want to keep it in that dburi.
 
     Driver specific query options can be specified by added them to the
-    driver name. For example, to enable the async fallback option for
-    asyncpg::
+    driver name. For example, to a sample option the asyncpg:
 
     .. sourcecode:: text
 
         --dburi postgresql://db1  \
-        --dbdriver=asyncpg?async_fallback=true
+        --dbdriver=asyncpg?some_option=a_value
 
     """
     urls = set()
@@ -319,7 +318,7 @@ def drop_views(cfg, eng):
         with eng.begin() as conn:
             for vname in view_names:
                 conn.execute(
-                    ddl._DropView(schema.Table(vname, schema.MetaData()))
+                    ddl.DropView(schema.Table(vname, schema.MetaData()))
                 )
 
     if config.requirements.schemas.enabled_for_config(cfg):
@@ -331,7 +330,7 @@ def drop_views(cfg, eng):
             with eng.begin() as conn:
                 for vname in view_names:
                     conn.execute(
-                        ddl._DropView(
+                        ddl.DropView(
                             schema.Table(
                                 vname,
                                 schema.MetaData(),
@@ -600,3 +599,35 @@ def delete_from_all_tables(connection, cfg, metadata):
                 connection.execute(table.delete())
         else:
             connection.execute(table.delete())
+
+
+@register.init
+def dbapi_error(cfg, cls, message):
+    """create a DBAPI error
+
+    :param cls: the DBAPI class, like ``dialect.dbapi.OperationalError``
+    :param message: message for the error
+
+    """
+    return cls(message)
+
+
+@register.init
+def profile_platform_tokens(eng):
+    """return extra tokens for the ``test/profiles.txt`` platform key.
+
+    The call counts asserted by ``test/aaa_profiling/`` are keyed to the
+    environment they were recorded in, and a dialect knows things about
+    that environment which the generic key can't see - whether the DBAPI
+    loaded its C accelerator, whether the database is on disk, and so on.
+    Anything that moves the counts belongs here, otherwise counts recorded
+    under one configuration get asserted against another.
+
+    Tokens are rendered into the key in the order returned, immediately
+    after the driver name, and must consist of lower case alphanumerics;
+    ``_`` is the separator between key tokens.  A dialect that adds a
+    token invalidates the entries already recorded for it, so the counts
+    need regenerating; see ``python tools/profiles.py --help``.
+
+    """
+    return ()

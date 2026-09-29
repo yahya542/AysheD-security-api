@@ -17,6 +17,7 @@ from .. import config
 from .. import mock
 from .. import provision
 from ..assertions import eq_
+from ..assertions import expect_deprecated
 from ..assertions import ne_
 from ..util import adict
 from ..util import drop_all_tables_from_metadata
@@ -53,7 +54,7 @@ class TablesTest(TestBase):
     sequences = None
 
     @config.fixture(autouse=True, scope="class")
-    @config.fixture_classmethod
+    @classmethod
     def _setup_tables_test_class(cls):
         cls._init_class()
 
@@ -320,12 +321,15 @@ class ComputedReflectionFixtureTest(TablesTest):
 
 
 class CacheKeyFixture:
-    def _compare_equal(self, a, b, compare_values):
+    def _compare_equal(self, a, b, *, compare_values=False):
         a_key = a._generate_cache_key()
         b_key = b._generate_cache_key()
 
         if a_key is None:
-            assert a._annotations.get("nocache")
+            assert a._annotations.get("nocache"), (
+                "Construct doesn't cache, so test suite should "
+                "add the 'nocache' annotation"
+            )
 
             assert b_key is None
         else:
@@ -336,7 +340,23 @@ class CacheKeyFixture:
                 assert a_param.compare(b_param, compare_values=compare_values)
         return a_key, b_key
 
-    def _run_cache_key_fixture(self, fixture, compare_values):
+    def _run_compare_fixture(self, fixture, *, compare_values=False):
+        case_a = fixture()
+        case_b = fixture()
+
+        for a, b in itertools.combinations_with_replacement(
+            range(len(case_a)), 2
+        ):
+            if a == b:
+                assert case_a[a].compare(
+                    case_b[b], compare_values=compare_values
+                )
+            else:
+                assert not case_a[a].compare(
+                    case_b[b], compare_values=compare_values
+                )
+
+    def _run_cache_key_fixture(self, fixture, *, compare_values=False):
         case_a = fixture()
         case_b = fixture()
 
@@ -345,7 +365,7 @@ class CacheKeyFixture:
         ):
             if a == b:
                 a_key, b_key = self._compare_equal(
-                    case_a[a], case_b[b], compare_values
+                    case_a[a], case_b[b], compare_values=compare_values
                 )
                 if a_key is None:
                     continue
@@ -418,7 +438,20 @@ class CacheKeyFixture:
         for a, b in itertools.combinations_with_replacement(
             range(len(case_a)), 2
         ):
-            self._compare_equal(case_a[a], case_b[b], compare_values)
+            self._compare_equal(
+                case_a[a], case_b[b], compare_values=compare_values
+            )
+
+
+class CacheKeySuite(CacheKeyFixture):
+    @classmethod
+    def run_suite_tests(cls, fn):
+        def decorate(self):
+            self._run_cache_key_fixture(fn(self), compare_values=False)
+            self._run_compare_fixture(fn(self), compare_values=False)
+
+        decorate.__name__ = fn.__name__
+        return decorate
 
 
 def insertmanyvalues_fixture(
@@ -480,3 +513,26 @@ def insertmanyvalues_fixture(
             return orig_conn(dialect, context)
 
     connection._exec_insertmany_context = _exec_insertmany_context
+
+
+class DistinctOnFixture:
+    @config.fixture(params=["legacy", "new"])
+    def distinct_on_fixture(self, request):
+        from sqlalchemy.dialects.postgresql import distinct_on
+
+        def go(query, *expr):
+            if request.param == "legacy":
+                if expr:
+                    with expect_deprecated(
+                        "Passing expression to ``distinct`` to generate a "
+                        "DISTINCT "
+                        "ON clause is deprecated. Use instead the "
+                        "``postgresql.distinct_on`` function as an extension."
+                    ):
+                        return query.distinct(*expr)
+                else:
+                    return query.distinct()
+            elif request.param == "new":
+                return query.ext(distinct_on(*expr))
+
+        return go

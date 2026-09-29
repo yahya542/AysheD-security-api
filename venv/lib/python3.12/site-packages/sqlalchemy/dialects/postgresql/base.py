@@ -114,6 +114,47 @@ The CREATE TABLE for the above :class:`_schema.Table` object would be:
            PRIMARY KEY (id)
        )
 
+.. _postgresql_monotonic_functions:
+
+PostgreSQL 18 and above UUID with uuidv7 as a server default
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+PostgreSQL 18's ``uuidv7`` SQL function is available as any other
+SQL function using the :data:`_sql.func` namespace::
+
+    >>> from sqlalchemy import select, func
+    >>> print(select(func.uuidv7()))
+    SELECT uuidv7() AS uuidv7_1
+
+When using ``func.uuidv7()`` as a default on a :class:`.Column` using either
+Core or ORM, an extra directive ``monotonic=True`` may be passed which
+indicates this function produces monotonically increasing values; this in turn
+allows Core and ORM to use a more efficient batched form of INSERT for large
+insert operations::
+
+    import uuid
+
+
+    class MyClass(Base):
+        __tablename__ = "my_table"
+
+        id: Mapped[uuid.UUID] = mapped_column(
+            server_default=func.uuidv7(monotonic=True)
+        )
+
+With the above mapping, the ORM will be able to efficiently batch rows when
+running bulk insert operations using the :ref:`engine_insertmanyvalues`
+feature.
+
+.. versionadded:: 2.1
+   Added ``monotonic=True`` to allow functions like PostgreSQL's
+   ``uuidv7()`` to work with batched "insertmanyvalues"
+
+.. seealso::
+
+    :ref:`engine_insertmanyvalues_monotonic_functions`
+
+
 .. _postgresql_ss_cursors:
 
 Server Side Cursors
@@ -227,7 +268,8 @@ passing the ``"SERIALIZABLE"`` isolation level at the same time as setting
 Note that some DBAPIs such as asyncpg only support "readonly" with
 SERIALIZABLE isolation.
 
-.. versionadded:: 1.4 added support for the ``postgresql_readonly``
+.. versionadded:: 1.4
+   Added support for the ``postgresql_readonly``
    and ``postgresql_deferrable`` execution options.
 
 .. _postgresql_reset_on_return:
@@ -1002,8 +1044,8 @@ Note that this feature requires PostgreSQL 11 or later.
   :ref:`postgresql_constraint_options_include` - the same feature implemented
   for :class:`.UniqueConstraint`
 
-.. versionadded:: 1.4 - support for covering indexes with :class:`.Index`.
-   support for :class:`.UniqueConstraint` was in 2.0.41
+.. versionadded:: 1.4
+   Support for covering indexes with :class:`.Index`.
 
 .. _postgresql_partial_indexes:
 
@@ -1054,10 +1096,6 @@ Operator classes are also supported by the
 :class:`_postgresql.ExcludeConstraint` construct using the
 :paramref:`_postgresql.ExcludeConstraint.ops` parameter. See that parameter for
 details.
-
-.. versionadded:: 1.3.21 added support for operator classes with
-   :class:`_postgresql.ExcludeConstraint`.
-
 
 Index Types
 ^^^^^^^^^^^
@@ -1141,6 +1179,12 @@ construct, the DBAPI's "autocommit" mode must be used::
 PostgreSQL Index Reflection
 ---------------------------
 
+Notes on Index reflection
+
+
+Implicit UNIQUE index for UNIQUE CONSTRAINT
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 The PostgreSQL database creates a UNIQUE INDEX implicitly whenever the
 UNIQUE CONSTRAINT construct is used.   When inspecting a table using
 :class:`_reflection.Inspector`, the :meth:`_reflection.Inspector.get_indexes`
@@ -1151,8 +1195,38 @@ two constructs distinctly; in the case of the index, the key
 detected as mirroring a constraint.   When performing reflection using
 ``Table(..., autoload_with=engine)``, the UNIQUE INDEX is **not** returned
 in :attr:`_schema.Table.indexes` when it is detected as mirroring a
-:class:`.UniqueConstraint` in the :attr:`_schema.Table.constraints` collection
-.
+:class:`.UniqueConstraint` in the :attr:`_schema.Table.constraints` collection.
+
+.. _postgresql_invalid_index_reflection:
+
+Invalid indexes
+^^^^^^^^^^^^^^^
+
+Indexes marked "invalid" by PostgreSQL (i.e. an index that exists in the
+catalog, but is ignored by the query planner because it may be incomplete,
+while still being maintained on writes) remain present in reflection. The
+:meth:`_reflection.Inspector.get_indexes` and
+:meth:`_reflection.Inspector.get_multi_indexes` methods include
+``postgresql_invalid=True`` in the index's ``dialect_options`` dictionary when
+``pg_index.indisvalid`` is false. Valid indexes omit this flag.
+
+When reflecting a :class:`_schema.Table`, the flag, if present, is stored
+separately from DDL options on each reflected :class:`.Index`::
+
+    table = Table("my_table", MetaData(), autoload_with=engine)
+    for index in table.indexes:
+        if index.reflect_only_elements["postgresql"].get("invalid"):
+            print(index.name)
+
+The :attr:`.Index.reflect_only_elements` mapping is read-only. These values are
+not included in :attr:`.Index.dialect_kwargs` and do not affect DDL.
+
+An invalid index may be left by a failed ``CREATE INDEX CONCURRENTLY``, may
+still be building, or may be a partitioned index awaiting attachment of its
+partition indexes. This flag reports the state at reflection time; it does not
+request an index rebuild.
+
+.. versionadded:: 2.1
 
 Special Reflection Options
 --------------------------
@@ -1177,8 +1251,8 @@ PostgreSQL Table Options
 ------------------------
 
 Several options for CREATE TABLE are supported directly by the PostgreSQL
-dialect in conjunction with the :class:`_schema.Table` construct, listed in
-the following sections.
+dialect in conjunction with the :class:`_schema.Table` construct, detailed
+in the following sections.
 
 .. seealso::
 
@@ -1289,6 +1363,58 @@ Specifies the table access method to use for storing table data, such as
 
 .. versionadded:: 2.0.26
 
+.. _postgresql_table_options_with:
+
+``WITH``
+^^^^^^^^
+
+::
+
+    Table("some_table", metadata, ..., postgresql_with={"fillfactor": 100})
+
+The ``postgresql_with`` parameter accepts a dictionary of storage parameters
+that will be applied to the table using the ``WITH`` clause in the
+``CREATE TABLE`` statement. Storage parameters control various aspects of
+table behavior such as the fill factor for pages, autovacuum settings, and
+toast table parameters.
+
+When the table is created, the parameters are rendered as a comma-separated
+list within the ``WITH`` clause. For example::
+
+    Table(
+        "mytable",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        postgresql_with={
+            "fillfactor": 70,
+            "autovacuum_enabled": False,
+            "toast.vacuum_truncate": True,
+        },
+    )
+
+This will generate DDL similar to:
+
+.. sourcecode:: sql
+
+    CREATE TABLE mytable (
+        id INTEGER NOT NULL,
+        PRIMARY KEY (id)
+    ) WITH (fillfactor = 70, autovacuum_enabled = false, toast.vacuum_truncate = true)
+
+The values in the dictionary can be integers, strings, boolean values, or
+``None``. Boolean values are rendered as lowercase ``true``/``false``.
+A ``None`` value renders the parameter name only, without an ``=`` value.
+Parameter names can include dots to specify parameters for associated objects
+like toast tables (e.g., ``toast.vacuum_truncate``).
+
+.. seealso::
+
+    `PostgreSQL Storage Parameters
+    <https://www.postgresql.org/docs/current/sql-createtable.html#SQL-CREATETABLE-STORAGE-PARAMETERS>`_ -
+    documentation on available storage parameters.
+
+.. versionadded:: 2.1
+
 ``WITH OIDS``
 ^^^^^^^^^^^^^
 
@@ -1299,6 +1425,8 @@ assigns a unique identifier to each row.
 
     Table("some_table", metadata, ..., postgresql_with_oids=True)
 
+.. note:: Support for tables "with OIDs" was removed in postgresql 12.
+
 ``WITHOUT OIDS``
 ^^^^^^^^^^^^^^^^
 
@@ -1308,6 +1436,40 @@ in modern PostgreSQL versions).
 ::
 
     Table("some_table", metadata, ..., postgresql_with_oids=False)
+
+.. _postgresql_view_options:
+
+PostgreSQL View Options
+-----------------------
+
+The following sections indicate options which are supported by the PostgreSQL
+dialect in conjunction with :class:`.CreateView`.
+
+``WITH``
+^^^^^^^^
+
+Specifies view-level options for :class:`.CreateView` using the ``WITH``
+clause::
+
+    from sqlalchemy import CreateView, select
+
+    CreateView(
+        select(my_table),
+        "my_view",
+        postgresql_with={"security_invoker": True},
+    )
+
+This generates:
+
+.. sourcecode:: sql
+
+    CREATE VIEW my_view WITH (security_invoker = true) AS SELECT ...
+
+The same formatting rules that apply to :ref:`postgresql_table_options_with`
+apply here: booleans render as lowercase ``true``/``false``, ``None``
+renders as the parameter name only, and other values render as-is.
+
+.. versionadded:: 2.1
 
 .. _postgresql_constraint_options:
 
@@ -1395,9 +1557,9 @@ would produce the DDL statement
 
 Note that this feature requires PostgreSQL 11 or later.
 
-.. versionadded:: 2.0.41 - added support for ``postgresql_include`` to
-   :class:`.UniqueConstraint`, to complement the existing feature in
-   :class:`.Index`.
+.. versionadded:: 2.0.41
+   Added support for ``postgresql_include`` to :class:`.UniqueConstraint`,
+   to complement the existing feature in :class:`.Index`.
 
 .. seealso::
 
@@ -1430,6 +1592,54 @@ that are subject to the action::
       )
 
 .. versionadded:: 2.0.40
+
+.. _postgresql_computed_column_notes:
+
+Computed Columns (GENERATED ALWAYS AS)
+---------------------------------------
+
+SQLAlchemy's support for the "GENERATED ALWAYS AS" SQL instruction, which
+establishes a dynamic, automatically populated value for a column, is available
+using the :ref:`computed_ddl` feature of SQLAlchemy DDL.   E.g.::
+
+    from sqlalchemy import Table, Column, MetaData, Integer, Computed
+
+    metadata_obj = MetaData()
+
+    square = Table(
+        "square",
+        metadata_obj,
+        Column("id", Integer, primary_key=True),
+        Column("side", Integer),
+        Column("area", Integer, Computed("side * side")),
+        Column("perimeter", Integer, Computed("4 * side", persisted=True)),
+    )
+
+There are two general varieties of the "computed" column, ``VIRTUAL`` and ``STORED``.
+A ``STORED`` computed column computes and persists its value at INSERT/UPDATE time,
+while a ``VIRTUAL`` computed column computes its value on access without persisting it.
+This preference is indicated using the :paramref:`.Computed.persisted` parameter,
+which defaults to ``None`` to use the database default behavior.
+
+For PostgreSQL, prior to version 18 only the ``STORED`` variant was supported,
+requiring the ``STORED`` keyword to be emitted explicitly. PostgreSQL 18 added
+support for ``VIRTUAL`` columns and made ``VIRTUAL`` the default behavior.
+
+To accommodate this change, SQLAlchemy's behavior when
+:paramref:`.Computed.persisted` is not specified depends on the PostgreSQL
+version: on PostgreSQL 18 and later, no keyword is rendered, allowing the
+database to use its default of ``VIRTUAL``; on PostgreSQL 17 and earlier,
+``STORED`` is rendered and a warning is emitted. To ensure consistent
+``STORED`` behavior across all PostgreSQL versions, explicitly set
+``persisted=True``.
+
+.. versionchanged:: 2.1
+
+   PostgreSQL 18+ now defaults to ``VIRTUAL`` when :paramref:`.Computed.persisted`
+   is not specified.  A warning is emitted for older versions of PostgreSQL
+   when this parameter is not indicated.
+
+
 
 
 ``NULLS NOT DISTINCT``
@@ -1663,6 +1873,36 @@ itself:
 .. versionadded:: 1.4.0b2
 
 
+.. _postgresql_collation:
+
+Schema-Qualified Collations
+----------------------------
+
+PostgreSQL supports collations that are qualified by a schema name, such as
+``CREATE COLLATION my_schema.my_collation (...)``.  To refer to such a
+collation, use the :paramref:`.String.collation_schema` parameter (or
+:paramref:`_postgresql.DOMAIN.collation_schema` for a :class:`_postgresql.DOMAIN`)
+in conjunction with :paramref:`.String.collation`, rather than attempting to
+embed the schema name inside the ``collation`` string itself::
+
+    Column(
+        "data",
+        String(collation="my_collation", collation_schema="my_schema"),
+    )
+
+The above renders DDL similar to:
+
+.. sourcecode:: sql
+
+    data VARCHAR COLLATE "my_schema"."my_collation"
+
+.. versionadded:: 2.1
+
+.. seealso::
+
+    :paramref:`.String.collation`
+
+    :paramref:`.String.collation_schema`
 
 """  # noqa: E501
 
@@ -1678,6 +1918,7 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 from typing import TYPE_CHECKING
+from typing import TypedDict
 from typing import Union
 
 from . import arraylib as _array
@@ -1741,6 +1982,7 @@ from ...sql import functions
 from ...sql import roles
 from ...sql import sqltypes
 from ...sql import util as sql_util
+from ...sql.base import DialectKWArgConst
 from ...sql.compiler import InsertmanyvaluesSentinelOpts
 from ...sql.visitors import InternalTraversal
 from ...types import BIGINT
@@ -1756,7 +1998,6 @@ from ...types import SMALLINT
 from ...types import TEXT
 from ...types import UUID as UUID
 from ...types import VARCHAR
-from ...util.typing import TypedDict
 
 IDX_USING = re.compile(r"^(?:btree|hash|gist|gin|[\w_]+)$", re.I)
 
@@ -2044,6 +2285,23 @@ class PGCompiler(compiler.SQLCompiler):
             binary, " #> " if not _cast_applied else " #>> ", **kw
         )
 
+    def visit_hstore_getitem_op_binary(self, binary, operator, **kw):
+        kw["eager_grouping"] = True
+
+        if self.dialect._supports_jsonb_subscripting:
+            # use subscript notation: col['key'] instead of col -> 'key'
+            # For function calls, wrap in parentheses: (func())[key]
+            left_str = self.process(binary.left, **kw)
+            if isinstance(binary.left, sql.functions.FunctionElement):
+                left_str = f"({left_str})"
+            return "%s[%s]" % (
+                left_str,
+                self.process(binary.right, **kw),
+            )
+        else:
+            # Fall back to arrow notation for older versions
+            return self._generate_generic_binary(binary, " -> ", **kw)
+
     def visit_getitem_binary(self, binary, operator, **kw):
         return "%s[%s]" % (
             self.process(binary.left, **kw),
@@ -2159,7 +2417,12 @@ class PGCompiler(compiler.SQLCompiler):
         return value
 
     def visit_aggregate_strings_func(self, fn, **kw):
-        return "string_agg%s" % self.function_argspec(fn)
+        return super().visit_aggregate_strings_func(
+            fn, use_function_name="string_agg", **kw
+        )
+
+    def visit_pow_func(self, fn, **kw):
+        return f"power{self.function_argspec(fn)}"
 
     def visit_sequence(self, seq, **kw):
         return "nextval(%s)" % self.preparer._format_sequence_string_literal(
@@ -2200,6 +2463,21 @@ class PGCompiler(compiler.SQLCompiler):
                 return "DISTINCT "
         else:
             return ""
+
+    def visit_postgresql_distinct_on(self, element, **kw):
+        if self.stack[-1]["selectable"]._distinct_on:
+            raise exc.CompileError(
+                "Cannot mix ``select.ext(distinct_on(...))`` and "
+                "``select.distinct(...)``"
+            )
+
+        if element._distinct_on:
+            cols = ", ".join(
+                self.process(col, **kw) for col in element._distinct_on
+            )
+            return f"ON ({cols})"
+        else:
+            return None
 
     def for_update_clause(self, select, **kw):
         if select._for_update_arg.read:
@@ -2305,18 +2583,13 @@ class PGCompiler(compiler.SQLCompiler):
             else:
                 continue
 
-            # TODO: this coercion should be up front.  we can't cache
-            # SQL constructs with non-bound literals buried in them
-            if coercions._is_literal(value):
-                value = elements.BindParameter(None, value, type_=c.type)
+            assert not coercions._is_literal(value)
+            if (
+                isinstance(value, elements.BindParameter)
+                and value.type._isnull
+            ):
+                value = value._with_binary_element_type(c.type)
 
-            else:
-                if (
-                    isinstance(value, elements.BindParameter)
-                    and value.type._isnull
-                ):
-                    value = value._clone()
-                    value.type = c.type
             value_text = self.process(
                 value.self_group(), is_upsert_set=True, **set_kw
             )
@@ -2542,7 +2815,10 @@ class PGDDLCompiler(compiler.DDLCompiler):
 
         options = []
         if domain.collation is not None:
-            options.append(f"COLLATE {self.preparer.quote(domain.collation)}")
+            collation = self.preparer.format_collation(
+                domain.collation, domain.collation_schema
+            )
+            options.append(f"COLLATE {collation}")
         if domain.default is not None:
             default = self.render_default_string(domain.default)
             options.append(f"DEFAULT {default}")
@@ -2568,6 +2844,26 @@ class PGDDLCompiler(compiler.DDLCompiler):
     def visit_drop_domain_type(self, drop, **kw):
         domain = drop.element
         return f"DROP DOMAIN {self.preparer.format_type(domain)}"
+
+    def _prepare_withclause_opts(self, withclause):
+        with_opts = []
+        for param, value in withclause.items():
+            if value is None:
+                with_opts.append(param)
+            elif isinstance(value, bool):
+                with_opts.append(
+                    "%s = %s" % (param, "true" if value else "false")
+                )
+            else:
+                with_opts.append("%s = %s" % (param, value))
+        return ", ".join(with_opts)
+
+    def create_table_select_suffixes(self, element, type_, **kw):
+        if type_ == "view":
+            withclause = element.dialect_options["postgresql"]["with"]
+            if withclause:
+                return "WITH (%s)" % self._prepare_withclause_opts(withclause)
+        return ""
 
     def visit_create_index(self, create, **kw):
         preparer = self.preparer
@@ -2634,14 +2930,7 @@ class PGDDLCompiler(compiler.DDLCompiler):
 
         withclause = index.dialect_options["postgresql"]["with"]
         if withclause:
-            text += " WITH (%s)" % (
-                ", ".join(
-                    [
-                        "%s = %s" % storage_parameter
-                        for storage_parameter in withclause.items()
-                    ]
-                )
-            )
+            text += " WITH (%s)" % self._prepare_withclause_opts(withclause)
 
         tablespace_name = index.dialect_options["postgresql"]["tablespace"]
         if tablespace_name:
@@ -2727,9 +3016,9 @@ class PGDDLCompiler(compiler.DDLCompiler):
             if not isinstance(inherits, (list, tuple)):
                 inherits = (inherits,)
             table_opts.append(
-                "\n INHERITS ( "
+                "\n INHERITS ("
                 + ", ".join(self.preparer.quote(name) for name in inherits)
-                + " )"
+                + ")"
             )
 
         if pg_opts["partition_by"]:
@@ -2737,6 +3026,11 @@ class PGDDLCompiler(compiler.DDLCompiler):
 
         if pg_opts["using"]:
             table_opts.append("\n USING %s" % pg_opts["using"])
+
+        if pg_opts["with"]:
+            table_opts.append(
+                "\n WITH (%s)" % self._prepare_withclause_opts(pg_opts["with"])
+            )
 
         if pg_opts["with_oids"] is True:
             table_opts.append("\n WITH OIDS")
@@ -2756,11 +3050,23 @@ class PGDDLCompiler(compiler.DDLCompiler):
         return "".join(table_opts)
 
     def visit_computed_column(self, generated, **kw):
+        if self.dialect.supports_virtual_generated_columns:
+            return super().visit_computed_column(generated, **kw)
         if generated.persisted is False:
             raise exc.CompileError(
                 "PostrgreSQL computed columns do not support 'virtual' "
                 "persistence; set the 'persisted' flag to None or True for "
                 "PostgreSQL support."
+            )
+        elif generated.persisted is None:
+            util.warn(
+                f"Computed column {generated.column} is being created as "
+                "'STORED' since the current PostgreSQL version does not "
+                "support VIRTUAL columns. On PostgreSQL 18+, when "
+                "'persisted' is not "
+                "specified, no keyword will be rendered and VIRTUAL will be "
+                "used by default. Set 'persisted=True' to ensure STORED "
+                "behavior across all PostgreSQL versions."
             )
 
         return "GENERATED ALWAYS AS (%s) STORED" % self.sql_compiler.process(
@@ -3050,6 +3356,22 @@ class PGIdentifierPreparer(compiler.IdentifierPreparer):
         name = self.quote(type_.name)
         effective_schema = self.schema_for_object(type_)
 
+        # a built-in type with the same name will obscure this type, so raise
+        # for that case.  this applies really to any visible type with the same
+        # name in any other visible schema that would not be appropriate for
+        # us to check against, so this is not a robust check, but
+        # at least do something for an obvious built-in name conflict
+        if (
+            effective_schema is None
+            and type_.name in self.dialect.ischema_names
+        ):
+            raise exc.CompileError(
+                f"{type_!r} has name "
+                f"'{type_.name}' that matches an existing type, and "
+                "requires an explicit schema name in order to be rendered "
+                "in DDL."
+            )
+
         if (
             not self.omit_schema
             and use_schema
@@ -3096,6 +3418,9 @@ class ReflectedDomain(ReflectedNamedType):
     """
     collation: Optional[str]
     """The collation for the domain."""
+    collation_schema: Optional[str]
+    """The schema of the collation for the domain, if the collation is not
+    visible on the current search_path."""
 
 
 class ReflectedEnum(ReflectedNamedType):
@@ -3299,7 +3624,7 @@ class PGDeferrableConnectionCharacteristic(
         return dialect.get_deferrable(dbapi_conn)
 
 
-class PGDialect(default.DefaultDialect):
+class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
     name = "postgresql"
     supports_statement_cache = True
     supports_alter = True
@@ -3312,6 +3637,7 @@ class PGDialect(default.DefaultDialect):
     supports_native_boolean = True
     supports_native_uuid = True
     supports_smallserial = True
+    supports_virtual_generated_columns = True
 
     supports_sequences = True
     sequences_optional = True
@@ -3377,6 +3703,7 @@ class PGDialect(default.DefaultDialect):
                 "with": {},
                 "tablespace": None,
                 "nulls_not_distinct": None,
+                "invalid": DialectKWArgConst.REFLECTED_ONLY,
             },
         ),
         (
@@ -3386,6 +3713,7 @@ class PGDialect(default.DefaultDialect):
                 "tablespace": None,
                 "partition_by": None,
                 "with_oids": None,
+                "with": None,
                 "on_commit": None,
                 "inherits": None,
                 "using": None,
@@ -3414,14 +3742,21 @@ class PGDialect(default.DefaultDialect):
                 "nulls_not_distinct": None,
             },
         ),
+        (
+            schema.CreateView,
+            {
+                "with": None,
+            },
+        ),
     ]
 
     reflection_options = ("postgresql_ignore_search_path",)
 
-    _backslash_escapes = True
+    _backslash_escapes = False
     _supports_create_index_concurrently = True
     _supports_drop_index_concurrently = True
     _supports_jsonb_subscripting = True
+    _pg_am_btree_oid = -1
 
     def __init__(
         self,
@@ -3451,6 +3786,10 @@ class PGDialect(default.DefaultDialect):
         self.supports_identity_columns = self.server_version_info >= (10,)
 
         self._supports_jsonb_subscripting = self.server_version_info >= (14,)
+
+        self.supports_virtual_generated_columns = self.server_version_info >= (
+            18,
+        )
 
     def get_isolation_level_values(self, dbapi_conn):
         # note the generic dialect doesn't have AUTOCOMMIT, however
@@ -3668,9 +4007,11 @@ class PGDialect(default.DefaultDialect):
         return pg_class_table.c.relkind == sql.any_(_array.array(relkinds))
 
     @lru_cache()
-    def _has_table_query(self, schema):
+    def _has_multi_table_query(self, schema):
         query = select(pg_catalog.pg_class.c.relname).where(
-            pg_catalog.pg_class.c.relname == bindparam("table_name"),
+            pg_catalog.pg_class.c.relname.in_(
+                bindparam("table_names", expanding=True)
+            ),
             self._pg_class_relkind_condition(
                 pg_catalog.RELKINDS_ALL_TABLE_LIKE
             ),
@@ -3681,9 +4022,18 @@ class PGDialect(default.DefaultDialect):
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kw):
+        # NOTE: it's not worth calling into the multi table since the query
+        # is compatible also with this single case.
         self._ensure_has_table_connection(connection)
-        query = self._has_table_query(schema)
-        return bool(connection.scalar(query, {"table_name": table_name}))
+        query = self._has_multi_table_query(schema)
+        return bool(connection.scalar(query, {"table_names": [table_name]}))
+
+    def has_multi_table(self, connection, table_names, schema=None, **kw):
+        query = self._has_multi_table_query(schema)
+        params = {"table_names": table_names}
+        existing = set(connection.scalars(query, params).all())
+        retval = {(schema, table): table in existing for table in table_names}
+        return retval.items()
 
     @reflection.cache
     def has_sequence(self, connection, sequence_name, schema=None, **kw):
@@ -3852,14 +4202,6 @@ class PGDialect(default.DefaultDialect):
         else:
             return res
 
-    def _value_or_raise(self, data, table, schema):
-        try:
-            return dict(data)[(schema, table)]
-        except KeyError:
-            raise exc.NoSuchTableError(
-                f"{schema}.{table}" if schema else table
-            ) from None
-
     def _prepare_filter_names(self, filter_names):
         if filter_names:
             return True, {"filter_names": filter_names}
@@ -3878,17 +4220,117 @@ class PGDialect(default.DefaultDialect):
             relkinds += pg_catalog.RELKINDS_MAT_VIEW
         return relkinds
 
-    @reflection.cache
-    def get_columns(self, connection, table_name, schema=None, **kw):
-        data = self.get_multi_columns(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
+    @lru_cache()
+    def _table_options_query(self, schema, has_filter_names, scope, kind):
+        inherits_sq = (
+            select(
+                pg_catalog.pg_inherits.c.inhrelid,
+                sql.func.array_agg(
+                    aggregate_order_by(
+                        pg_catalog.pg_class.c.relname,
+                        pg_catalog.pg_inherits.c.inhseqno,
+                    )
+                ).label("parent_table_names"),
+            )
+            .select_from(pg_catalog.pg_inherits)
+            .join(
+                pg_catalog.pg_class,
+                pg_catalog.pg_inherits.c.inhparent
+                == pg_catalog.pg_class.c.oid,
+            )
+            .group_by(pg_catalog.pg_inherits.c.inhrelid)
+            .subquery("inherits")
         )
-        return self._value_or_raise(data, table_name, schema)
+
+        if self.server_version_info < (12,):
+            # this is not in the pg_catalog.pg_class since it was
+            # removed in PostgreSQL version 12
+            has_oids = sql.column("relhasoids", BOOLEAN)
+        else:
+            has_oids = sql.null().label("relhasoids")
+
+        relkinds = self._kind_to_relkinds(kind)
+        query = (
+            select(
+                pg_catalog.pg_class.c.oid,
+                pg_catalog.pg_class.c.relname,
+                pg_catalog.pg_class.c.reloptions,
+                has_oids,
+                sql.case(
+                    (
+                        sql.and_(
+                            pg_catalog.pg_am.c.amname.is_not(None),
+                            pg_catalog.pg_am.c.amname
+                            != sql.func.current_setting(
+                                "default_table_access_method"
+                            ),
+                        ),
+                        pg_catalog.pg_am.c.amname,
+                    ),
+                    else_=sql.null(),
+                ).label("access_method_name"),
+                pg_catalog.pg_tablespace.c.spcname.label("tablespace_name"),
+                inherits_sq.c.parent_table_names,
+            )
+            .select_from(pg_catalog.pg_class)
+            .outerjoin(
+                # NOTE: on postgresql < 12, this could be avoided
+                # since relam is always 0 so nothing is joined.
+                pg_catalog.pg_am,
+                pg_catalog.pg_class.c.relam == pg_catalog.pg_am.c.oid,
+            )
+            .outerjoin(
+                inherits_sq,
+                pg_catalog.pg_class.c.oid == inherits_sq.c.inhrelid,
+            )
+            .outerjoin(
+                pg_catalog.pg_tablespace,
+                pg_catalog.pg_tablespace.c.oid
+                == pg_catalog.pg_class.c.reltablespace,
+            )
+            .where(self._pg_class_relkind_condition(relkinds))
+        )
+        query = self._pg_class_filter_scope_schema(query, schema, scope=scope)
+        if has_filter_names:
+            query = query.where(
+                pg_catalog.pg_class.c.relname.in_(bindparam("filter_names"))
+            )
+        return query
+
+    def get_multi_table_options(
+        self, connection, schema, filter_names, scope, kind, **kw
+    ):
+        has_filter_names, params = self._prepare_filter_names(filter_names)
+        query = self._table_options_query(
+            schema, has_filter_names, scope, kind
+        )
+        rows = connection.execute(query, params).mappings()
+        table_options = {}
+
+        for row in rows:
+            current: dict[str, Any] = {}
+            if row["access_method_name"] is not None:
+                current["postgresql_using"] = row["access_method_name"]
+
+            if row["parent_table_names"]:
+                current["postgresql_inherits"] = tuple(
+                    row["parent_table_names"]
+                )
+
+            if row["reloptions"]:
+                current["postgresql_with"] = dict(
+                    option.split("=", 1) for option in row["reloptions"]
+                )
+
+            if row["relhasoids"]:
+                current["postgresql_with_oids"] = True
+
+            if row["tablespace_name"] is not None:
+                current["postgresql_tablespace"] = row["tablespace_name"]
+
+            table_options[(schema, row["relname"])] = current
+
+        return table_options.items()
 
     @lru_cache()
     def _columns_query(self, schema, has_filter_names, scope, kind):
@@ -3901,78 +4343,89 @@ class PGDialect(default.DefaultDialect):
         )
         if self.server_version_info >= (10,):
             # join lateral performs worse (~2x slower) than a scalar_subquery
-            identity = (
-                select(
-                    sql.func.json_build_object(
-                        "always",
-                        pg_catalog.pg_attribute.c.attidentity == "a",
-                        "start",
-                        pg_catalog.pg_sequence.c.seqstart,
-                        "increment",
-                        pg_catalog.pg_sequence.c.seqincrement,
-                        "minvalue",
-                        pg_catalog.pg_sequence.c.seqmin,
-                        "maxvalue",
-                        pg_catalog.pg_sequence.c.seqmax,
-                        "cache",
-                        pg_catalog.pg_sequence.c.seqcache,
-                        "cycle",
-                        pg_catalog.pg_sequence.c.seqcycle,
-                        type_=sqltypes.JSON(),
-                    )
-                )
-                .select_from(pg_catalog.pg_sequence)
-                .where(
-                    # attidentity != '' is required or it will reflect also
+            # also the subquery can be run only if the column is an identity
+            identity = sql.case(
+                (  # attidentity != '' is required or it will reflect also
                     # serial columns as identity.
                     pg_catalog.pg_attribute.c.attidentity != "",
-                    pg_catalog.pg_sequence.c.seqrelid
-                    == sql.cast(
-                        sql.cast(
-                            pg_catalog.pg_get_serial_sequence(
-                                sql.cast(
+                    select(
+                        sql.func.json_build_object(
+                            "always",
+                            pg_catalog.pg_attribute.c.attidentity == "a",
+                            "start",
+                            pg_catalog.pg_sequence.c.seqstart,
+                            "increment",
+                            pg_catalog.pg_sequence.c.seqincrement,
+                            "minvalue",
+                            pg_catalog.pg_sequence.c.seqmin,
+                            "maxvalue",
+                            pg_catalog.pg_sequence.c.seqmax,
+                            "cache",
+                            pg_catalog.pg_sequence.c.seqcache,
+                            "cycle",
+                            pg_catalog.pg_sequence.c.seqcycle,
+                            type_=sqltypes.JSON(),
+                        )
+                    )
+                    .select_from(pg_catalog.pg_sequence)
+                    .where(
+                        # not needed but pg seems to like it
+                        pg_catalog.pg_attribute.c.attidentity != "",
+                        pg_catalog.pg_sequence.c.seqrelid
+                        == sql.cast(
+                            sql.cast(
+                                pg_catalog.pg_get_serial_sequence(
                                     sql.cast(
-                                        pg_catalog.pg_attribute.c.attrelid,
-                                        REGCLASS,
+                                        sql.cast(
+                                            pg_catalog.pg_attribute.c.attrelid,
+                                            REGCLASS,
+                                        ),
+                                        TEXT,
                                     ),
-                                    TEXT,
+                                    pg_catalog.pg_attribute.c.attname,
                                 ),
-                                pg_catalog.pg_attribute.c.attname,
+                                REGCLASS,
                             ),
-                            REGCLASS,
+                            OID,
                         ),
-                        OID,
-                    ),
-                )
-                .correlate(pg_catalog.pg_attribute)
-                .scalar_subquery()
-                .label("identity_options")
-            )
+                    )
+                    .correlate(pg_catalog.pg_attribute)
+                    .scalar_subquery(),
+                ),
+                else_=sql.null(),
+            ).label("identity_options")
         else:
             identity = sql.null().label("identity_options")
 
-        # join lateral performs the same as scalar_subquery here
-        default = (
-            select(
-                pg_catalog.pg_get_expr(
-                    pg_catalog.pg_attrdef.c.adbin,
-                    pg_catalog.pg_attrdef.c.adrelid,
-                )
-            )
-            .select_from(pg_catalog.pg_attrdef)
-            .where(
-                pg_catalog.pg_attrdef.c.adrelid
-                == pg_catalog.pg_attribute.c.attrelid,
-                pg_catalog.pg_attrdef.c.adnum
-                == pg_catalog.pg_attribute.c.attnum,
+        # join lateral performs the same as scalar_subquery here, also
+        # the subquery can be run only if the column has a default
+        default = sql.case(
+            (
                 pg_catalog.pg_attribute.c.atthasdef,
-            )
-            .correlate(pg_catalog.pg_attribute)
-            .scalar_subquery()
-            .label("default")
-        )
+                select(
+                    pg_catalog.pg_get_expr(
+                        pg_catalog.pg_attrdef.c.adbin,
+                        pg_catalog.pg_attrdef.c.adrelid,
+                    )
+                )
+                .select_from(pg_catalog.pg_attrdef)
+                .where(
+                    # not needed but pg seems to like it
+                    pg_catalog.pg_attribute.c.atthasdef,
+                    pg_catalog.pg_attrdef.c.adrelid
+                    == pg_catalog.pg_attribute.c.attrelid,
+                    pg_catalog.pg_attrdef.c.adnum
+                    == pg_catalog.pg_attribute.c.attnum,
+                )
+                .correlate(pg_catalog.pg_attribute)
+                .scalar_subquery(),
+            ),
+            else_=sql.null(),
+        ).label("default")
 
-        # get the name of the collate when it's different from the default one
+        # get the name and schema of the collate when it's different from
+        # the default one; the schema is only included when the collation
+        # is not visible on the current search_path
         collate = sql.case(
             (
                 sql.and_(
@@ -3986,7 +4439,29 @@ class PGDialect(default.DefaultDialect):
                     .scalar_subquery()
                     != pg_catalog.pg_attribute.c.attcollation,
                 ),
-                select(pg_catalog.pg_collation.c.collname)
+                select(
+                    sql.func.json_build_object(
+                        "name",
+                        pg_catalog.pg_collation.c.collname,
+                        "schema",
+                        sql.case(
+                            (
+                                pg_catalog.pg_collation_is_visible(
+                                    pg_catalog.pg_collation.c.oid
+                                ),
+                                sql.null(),
+                            ),
+                            else_=pg_catalog.pg_namespace.c.nspname,
+                        ),
+                        type_=sqltypes.JSON(),
+                    )
+                )
+                .select_from(pg_catalog.pg_collation)
+                .join(
+                    pg_catalog.pg_namespace,
+                    pg_catalog.pg_namespace.c.oid
+                    == pg_catalog.pg_collation.c.collnamespace,
+                )
                 .where(
                     pg_catalog.pg_collation.c.oid
                     == pg_catalog.pg_attribute.c.attcollation
@@ -4054,29 +4529,8 @@ class PGDialect(default.DefaultDialect):
         query = self._columns_query(schema, has_filter_names, scope, kind)
         rows = connection.execute(query, params).mappings()
 
-        # dictionary with (name, ) if default search path or (schema, name)
-        # as keys
-        domains = {
-            ((d["schema"], d["name"]) if not d["visible"] else (d["name"],)): d
-            for d in self._load_domains(
-                connection, schema="*", info_cache=kw.get("info_cache")
-            )
-        }
-
-        # dictionary with (name, ) if default search path or (schema, name)
-        # as keys
-        enums = dict(
-            (
-                ((rec["name"],), rec)
-                if rec["visible"]
-                else ((rec["schema"], rec["name"]), rec)
-            )
-            for rec in self._load_enums(
-                connection, schema="*", info_cache=kw.get("info_cache")
-            )
-        )
-
-        columns = self._get_columns_info(rows, domains, enums, schema)
+        named_type_loader = _NamedTypeLoader(self, connection, kw)
+        columns = self._get_columns_info(rows, named_type_loader, schema)
 
         return columns.items()
 
@@ -4087,10 +4541,10 @@ class PGDialect(default.DefaultDialect):
     def _reflect_type(
         self,
         format_type: Optional[str],
-        domains: Dict[str, ReflectedDomain],
-        enums: Dict[str, ReflectedEnum],
+        named_type_loader: _NamedTypeLoader,
         type_description: str,
         collation: Optional[str],
+        collation_schema: Optional[str] = None,
     ) -> sqltypes.TypeEngine[Any]:
         """
         Attempts to reconstruct a column type defined in ischema_names based
@@ -4173,29 +4627,36 @@ class PGDialect(default.DefaultDialect):
         else:
             enum_or_domain_key = tuple(util.quoted_token_parser(attype))
 
-            if enum_or_domain_key in enums:
+            if (
+                schema_type is None
+                and enum_or_domain_key in named_type_loader.enums
+            ):
                 schema_type = ENUM
-                enum = enums[enum_or_domain_key]
+                enum = named_type_loader.enums[enum_or_domain_key]
 
                 kwargs["name"] = enum["name"]
 
                 if not enum["visible"]:
                     kwargs["schema"] = enum["schema"]
                 args = tuple(enum["labels"])
-            elif enum_or_domain_key in domains:
+            elif (
+                schema_type is None
+                and enum_or_domain_key in named_type_loader.domains
+            ):
                 schema_type = DOMAIN
-                domain = domains[enum_or_domain_key]
+                domain = named_type_loader.domains[enum_or_domain_key]
 
                 data_type = self._reflect_type(
                     domain["type"],
-                    domains,
-                    enums,
+                    named_type_loader,
                     type_description="DOMAIN '%s'" % domain["name"],
                     collation=domain["collation"],
+                    collation_schema=domain["collation_schema"],
                 )
                 args = (domain["name"], data_type)
 
                 kwargs["collation"] = domain["collation"]
+                kwargs["collation_schema"] = domain["collation_schema"]
                 kwargs["default"] = domain["default"]
                 kwargs["not_null"] = not domain["nullable"]
                 kwargs["create_type"] = False
@@ -4226,6 +4687,8 @@ class PGDialect(default.DefaultDialect):
 
         if collation is not None:
             kwargs["collation"] = collation
+            if collation_schema is not None:
+                kwargs["collation_schema"] = collation_schema
 
         data_type = schema_type(*args, **kwargs)
         if array_dim >= 1:
@@ -4234,7 +4697,7 @@ class PGDialect(default.DefaultDialect):
 
         return data_type
 
-    def _get_columns_info(self, rows, domains, enums, schema):
+    def _get_columns_info(self, rows, named_type_loader, schema):
         columns = defaultdict(list)
         for row_dict in rows:
             # ensure that each table has an entry, even if it has no columns
@@ -4245,14 +4708,19 @@ class PGDialect(default.DefaultDialect):
                 continue
             table_cols = columns[(schema, row_dict["table_name"])]
 
-            collation = row_dict["collation"]
+            collation_info = row_dict["collation"]
+            if collation_info is not None:
+                collation = collation_info["name"]
+                collation_schema = collation_info["schema"]
+            else:
+                collation = collation_schema = None
 
             coltype = self._reflect_type(
                 row_dict["format_type"],
-                domains,
-                enums,
+                named_type_loader,
                 type_description="column '%s'" % row_dict["name"],
                 collation=collation,
+                collation_schema=collation_schema,
             )
 
             default = row_dict["default"]
@@ -4273,8 +4741,7 @@ class PGDialect(default.DefaultDialect):
 
             # If a zero byte or blank string depending on driver (is also
             # absent for older PG versions), then not a generated column.
-            # Otherwise, s = stored. (Other values might be added in the
-            # future.)
+            # Otherwise, s = stored, v = virtual.
             if generated not in (None, "", b"\x00"):
                 computed = dict(
                     sqltext=default, persisted=generated in ("s", b"s")
@@ -4497,18 +4964,6 @@ class PGDialect(default.DefaultDialect):
                 else:
                     yield tablename, None, None, None, None
 
-    @reflection.cache
-    def get_pk_constraint(self, connection, table_name, schema=None, **kw):
-        data = self.get_multi_pk_constraint(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
-
     def get_multi_pk_constraint(
         self, connection, schema, filter_names, scope, kind, **kw
     ):
@@ -4541,26 +4996,6 @@ class PGDialect(default.DefaultDialect):
             )
             for table_name, cols, pk_name, comment, opts in result
         )
-
-    @reflection.cache
-    def get_foreign_keys(
-        self,
-        connection,
-        table_name,
-        schema=None,
-        postgresql_ignore_search_path=False,
-        **kw,
-    ):
-        data = self.get_multi_foreign_keys(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            postgresql_ignore_search_path=postgresql_ignore_search_path,
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     @lru_cache()
     def _foreing_key_query(self, schema, has_filter_names, scope, kind):
@@ -4773,18 +5208,6 @@ class PGDialect(default.DefaultDialect):
             table_fks.append(fkey_d)
         return fkeys.items()
 
-    @reflection.cache
-    def get_indexes(self, connection, table_name, schema=None, **kw):
-        data = self.get_multi_indexes(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
-
     @util.memoized_property
     def _index_query(self):
         # NOTE: pg_index is used as from two times to improve performance,
@@ -4833,8 +5256,10 @@ class PGDialect(default.DefaultDialect):
                     else_=pg_catalog.pg_attribute.c.attname.cast(TEXT),
                 ).label("element"),
                 (idx_sq.c.attnum == 0).label("is_expr"),
-                pg_catalog.pg_opclass.c.opcname,
-                pg_catalog.pg_opclass.c.opcdefault,
+                # since it's converted to array cast it to bigint (oid are
+                # "unsigned four-byte integer") to make it easier for
+                # dialects to interpret
+                idx_sq.c.att_opclass.cast(BIGINT),
             )
             .select_from(idx_sq)
             .outerjoin(
@@ -4844,10 +5269,6 @@ class PGDialect(default.DefaultDialect):
                     pg_catalog.pg_attribute.c.attnum == idx_sq.c.attnum,
                     pg_catalog.pg_attribute.c.attrelid == idx_sq.c.indrelid,
                 ),
-            )
-            .outerjoin(
-                pg_catalog.pg_opclass,
-                pg_catalog.pg_opclass.c.oid == idx_sq.c.att_opclass,
             )
             .where(idx_sq.c.indrelid.in_(bindparam("oids")))
             .subquery("idx_attr")
@@ -4864,11 +5285,8 @@ class PGDialect(default.DefaultDialect):
                     aggregate_order_by(attr_sq.c.is_expr, attr_sq.c.ord)
                 ).label("elements_is_expr"),
                 sql.func.array_agg(
-                    aggregate_order_by(attr_sq.c.opcname, attr_sq.c.ord)
+                    aggregate_order_by(attr_sq.c.att_opclass, attr_sq.c.ord)
                 ).label("elements_opclass"),
-                sql.func.array_agg(
-                    aggregate_order_by(attr_sq.c.opcdefault, attr_sq.c.ord)
-                ).label("elements_opdefault"),
             )
             .group_by(attr_sq.c.indexrelid)
             .subquery("idx_cols")
@@ -4889,12 +5307,14 @@ class PGDialect(default.DefaultDialect):
                 pg_catalog.pg_index.c.indrelid,
                 pg_catalog.pg_class.c.relname,
                 pg_catalog.pg_index.c.indisunique,
+                pg_catalog.pg_index.c.indisvalid,
                 pg_catalog.pg_constraint.c.conrelid.is_not(None).label(
                     "has_constraint"
                 ),
                 pg_catalog.pg_index.c.indoption,
                 pg_catalog.pg_class.c.reloptions,
-                pg_catalog.pg_am.c.amname,
+                # will get the value using the pg_am cached dict
+                pg_catalog.pg_class.c.relam,
                 # NOTE: pg_get_expr is very fast so this case has almost no
                 # performance impact
                 sql.case(
@@ -4911,8 +5331,8 @@ class PGDialect(default.DefaultDialect):
                 nulls_not_distinct,
                 cols_sq.c.elements,
                 cols_sq.c.elements_is_expr,
+                # will get the value using the pg_opclass cached dict
                 cols_sq.c.elements_opclass,
-                cols_sq.c.elements_opdefault,
             )
             .select_from(pg_catalog.pg_index)
             .where(
@@ -4922,10 +5342,6 @@ class PGDialect(default.DefaultDialect):
             .join(
                 pg_catalog.pg_class,
                 pg_catalog.pg_index.c.indexrelid == pg_catalog.pg_class.c.oid,
-            )
-            .join(
-                pg_catalog.pg_am,
-                pg_catalog.pg_class.c.relam == pg_catalog.pg_am.c.oid,
             )
             .outerjoin(
                 cols_sq,
@@ -4952,6 +5368,14 @@ class PGDialect(default.DefaultDialect):
     ):
         table_oids = self._get_table_oids(
             connection, schema, filter_names, scope, kind, **kw
+        )
+
+        pg_am_btree_oid = self._load_pg_am_btree_oid(connection)
+        # lazy load only if needed, the assumption is that most indexes
+        # will use btree so it may not be needed at all
+        pg_am_dict = None
+        pg_opclass_dict = self._load_pg_opclass_notdefault_dict(
+            connection, **kw
         )
 
         indexes = defaultdict(list)
@@ -4986,7 +5410,6 @@ class PGDialect(default.DefaultDialect):
                     all_elements = row["elements"]
                     all_elements_is_expr = row["elements_is_expr"]
                     all_elements_opclass = row["elements_opclass"]
-                    all_elements_opdefault = row["elements_opdefault"]
                     indnkeyatts = row["indnkeyatts"]
                     # "The number of key columns in the index, not counting any
                     # included columns, which are merely stored and do not
@@ -5009,15 +5432,11 @@ class PGDialect(default.DefaultDialect):
                         idx_elements_opclass = all_elements_opclass[
                             :indnkeyatts
                         ]
-                        idx_elements_opdefault = all_elements_opdefault[
-                            :indnkeyatts
-                        ]
                     else:
                         idx_elements = all_elements
                         idx_elements_is_expr = all_elements_is_expr
                         inc_cols = []
                         idx_elements_opclass = all_elements_opclass
-                        idx_elements_opdefault = all_elements_opdefault
 
                     index = {"name": index_name, "unique": row["indisunique"]}
                     if any(idx_elements_is_expr):
@@ -5033,16 +5452,17 @@ class PGDialect(default.DefaultDialect):
 
                     dialect_options = {}
 
-                    if not all(idx_elements_opdefault):
-                        dialect_options["postgresql_ops"] = {
-                            name: opclass
-                            for name, opclass, is_default in zip(
-                                idx_elements,
-                                idx_elements_opclass,
-                                idx_elements_opdefault,
-                            )
-                            if not is_default
-                        }
+                    postgresql_ops = {}
+                    for name, opclass in zip(
+                        idx_elements, idx_elements_opclass
+                    ):
+                        # is not in the dict if the opclass is the default one
+                        opclass_name = pg_opclass_dict.get(opclass)
+                        if opclass_name is not None:
+                            postgresql_ops[name] = opclass_name
+
+                    if postgresql_ops:
+                        dialect_options["postgresql_ops"] = postgresql_ops
 
                     sorting = {}
                     for col_index, col_flags in enumerate(row["indoption"]):
@@ -5074,17 +5494,19 @@ class PGDialect(default.DefaultDialect):
                     # reflection info.  But we don't want an Index object
                     # to have a ``postgresql_using`` in it that is just the
                     # default, so for the moment leaving this out.
-                    amname = row["amname"]
-                    if amname != "btree":
-                        dialect_options["postgresql_using"] = row["amname"]
+                    if row["relam"] != pg_am_btree_oid:
+                        if pg_am_dict is None:
+                            pg_am_dict = self._load_pg_am_dict(
+                                connection, **kw
+                            )
+                        dialect_options["postgresql_using"] = pg_am_dict[
+                            row["relam"]
+                        ]
                     if row["filter_definition"]:
                         dialect_options["postgresql_where"] = row[
                             "filter_definition"
                         ]
                     if self.server_version_info >= (11,):
-                        # NOTE: this is legacy, this is part of
-                        # dialect_options now as of #7382
-                        index["include_columns"] = inc_cols
                         dialect_options["postgresql_include"] = inc_cols
                     if row["indnullsnotdistinct"]:
                         # the default is False, so ignore it.
@@ -5092,25 +5514,14 @@ class PGDialect(default.DefaultDialect):
                             "indnullsnotdistinct"
                         ]
 
+                    if not row["indisvalid"]:
+                        dialect_options["postgresql_invalid"] = True
+
                     if dialect_options:
                         index["dialect_options"] = dialect_options
 
                     table_indexes.append(index)
         return indexes.items()
-
-    @reflection.cache
-    def get_unique_constraints(
-        self, connection, table_name, schema=None, **kw
-    ):
-        data = self.get_multi_unique_constraints(
-            connection,
-            schema=schema,
-            filter_names=[table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     def get_multi_unique_constraints(
         self,
@@ -5145,18 +5556,6 @@ class PGDialect(default.DefaultDialect):
 
             uniques[(schema, table_name)].append(uc_dict)
         return uniques.items()
-
-    @reflection.cache
-    def get_table_comment(self, connection, table_name, schema=None, **kw):
-        data = self.get_multi_table_comment(
-            connection,
-            schema,
-            [table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     @lru_cache()
     def _comment_query(self, schema, has_filter_names, scope, kind):
@@ -5201,18 +5600,6 @@ class PGDialect(default.DefaultDialect):
             )
             for table, comment in result
         )
-
-    @reflection.cache
-    def get_check_constraints(self, connection, table_name, schema=None, **kw):
-        data = self.get_multi_check_constraints(
-            connection,
-            schema,
-            [table_name],
-            scope=ObjectScope.ANY,
-            kind=ObjectKind.ANY,
-            **kw,
-        )
-        return self._value_or_raise(data, table_name, schema)
 
     @lru_cache()
     def _check_constraint_query(self, schema, has_filter_names, scope, kind):
@@ -5408,6 +5795,10 @@ class PGDialect(default.DefaultDialect):
             .subquery("domain_constraints")
         )
 
+        collation_namespace = pg_catalog.pg_namespace.alias(
+            "collation_namespace"
+        )
+
         query = (
             select(
                 pg_catalog.pg_type.c.typname.label("name"),
@@ -5424,6 +5815,19 @@ class PGDialect(default.DefaultDialect):
                 con_sq.c.condefs,
                 con_sq.c.connames,
                 pg_catalog.pg_collation.c.collname,
+                sql.case(
+                    (
+                        pg_catalog.pg_collation.c.oid.is_(None),
+                        sql.null(),
+                    ),
+                    (
+                        pg_catalog.pg_collation_is_visible(
+                            pg_catalog.pg_collation.c.oid
+                        ),
+                        sql.null(),
+                    ),
+                    else_=collation_namespace.c.nspname,
+                ).label("collation_schema"),
             )
             .join(
                 pg_catalog.pg_namespace,
@@ -5434,6 +5838,11 @@ class PGDialect(default.DefaultDialect):
                 pg_catalog.pg_collation,
                 pg_catalog.pg_type.c.typcollation
                 == pg_catalog.pg_collation.c.oid,
+            )
+            .outerjoin(
+                collation_namespace,
+                collation_namespace.c.oid
+                == pg_catalog.pg_collation.c.collnamespace,
             )
             .outerjoin(
                 con_sq,
@@ -5478,10 +5887,41 @@ class PGDialect(default.DefaultDialect):
                 "default": domain["default"],
                 "constraints": constraints,
                 "collation": domain["collname"],
+                "collation_schema": domain["collation_schema"],
             }
             domains.append(domain_rec)
 
         return domains
+
+    @util.memoized_property
+    def _pg_am_query(self):
+        return sql.select(pg_catalog.pg_am.c.oid, pg_catalog.pg_am.c.amname)
+
+    @reflection.cache
+    def _load_pg_am_dict(self, connection, **kw) -> dict[int, str]:
+        rows = connection.execute(self._pg_am_query)
+        return dict(rows.all())
+
+    def _load_pg_am_btree_oid(self, connection):
+        # this oid is assumed to be stable
+        if self._pg_am_btree_oid == -1:
+            self._pg_am_btree_oid = connection.scalar(
+                self._pg_am_query.where(pg_catalog.pg_am.c.amname == "btree")
+            )
+        return self._pg_am_btree_oid
+
+    @util.memoized_property
+    def _pg_opclass_notdefault_query(self):
+        return sql.select(
+            pg_catalog.pg_opclass.c.oid, pg_catalog.pg_opclass.c.opcname
+        ).where(~pg_catalog.pg_opclass.c.opcdefault)
+
+    @reflection.cache
+    def _load_pg_opclass_notdefault_dict(
+        self, connection, **kw
+    ) -> dict[int, str]:
+        rows = connection.execute(self._pg_opclass_notdefault_query)
+        return dict(rows.all())
 
     def _set_backslash_escapes(self, connection):
         # this method is provided as an override hook for descendant
@@ -5490,3 +5930,48 @@ class PGDialect(default.DefaultDialect):
             "show standard_conforming_strings"
         ).scalar()
         self._backslash_escapes = std_string == "off"
+
+
+class _NamedTypeLoader:
+    """Helper class used for deferred loading of named types (enums, domains)
+    only when needed.
+    """
+
+    def __init__(
+        self, dialect: PGDialect, connection, kw: Dict[str, Any]
+    ) -> None:
+        self.dialect = dialect
+        self.connection = connection
+        self.kw = kw
+
+    @util.memoized_property
+    def enums(self) -> Dict[Tuple[str] | Tuple[str, str], ReflectedEnum]:
+        # dictionary with (name, ) if default search path or (schema, name)
+        # as keys
+        enums = dict(
+            (
+                ((rec["name"],), rec)
+                if rec["visible"]
+                else ((rec["schema"], rec["name"]), rec)
+            )
+            for rec in self.dialect._load_enums(
+                self.connection,
+                schema="*",
+                info_cache=self.kw.get("info_cache"),
+            )
+        )
+        return enums
+
+    @util.memoized_property
+    def domains(self) -> Dict[Tuple[str] | Tuple[str, str], ReflectedDomain]:
+        # dictionary with (name, ) if default search path or (schema, name)
+        # as keys
+        domains = {
+            ((d["schema"], d["name"]) if not d["visible"] else (d["name"],)): d
+            for d in self.dialect._load_domains(
+                self.connection,
+                schema="*",
+                info_cache=self.kw.get("info_cache"),
+            )
+        }
+        return domains

@@ -9,12 +9,10 @@ from __future__ import annotations
 import re
 from typing import Any
 from typing import Callable
-from typing import Dict
-from typing import List
+from typing import Literal
 from typing import Optional
 from typing import overload
 from typing import Sequence
-from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import Union
 
@@ -25,7 +23,6 @@ from .types import TIME
 from .types import TIMESTAMP
 from ... import types as sqltypes
 from ... import util
-from ...util.typing import Literal
 
 if TYPE_CHECKING:
     from .base import MySQLDialect
@@ -39,12 +36,12 @@ class ReflectedState:
     charset: Optional[str]
 
     def __init__(self) -> None:
-        self.columns: List[ReflectedColumn] = []
-        self.table_options: Dict[str, str] = {}
+        self.columns: list[ReflectedColumn] = []
+        self.table_options: dict[str, str] = {}
         self.table_name: Optional[str] = None
-        self.keys: List[Dict[str, Any]] = []
-        self.fk_constraints: List[Dict[str, Any]] = []
-        self.ck_constraints: List[Dict[str, Any]] = []
+        self.keys: list[dict[str, Any]] = []
+        self.fk_constraints: list[dict[str, Any]] = []
+        self.ck_constraints: list[dict[str, Any]] = []
 
 
 class MySQLTableDefinitionParser:
@@ -97,10 +94,10 @@ class MySQLTableDefinitionParser:
         return bool(self._re_is_view.match(sql))
 
     def _parse_constraints(self, line: str) -> Union[
-        Tuple[None, str],
-        Tuple[Literal["partition"], str],
-        Tuple[
-            Literal["ck_constraint", "fk_constraint", "key"], Dict[str, str]
+        tuple[None, str],
+        tuple[Literal["partition"], str],
+        tuple[
+            Literal["ck_constraint", "fk_constraint", "key"], dict[str, str]
         ],
     ]:
         """Parse a KEY or CONSTRAINT line.
@@ -310,7 +307,7 @@ class MySQLTableDefinitionParser:
 
         type_instance = col_type(*type_args, **type_kw)
 
-        col_kw: Dict[str, Any] = {}
+        col_kw: dict[str, Any] = {}
 
         # NOT NULL
         col_kw["nullable"] = True
@@ -356,7 +353,7 @@ class MySQLTableDefinitionParser:
     def _describe_to_create(
         self,
         table_name: str,
-        columns: Sequence[Tuple[str, str, str, str, str, str]],
+        columns: Sequence[tuple[str, str, str, str, str, str]],
     ) -> str:
         """Re-format DESCRIBE output as a SHOW CREATE TABLE string.
 
@@ -412,7 +409,7 @@ class MySQLTableDefinitionParser:
 
     def _parse_keyexprs(
         self, identifiers: str
-    ) -> List[Tuple[str, Optional[int], str]]:
+    ) -> list[tuple[str, Optional[int], str]]:
         """Unpack '"col"(2),"col" ASC'-ish strings into components."""
 
         return [
@@ -425,8 +422,8 @@ class MySQLTableDefinitionParser:
     def _prep_regexes(self) -> None:
         """Pre-compile regular expressions."""
 
-        self._pr_options: List[
-            Tuple[re.Pattern[Any], Optional[Callable[[str], str]]]
+        self._pr_options: list[
+            tuple[re.Pattern[Any], Optional[Callable[[str], str]]]
         ] = []
 
         _final = self.preparer.final_quote
@@ -521,7 +518,7 @@ class MySQLTableDefinitionParser:
             r"(?: +USING +(?P<using_post>\S+))?"
             r"(?: +KEY_BLOCK_SIZE *[ =]? *(?P<keyblock>\S+))?"
             r"(?: +WITH PARSER +(?P<parser>\S+))?"
-            r"(?: +COMMENT +(?P<comment>(\x27\x27|\x27([^\x27])*?\x27)+))?"
+            r"(?: +COMMENT +(?P<comment>\x27(?:\x27\x27|[^\x27])*\x27))?"
             r"(?: +/\*(?P<version_sql>.+)\*/ *)?"
             r",?$" % quotes
         )
@@ -666,18 +663,18 @@ _options_of_type_string = (
 @overload
 def _pr_compile(
     regex: str, cleanup: Callable[[str], str]
-) -> Tuple[re.Pattern[Any], Callable[[str], str]]: ...
+) -> tuple[re.Pattern[Any], Callable[[str], str]]: ...
 
 
 @overload
 def _pr_compile(
     regex: str, cleanup: None = None
-) -> Tuple[re.Pattern[Any], None]: ...
+) -> tuple[re.Pattern[Any], None]: ...
 
 
 def _pr_compile(
     regex: str, cleanup: Optional[Callable[[str], str]] = None
-) -> Tuple[re.Pattern[Any], Optional[Callable[[str], str]]]:
+) -> tuple[re.Pattern[Any], Optional[Callable[[str], str]]]:
     """Prepare a 2-tuple of compiled regex and callable."""
 
     return (_re_compile(regex), cleanup)
@@ -689,9 +686,9 @@ def _re_compile(regex: str) -> re.Pattern[Any]:
     return re.compile(regex, re.I | re.UNICODE)
 
 
-def _strip_values(values: Sequence[str]) -> List[str]:
+def _strip_values(values: Sequence[str]) -> list[str]:
     "Strip reflected values quotes"
-    strip_values: List[str] = []
+    strip_values: list[str] = []
     for a in values:
         if a[0:1] == '"' or a[0:1] == "'":
             # strip enclosing quotes and unquote interior

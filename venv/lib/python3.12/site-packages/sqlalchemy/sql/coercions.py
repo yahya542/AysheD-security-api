@@ -19,6 +19,7 @@ from typing import Dict
 from typing import Iterable
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import NoReturn
 from typing import Optional
 from typing import overload
@@ -39,7 +40,6 @@ from .visitors import Visitable
 from .. import exc
 from .. import inspection
 from .. import util
-from ..util.typing import Literal
 
 if typing.TYPE_CHECKING:
     # elements lambdas schema selectable are set by __init__
@@ -53,6 +53,7 @@ if typing.TYPE_CHECKING:
     from ._typing import _DMLTableArgument
     from ._typing import _FromClauseArgument
     from ._typing import _OnlyColumnArgument
+    from .base import SyntaxExtension
     from .dml import _DMLTableElement
     from .elements import BindParameter
     from .elements import ClauseElement
@@ -212,8 +213,16 @@ def expect(
 
 @overload
 def expect(
+    role: Type[roles.SyntaxExtensionRole],
+    element: Any,
+    **kw: Any,
+) -> SyntaxExtension: ...
+
+
+@overload
+def expect(
     role: Type[roles.LabeledColumnExprRole[Any]],
-    element: Union[_ColumnExpressionArgument[_T], _OnlyColumnArgument[_T]],
+    element: _ColumnExpressionArgument[_T] | _OnlyColumnArgument[_T],
     **kw: Any,
 ) -> NamedColumn[_T]: ...
 
@@ -787,6 +796,10 @@ class ExpressionElementImpl(_ColumnCoercions, RoleImpl):
         )
 
 
+class TStringElementImpl(ExpressionElementImpl, RoleImpl):
+    __slots__ = ()
+
+
 class BinaryElementImpl(ExpressionElementImpl, RoleImpl):
     __slots__ = ()
 
@@ -925,6 +938,10 @@ class WhereHavingImpl(_CoerceLiterals, _ColumnCoercions, RoleImpl):
 
     def _text_coercion(self, element, argname=None):
         return _no_text_coercion(element, argname)
+
+
+class SyntaxExtensionImpl(RoleImpl):
+    __slots__ = ()
 
 
 class StatementOptionImpl(_CoerceLiterals, RoleImpl):
@@ -1166,21 +1183,11 @@ class StatementImpl(_CoerceLiterals, RoleImpl):
         if resolved is not original_element and not isinstance(
             original_element, str
         ):
-            # use same method as Connection uses; this will later raise
-            # ObjectNotExecutableError
+            # use same method as Connection uses
             try:
                 original_element._execute_on_connection
-            except AttributeError:
-                util.warn_deprecated(
-                    "Object %r should not be used directly in a SQL statement "
-                    "context, such as passing to methods such as "
-                    "session.execute().  This usage will be disallowed in a "
-                    "future release.  "
-                    "Please use Core select() / update() / delete() etc. "
-                    "with Session.execute() and other statement execution "
-                    "methods." % original_element,
-                    "1.4",
-                )
+            except AttributeError as err:
+                raise exc.ObjectNotExecutableError(original_element) from err
 
         return resolved
 
@@ -1272,25 +1279,12 @@ class FromClauseImpl(_SelectIsNotFrom, _NoTextCoercion, RoleImpl):
         argname: Optional[str] = None,
         *,
         explicit_subquery: bool = False,
-        allow_select: bool = True,
         **kw: Any,
     ) -> Any:
-        if resolved._is_select_base:
-            if explicit_subquery:
-                return resolved.subquery()
-            elif allow_select:
-                util.warn_deprecated(
-                    "Implicit coercion of SELECT and textual SELECT "
-                    "constructs into FROM clauses is deprecated; please call "
-                    ".subquery() on any Core select or ORM Query object in "
-                    "order to produce a subquery object.",
-                    version="1.4",
-                )
-                return resolved._implicit_subquery
-        elif resolved._is_text_clause:
-            return resolved
-        else:
-            self._raise_for_expected(element, argname, resolved)
+        if resolved._is_select_base and explicit_subquery:
+            return resolved.subquery()
+
+        self._raise_for_expected(element, argname, resolved)
 
     def _post_coercion(self, element, *, deannotate=False, **kw):
         if deannotate:
@@ -1299,32 +1293,7 @@ class FromClauseImpl(_SelectIsNotFrom, _NoTextCoercion, RoleImpl):
             return element
 
 
-class StrictFromClauseImpl(FromClauseImpl):
-    __slots__ = ()
-
-    def _implicit_coercions(
-        self,
-        element: Any,
-        resolved: Any,
-        argname: Optional[str] = None,
-        *,
-        allow_select: bool = False,
-        **kw: Any,
-    ) -> Any:
-        if resolved._is_select_base and allow_select:
-            util.warn_deprecated(
-                "Implicit coercion of SELECT and textual SELECT constructs "
-                "into FROM clauses is deprecated; please call .subquery() "
-                "on any Core select or ORM Query object in order to produce a "
-                "subquery object.",
-                version="1.4",
-            )
-            return resolved._implicit_subquery
-        else:
-            self._raise_for_expected(element, argname, resolved)
-
-
-class AnonymizedFromClauseImpl(StrictFromClauseImpl):
+class AnonymizedFromClauseImpl(FromClauseImpl):
     __slots__ = ()
 
     def _post_coercion(self, element, *, flat=False, name=None, **kw):

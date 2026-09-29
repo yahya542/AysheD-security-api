@@ -36,6 +36,7 @@ from typing import Any
 from typing import Callable
 from typing import Collection
 from typing import Dict
+from typing import final
 from typing import Generator
 from typing import Iterable
 from typing import List
@@ -61,7 +62,6 @@ from ..sql.elements import TextClause
 from ..sql.type_api import TypeEngine
 from ..sql.visitors import InternalTraversal
 from ..util import topological
-from ..util.typing import final
 
 if TYPE_CHECKING:
     from .interfaces import Dialect
@@ -188,6 +188,13 @@ class Inspector(inspection.Inspectable["Inspector"]):
     consistent interface as well as caching support for previously
     fetched metadata.
 
+    The caching behavior is dialect-specific: as a general rule single table
+    reflection methods should cache their result, while multi-table reflection
+    methods should not, but behavior may vary.
+    Following DDL operations on the database, it is recommended to either
+    create a new :class:`_reflection.Inspector` instance or to clear the cache
+    of existing instances using the :meth:`.Inspector.clear_cache` method.
+
     A :class:`_reflection.Inspector` object is usually created via the
     :func:`_sa.inspect` function, which may be passed an
     :class:`_engine.Engine`
@@ -268,7 +275,7 @@ class Inspector(inspection.Inspectable["Inspector"]):
         self.info_cache = {}
 
     def clear_cache(self) -> None:
-        """reset the cache for this :class:`.Inspector`.
+        """Reset the cache for this :class:`.Inspector`.
 
         Inspection methods that have data cached will emit SQL queries
         when next called to get new data.
@@ -439,6 +446,33 @@ class Inspector(inspection.Inspectable["Inspector"]):
         with self._operation_context() as conn:
             return self.dialect.has_table(
                 conn, table_name, schema, info_cache=self.info_cache, **kw
+            )
+
+    def has_multi_table(
+        self,
+        table_names: Sequence[str],
+        schema: Optional[str] = None,
+        **kw: Any,
+    ) -> Dict[TableKey, bool]:
+        r"""Return a dict indicating for each table name whether the backend
+        has a table, view, or temporary table with the given name.
+
+        :param table_names: sequence of table names to check.
+        :param schema: schema name to query, if not the default schema.
+        :param \**kw: Additional keyword argument to pass to the dialect
+         specific implementation. See the documentation of the dialect
+         in use for more information.
+
+        .. versionadded:: 2.1
+
+        .. seealso:: :meth:`Inspector.has_table`
+
+        """
+        with self._operation_context() as conn:
+            return dict(
+                self.dialect.has_multi_table(
+                    conn, table_names, schema, info_cache=self.info_cache, **kw
+                )
             )
 
     def has_sequence(
@@ -1317,8 +1351,6 @@ class Inspector(inspection.Inspectable["Inspector"]):
 
         :return: a dictionary, with the table comment.
 
-        .. versionadded:: 1.2
-
         .. seealso:: :meth:`Inspector.get_multi_table_comment`
         """
 
@@ -1758,19 +1790,10 @@ class Inspector(inspection.Inspectable["Inspector"]):
             ):
                 continue
 
-            if len(set(constrained_columns)) != len(constrained_columns):
-                util.warn(
-                    f"On reflected table {table.name}, skipping reflection of "
-                    f"foreign key constraint {conname}; duplicate source "
-                    f"columns within name(s) {', '.join(constrained_columns)} "
-                    "are not supported"
-                )
-                continue
-
             referred_schema = fkey_d["referred_schema"]
             referred_table = fkey_d["referred_table"]
             referred_columns = fkey_d["referred_columns"]
-            refspec = []
+            refspec: List[sa_schema.ForeignKeyTarget] = []
             if referred_schema is not None:
                 if resolve_fks:
                     sa_schema.Table(
@@ -1784,7 +1807,9 @@ class Inspector(inspection.Inspectable["Inspector"]):
                     )
                 for column in referred_columns:
                     refspec.append(
-                        ".".join([referred_schema, referred_table, column])
+                        sa_schema.ForeignKeyTarget(
+                            referred_schema, referred_table, column
+                        )
                     )
             else:
                 if resolve_fks:
@@ -1798,7 +1823,11 @@ class Inspector(inspection.Inspectable["Inspector"]):
                         **reflection_options,
                     )
                 for column in referred_columns:
-                    refspec.append(".".join([referred_table, column]))
+                    refspec.append(
+                        sa_schema.ForeignKeyTarget(
+                            None, referred_table, column
+                        )
+                    )
             if "options" in fkey_d:
                 options = fkey_d["options"]
             else:

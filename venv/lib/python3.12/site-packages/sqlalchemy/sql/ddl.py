@@ -15,6 +15,8 @@ to invoke them for a create/drop call.
 from __future__ import annotations
 
 import contextlib
+from enum import auto
+from enum import Flag
 import typing
 from typing import Any
 from typing import Callable
@@ -22,20 +24,27 @@ from typing import Generic
 from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import Protocol
 from typing import Sequence as typing_Sequence
 from typing import Tuple
 from typing import TypeVar
 from typing import Union
 
+from . import coercions
 from . import roles
+from . import util as sql_util
 from .base import _generative
+from .base import _NoArg
+from .base import DialectKWArgs
 from .base import Executable
+from .base import NO_ARG
 from .base import SchemaVisitor
 from .elements import ClauseElement
+from .selectable import SelectBase
+from .selectable import TableClause
 from .. import exc
 from .. import util
 from ..util import topological
-from ..util.typing import Protocol
 from ..util.typing import Self
 
 if typing.TYPE_CHECKING:
@@ -46,11 +55,12 @@ if typing.TYPE_CHECKING:
     from .schema import Constraint
     from .schema import ForeignKeyConstraint
     from .schema import Index
+    from .schema import MetaData
     from .schema import SchemaItem
     from .schema import Sequence as Sequence  # noqa: F401
     from .schema import Table
-    from .selectable import TableClause
     from ..engine.base import Connection
+    from ..engine.interfaces import _CoreSingleExecuteParams
     from ..engine.interfaces import CacheStats
     from ..engine.interfaces import CompiledCacheType
     from ..engine.interfaces import Dialect
@@ -85,8 +95,11 @@ class BaseDDLElement(ClauseElement):
         for_executemany: bool = False,
         schema_translate_map: Optional[SchemaTranslateMapType] = None,
         **kw: Any,
-    ) -> Tuple[
-        Compiled, Optional[typing_Sequence[BindParameter[Any]]], CacheStats
+    ) -> tuple[
+        Compiled,
+        typing_Sequence[BindParameter[Any]] | None,
+        _CoreSingleExecuteParams | None,
+        CacheStats,
     ]:
         raise NotImplementedError()
 
@@ -164,7 +177,9 @@ class ExecutableDDLElement(roles.DDLRole, Executable, BaseDDLElement):
         event.listen(
             users,
             "after_create",
-            AddConstraint(constraint).execute_if(dialect="postgresql"),
+            AddConstraint(constraint, isolate_from_table=True).execute_if(
+                dialect="postgresql"
+            ),
         )
 
     .. seealso::
@@ -461,10 +476,22 @@ class _CreateBase(_CreateDropBase[_SI]):
         self.if_not_exists = if_not_exists
 
 
+class TableCreateDDL(_CreateBase["Table"]):
+
+    def to_metadata(self, metadata: MetaData, table: Table) -> Self:
+        raise NotImplementedError()
+
+
 class _DropBase(_CreateDropBase[_SI]):
     def __init__(self, element: _SI, if_exists: bool = False) -> None:
         super().__init__(element)
         self.if_exists = if_exists
+
+
+class TableDropDDL(_DropBase["Table"]):
+
+    def to_metadata(self, metadata: MetaData, table: Table) -> Self:
+        raise NotImplementedError()
 
 
 class CreateSchema(_CreateBase[str]):
@@ -511,7 +538,7 @@ class DropSchema(_DropBase[str]):
         self.cascade = cascade
 
 
-class CreateTable(_CreateBase["Table"]):
+class CreateTable(TableCreateDDL):
     """Represent a CREATE TABLE statement."""
 
     __visit_name__ = "create_table"
@@ -544,16 +571,358 @@ class CreateTable(_CreateBase["Table"]):
         self.columns = [CreateColumn(column) for column in element.columns]
         self.include_foreign_key_constraints = include_foreign_key_constraints
 
+    def to_metadata(self, metadata: MetaData, table: Table) -> Self:
+        return self.__class__(table, if_not_exists=self.if_not_exists)
 
-class _DropView(_DropBase["Table"]):
-    """Semi-public 'DROP VIEW' construct.
 
-    Used by the test suite for dialect-agnostic drops of views.
-    This object will eventually be part of a public "view" API.
+class _TableViaSelect(TableCreateDDL, ExecutableDDLElement):
+    """Common base class for DDL constructs that generate and render for a
+    :class:`.Table` given a :class:`.Select`
+
+    .. versionadded:: 2.1
+
+    """
+
+    table: Table
+    """:class:`.Table` object representing the table that this
+    :class:`.CreateTableAs` would generate when executed."""
+
+    def __init__(
+        self,
+        selectable: SelectBase,
+        name: str,
+        *,
+        metadata: Optional["MetaData"] = None,
+        schema: Optional[str] = None,
+        temporary: bool = False,
+        if_not_exists: bool = False,
+    ):
+        # Coerce selectable to a Select statement
+        selectable = coercions.expect(roles.DMLSelectRole, selectable)
+
+        self.schema = schema
+        self.selectable = selectable
+        self.temporary = bool(temporary)
+        self.if_not_exists = bool(if_not_exists)
+        self.metadata = metadata
+        self.table_name = name
+        self._gen_table()
+
+    @property
+    def element(self):  # type: ignore[override]
+        return self.table
+
+    def to_metadata(self, metadata: MetaData, table: Table) -> Self:
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(self.__dict__)
+        new.metadata = metadata
+        new.table = table
+        return new
+
+    @util.preload_module("sqlalchemy.sql.schema")
+    def _gen_table(self) -> None:
+        MetaData = util.preloaded.sql_schema.MetaData
+        Column = util.preloaded.sql_schema.Column
+        Table = util.preloaded.sql_schema.Table
+        MetaData = util.preloaded.sql_schema.MetaData
+
+        column_name_type_pairs = (
+            (name, col_element.type)
+            for _, name, _, col_element, _ in (
+                self.selectable._generate_columns_plus_names(
+                    anon_for_dupe_key=False
+                )
+            )
+        )
+
+        if self.metadata is None:
+            self.metadata = metadata = MetaData()
+        else:
+            metadata = self.metadata
+
+        self.table = Table(
+            self.table_name,
+            metadata,
+            *(Column(name, typ) for name, typ in column_name_type_pairs),
+            schema=self.schema,
+            _creator_ddl=self,
+        )
+
+
+class CreateTableAs(DialectKWArgs, _TableViaSelect):
+    """Represent a CREATE TABLE ... AS statement.
+
+    This creates a new table directly from the output of a SELECT, including
+    its schema and its initial set of data.   Unlike a view, the
+    new table is fixed and does not synchronize further with the originating
+    SELECT statement.
+
+    The example below illustrates basic use of :class:`.CreateTableAs`; given a
+    :class:`.Select` and optional :class:`.MetaData`, the
+    :class:`.CreateTableAs` may be invoked directly via
+    :meth:`.Connection.execute` or indirectly via :meth:`.MetaData.create_all`;
+    the :attr:`.CreateTableAs.table` attribute provides a :class:`.Table`
+    object with which to generate new queries::
+
+        from sqlalchemy import CreateTableAs
+        from sqlalchemy import select
+
+        # instantiate CreateTableAs given a select() and optional MetaData
+        cas = CreateTableAs(
+            select(users.c.id, users.c.name).where(users.c.status == "active"),
+            "active_users",
+            metadata=some_metadata,
+        )
+
+        # a Table object is available immediately via the .table attribute
+        new_statement = select(cas.table)
+
+        # to emit CREATE TABLE AS, either invoke CreateTableAs directly...
+        with engine.begin() as conn:
+            conn.execute(cas)
+
+        # or alternatively, invoke metadata.create_all()
+        some_metdata.create_all(engine)
+
+        # drop is performed in the usual way, via drop_all
+        # or table.drop()
+        some_metdata.drop_all(engine)
+
+    For detailed background on :class:`.CreateTableAs` see
+    :ref:`metadata_create_table_as`.
+
+    .. versionadded:: 2.1
+
+    :param selectable: :class:`_sql.Select`
+        The SELECT statement providing the columns and rows.
+
+    :param table_name: table name as a string. Combine with the optional
+        :paramref:`.CreateTableAs.schema` parameter to indicate a
+        schema-qualified table name.
+
+    :param metadata: :class:`_schema.MetaData`, optional
+        If provided, the :class:`_schema.Table` object available via the
+        :attr:`.table` attribute will be associated with this
+        :class:`.MetaData`.  Otherwise, a new, empty :class:`.MetaData`
+        is created.
+
+    :param schema: str, optional schema or owner name.
+
+    :param temporary: bool, default False.
+        If True, render ``TEMPORARY``
+
+    :param if_not_exists: bool, default False.
+        If True, render ``IF NOT EXISTS``
+
+    .. seealso::
+
+        :ref:`metadata_create_table_as` - in :ref:`metadata_toplevel`
+
+        :meth:`_sql.SelectBase.into` - convenience method to create a
+        :class:`_schema.CreateTableAs` from a SELECT statement
+
+        :class:`.CreateView`
+
+
+    """
+
+    __visit_name__ = "create_table_as"
+    inherit_cache = False
+
+    table: Table
+    """:class:`.Table` object representing the table that this
+    :class:`.CreateTableAs` would generate when executed."""
+
+    def __init__(
+        self,
+        selectable: SelectBase,
+        table_name: str,
+        *,
+        metadata: Optional["MetaData"] = None,
+        schema: Optional[str] = None,
+        temporary: bool = False,
+        if_not_exists: bool = False,
+        **dialect_kwargs: Any,
+    ):
+        self._validate_dialect_kwargs(dialect_kwargs)
+        super().__init__(
+            selectable=selectable,
+            name=table_name,
+            metadata=metadata,
+            schema=schema,
+            temporary=temporary,
+            if_not_exists=if_not_exists,
+        )
+
+
+class CreateView(DialectKWArgs, _TableViaSelect):
+    """Represent a CREATE VIEW statement.
+
+    This creates a new view based on a particular SELECT statement. The schema
+    of the view is based on the columns of the SELECT statement, and the data
+    present in the view is derived from the rows represented by the
+    SELECT.  A non-materialized view will evaluate the SELECT statement
+    dynamically as it is queried, whereas a materialized view represents a
+    snapshot of the SELECT statement at a particular point in time and
+    typically needs to be refreshed manually using database-specific commands.
+
+    The example below illustrates basic use of :class:`.CreateView`; given a
+    :class:`.Select` and optional :class:`.MetaData`, the
+    :class:`.CreateView` may be invoked directly via
+    :meth:`.Connection.execute` or indirectly via :meth:`.MetaData.create_all`;
+    the :attr:`.CreateView.table` attribute provides a :class:`.Table`
+    object with which to generate new queries::
+
+
+        from sqlalchemy import select
+        from sqlalchemy.sql.ddl import CreateView
+
+        # instantiate CreateView given a select() and optional MetaData
+        create_view = CreateView(
+            select(users.c.id, users.c.name).where(users.c.status == "active"),
+            "active_users_view",
+            metadata=some_metadata,
+        )
+
+        # a Table object is available immediately via the .table attribute
+        new_statement = select(create_view.table)
+
+        # to emit CREATE VIEW, either invoke CreateView directly...
+        with engine.begin() as conn:
+            conn.execute(create_view)
+
+        # or alternatively, invoke metadata.create_all()
+        some_metdata.create_all(engine)
+
+        # drop is performed in the usual way, via drop_all
+        # or table.drop() (will emit DROP VIEW)
+        some_metdata.drop_all(engine)
+
+    For detailed background on :class:`.CreateView` see
+    :ref:`metadata_create_view`.
+
+    .. versionadded:: 2.1
+
+    :param selectable: :class:`_sql.Select`
+        The SELECT statement defining the view.
+
+    :param view_name: table name as a string. Combine with the optional
+        :paramref:`.CreateView.schema` parameter to indicate a
+        schema-qualified table name.
+
+    :param metadata: :class:`_schema.MetaData`, optional
+        If provided, the :class:`_schema.Table` object available via the
+        :attr:`.table` attribute will be associated with this
+        :class:`.MetaData`.  Otherwise, a new, empty :class:`.MetaData`
+        is created.
+
+    :param schema: str, optional schema or owner name.
+
+    :param temporary: bool, default False.
+        If True, render ``TEMPORARY``
+
+    :param or_replace: bool, default False.
+        If True, render ``OR REPLACE`` to replace an existing view if it
+        exists. Supported by PostgreSQL, MySQL, MariaDB, and Oracle.
+        Not supported by SQLite or SQL Server.
+
+        .. versionadded:: 2.1
+
+    :param materialized: bool, default False.
+        If True, render ``MATERIALIZED`` to create a materialized view.
+        Materialized views store the query results physically and can be
+        refreshed periodically. Not supported by all database backends.
+
+        .. versionadded:: 2.1
+
+    :param dialect_kw: Additional keyword arguments are dialect-specific and
+        are passed as keyword arguments to the dialect's compiler.
+
+        .. note::
+
+            For SQLite, the ``sqlite_if_not_exists`` boolean parameter
+            is supported to render ``CREATE VIEW IF NOT EXISTS``.
+
+        .. versionadded:: 2.1
+
+    .. seealso::
+
+        :ref:`metadata_create_view` - in :ref:`metadata_toplevel`
+
+        :class:`.CreateTableAs` - for creating a table from a SELECT statement
+
+    """
+
+    __visit_name__ = "create_view"
+
+    inherit_cache = False
+
+    table: Table
+    """:class:`.Table` object representing the view that this
+    :class:`.CreateView` would generate when executed."""
+
+    materialized: bool
+    """Boolean flag indicating if this is a materialized view."""
+
+    or_replace: bool
+    """Boolean flag indicating if OR REPLACE should be used."""
+
+    def __init__(
+        self,
+        selectable: SelectBase,
+        view_name: str,
+        *,
+        metadata: Optional["MetaData"] = None,
+        schema: Optional[str] = None,
+        temporary: bool = False,
+        or_replace: bool = False,
+        materialized: bool = False,
+        **dialect_kwargs: Any,
+    ):
+        self._validate_dialect_kwargs(dialect_kwargs)
+        super().__init__(
+            selectable=selectable,
+            name=view_name,
+            metadata=metadata,
+            schema=schema,
+            temporary=temporary,
+            if_not_exists=False,
+        )
+        self.materialized = materialized
+        self.or_replace = or_replace
+        self.table._dropper_ddl = DropView(
+            self.table, materialized=materialized
+        )
+
+
+class DropView(TableDropDDL):
+    """'DROP VIEW' construct.
+
+    .. versionadded:: 2.1 the :class:`.DropView` construct became public
+       and was renamed from ``_DropView``.
 
     """
 
     __visit_name__ = "drop_view"
+
+    materialized: bool
+    """Boolean flag indicating if this is a materialized view."""
+
+    def __init__(
+        self,
+        element: Table,
+        *,
+        if_exists: bool = False,
+        materialized: bool = False,
+    ) -> None:
+        super().__init__(element, if_exists=if_exists)
+        self.materialized = materialized
+
+    def to_metadata(self, metadata: MetaData, table: Table) -> Self:
+        new = self.__class__.__new__(self.__class__)
+        new.__dict__.update(self.__dict__)
+        new.element = table
+        return new
 
 
 class CreateConstraint(BaseDDLElement):
@@ -682,7 +1051,7 @@ class CreateColumn(BaseDDLElement):
         self.element = element
 
 
-class DropTable(_DropBase["Table"]):
+class DropTable(TableDropDDL):
     """Represent a DROP TABLE statement."""
 
     __visit_name__ = "drop_table"
@@ -700,6 +1069,9 @@ class DropTable(_DropBase["Table"]):
 
         """
         super().__init__(element, if_exists=if_exists)
+
+    def to_metadata(self, metadata: MetaData, table: Table) -> Self:
+        return self.__class__(table, if_exists=self.if_exists)
 
 
 class CreateSequence(_CreateBase["Sequence"]):
@@ -758,19 +1130,22 @@ class AddConstraint(_CreateBase["Constraint"]):
     __visit_name__ = "add_constraint"
 
     def __init__(
-        self,
-        element: Constraint,
-        *,
-        isolate_from_table: bool = True,
+        self, element: Constraint, *, isolate_from_table: bool = True
     ) -> None:
         """Construct a new :class:`.AddConstraint` construct.
 
         :param element: a :class:`.Constraint` object
 
-        :param isolate_from_table: optional boolean, defaults to True.  Has
-         the effect of the incoming constraint being isolated from being
-         included in a CREATE TABLE sequence when associated with a
-         :class:`.Table`.
+        :param isolate_from_table: optional boolean.  Prevents the target
+         :class:`.Constraint` from being rendered inline in a "CONSTRAINT"
+         clause within a CREATE TABLE statement, in the case that the
+         constraint is associated with a :class:`.Table` which is later
+         created using :meth:`.Table.create` or :meth:`.MetaData.create_all`.
+         This occurs by modifying the state of the :class:`.Constraint`
+         object itself such that the CREATE TABLE DDL process will skip it.
+         Used for the case when a separate `ALTER TABLE...ADD CONSTRAINT`
+         call will be emitted after the `CREATE TABLE` has already occurred.
+         ``True`` by default.
 
          .. versionadded:: 2.0.39 - added
             :paramref:`.AddConstraint.isolate_from_table`, defaulting
@@ -781,9 +1156,7 @@ class AddConstraint(_CreateBase["Constraint"]):
         super().__init__(element)
 
         if isolate_from_table:
-            element._create_rule = util.portable_instancemethod(
-                self._create_rule_disable
-            )
+            element._create_rule = self._create_rule_disable
 
 
 class DropConstraint(_DropBase["Constraint"]):
@@ -797,34 +1170,48 @@ class DropConstraint(_DropBase["Constraint"]):
         *,
         cascade: bool = False,
         if_exists: bool = False,
-        isolate_from_table: bool = True,
+        isolate_from_table: bool | _NoArg = NO_ARG,
         **kw: Any,
     ) -> None:
         """Construct a new :class:`.DropConstraint` construct.
 
         :param element: a :class:`.Constraint` object
+
         :param cascade: optional boolean, indicates backend-specific
          "CASCADE CONSTRAINT" directive should be rendered if available
+
         :param if_exists: optional boolean, indicates backend-specific
          "IF EXISTS" directive should be rendered if available
-        :param isolate_from_table: optional boolean, defaults to True.  Has
-         the effect of the incoming constraint being isolated from being
-         included in a CREATE TABLE sequence when associated with a
-         :class:`.Table`.
+
+        :param isolate_from_table: optional boolean. This is a deprecated
+         setting that when ``True``, does the same thing that
+         :paramref:`.AddConstraint.isolate_from_table` does, which is prevents
+         the constraint from being associated with an inline ``CREATE TABLE``
+         statement. It does not have any effect on the DROP process for a
+         table and is an artifact of older SQLAlchemy versions,
+         and will be removed in a future release.
 
          .. versionadded:: 2.0.39 - added
             :paramref:`.DropConstraint.isolate_from_table`, defaulting
             to True.  Previously, the behavior of this parameter was implicitly
             turned on in all cases.
 
+         .. versionchanged:: 2.1 - This parameter has been deprecated and
+            the default value of the flag was changed to ``False``.
+
         """
         self.cascade = cascade
         super().__init__(element, if_exists=if_exists, **kw)
 
-        if isolate_from_table:
-            element._create_rule = util.portable_instancemethod(
-                self._create_rule_disable
+        if isolate_from_table is not NO_ARG:
+            util.warn_deprecated(
+                "The ``isolate_from_table`` is deprecated and it be removed "
+                "in a future release.",
+                "2.1",
             )
+
+            if isolate_from_table:
+                element._create_rule = self._create_rule_disable
 
 
 class SetTableComment(_CreateDropBase["Table"]):
@@ -910,15 +1297,111 @@ class InvokeDropDDLBase(InvokeDDLBase):
         )
 
 
-class SchemaGenerator(InvokeCreateDDLBase):
+class CheckFirst(Flag):
+    """Enumeration for the :paramref:`.MetaData.create_all.checkfirst`
+    parameter passed to methods like :meth:`.MetaData.create_all`,
+    :meth:`.MetaData.drop_all`, :meth:`.Table.create`, :meth:`.Table.drop` and
+    others.
+
+    This enumeration indicates what kinds of objects should be "checked"
+    with a separate query before emitting CREATE or DROP for that object.
+
+    Can use ``CheckFirst(bool_value)`` to convert from a boolean value.
+
+    .. versionadded:: 2.1
+
+    """
+
+    NONE = 0  # equivalent to False
+    """No items should be checked"""
+
+    # avoid 1 so that bool True doesn't match by value
+    TABLES = 2
+    """Check for tables"""
+
+    VIEWS = auto()
+    """Check for views"""
+
+    INDEXES = auto()
+    """Check for indexes"""
+
+    SEQUENCES = auto()
+    """Check for sequences"""
+
+    TYPES = auto()
+    """Check for custom datatypes that are created server-side
+
+    This is currently used by PostgreSQL.
+
+    """
+
+    ALL = TABLES | VIEWS | INDEXES | SEQUENCES | TYPES  # equivalent to True
+
+    @classmethod
+    def _missing_(cls, value: object) -> Any:
+        if isinstance(value, bool):
+            return cls.ALL if value else cls.NONE
+        return super()._missing_(value)
+
+
+class _SchemaTableReflector:
+    _effective_tables: typing_Sequence[Table] | None = None
+    _has_tables: dict[tuple[Optional[str], str], bool]
+
     def __init__(
-        self, dialect, connection, checkfirst=False, tables=None, **kwargs
+        self,
+        dialect: Dialect,
+        connection: Connection,
+        tables: typing_Sequence[Table] | None,
     ):
-        super().__init__(connection, **kwargs)
-        self.checkfirst = checkfirst
-        self.tables = tables
-        self.preparer = dialect.identifier_preparer
         self.dialect = dialect
+        self.connection = connection
+        self.tables = self._effective_tables = tables
+        self._has_tables = {}
+
+    def _update_effective_tables(self, metadata):
+        if self.tables is not None:
+            self._effective_tables = self.tables
+        else:
+            self._effective_tables = list(metadata.tables.values())
+        return self._effective_tables
+
+    def _has_table(self, table: Table, schema: str | None) -> bool:
+        res = self._has_tables.get((schema, table.name))
+        if res is not None:
+            return res
+        if self._effective_tables is None:
+            to_check = [table.name]
+        else:
+            is_view = table.is_view
+            to_check = [
+                t.name
+                for t in self._effective_tables
+                if t.is_view == is_view
+                and self.connection.schema_for_object(t) == schema
+            ]
+            assert table.name in to_check
+        self._has_tables.update(
+            self.dialect.has_multi_table(
+                self.connection, to_check, schema=schema
+            )
+        )
+        return self._has_tables[(schema, table.name)]
+
+
+class SchemaGenerator(InvokeCreateDDLBase, _SchemaTableReflector):
+    def __init__(
+        self,
+        dialect,
+        connection,
+        checkfirst=CheckFirst.NONE,
+        tables=None,
+        **kwargs,
+    ):
+        InvokeCreateDDLBase.__init__(self, connection, **kwargs)
+        _SchemaTableReflector.__init__(self, dialect, connection, tables)
+        self.checkfirst = CheckFirst(checkfirst)
+        self.preparer = dialect.identifier_preparer
         self.memo = {}
 
     def _can_create_table(self, table):
@@ -926,19 +1409,26 @@ class SchemaGenerator(InvokeCreateDDLBase):
         effective_schema = self.connection.schema_for_object(table)
         if effective_schema:
             self.dialect.validate_identifier(effective_schema)
-        return not self.checkfirst or not self.dialect.has_table(
-            self.connection, table.name, schema=effective_schema
+
+        bool_to_check = (
+            CheckFirst.TABLES if not table.is_view else CheckFirst.VIEWS
+        )
+        return not self.checkfirst & bool_to_check or not self._has_table(
+            table, effective_schema
         )
 
     def _can_create_index(self, index):
         effective_schema = self.connection.schema_for_object(index.table)
         if effective_schema:
             self.dialect.validate_identifier(effective_schema)
-        return not self.checkfirst or not self.dialect.has_index(
-            self.connection,
-            index.table.name,
-            index.name,
-            schema=effective_schema,
+        return (
+            not self.checkfirst & CheckFirst.INDEXES
+            or not self.dialect.has_index(
+                self.connection,
+                index.table.name,
+                index.name,
+                schema=effective_schema,
+            )
         )
 
     def _can_create_sequence(self, sequence):
@@ -947,7 +1437,7 @@ class SchemaGenerator(InvokeCreateDDLBase):
         return self.dialect.supports_sequences and (
             (not self.dialect.sequences_optional or not sequence.optional)
             and (
-                not self.checkfirst
+                not self.checkfirst & CheckFirst.SEQUENCES
                 or not self.dialect.has_sequence(
                     self.connection, sequence.name, schema=effective_schema
                 )
@@ -955,10 +1445,7 @@ class SchemaGenerator(InvokeCreateDDLBase):
         )
 
     def visit_metadata(self, metadata):
-        if self.tables is not None:
-            tables = self.tables
-        else:
-            tables = list(metadata.tables.values())
+        tables = self._update_effective_tables(metadata)
 
         collection = sort_tables_and_constraints(
             [t for t in tables if self._can_create_table(t)]
@@ -1015,12 +1502,17 @@ class SchemaGenerator(InvokeCreateDDLBase):
                 # e.g., don't omit any foreign key constraints
                 include_foreign_key_constraints = None
 
-            CreateTable(
-                table,
-                include_foreign_key_constraints=(
-                    include_foreign_key_constraints
-                ),
-            )._invoke_with(self.connection)
+            if table._creator_ddl is not None:
+                table_create_ddl = table._creator_ddl
+            else:
+                table_create_ddl = CreateTable(
+                    table,
+                    include_foreign_key_constraints=(
+                        include_foreign_key_constraints
+                    ),
+                )
+
+            table_create_ddl._invoke_with(self.connection)
 
             if hasattr(table, "indexes"):
                 for index in table.indexes:
@@ -1049,7 +1541,9 @@ class SchemaGenerator(InvokeCreateDDLBase):
             return
 
         with self.with_ddl_events(constraint):
-            AddConstraint(constraint)._invoke_with(self.connection)
+            AddConstraint(constraint, isolate_from_table=True)._invoke_with(
+                self.connection
+            )
 
     def visit_sequence(self, sequence, create_ok=False):
         if not create_ok and not self._can_create_sequence(sequence):
@@ -1064,22 +1558,23 @@ class SchemaGenerator(InvokeCreateDDLBase):
             CreateIndex(index)._invoke_with(self.connection)
 
 
-class SchemaDropper(InvokeDropDDLBase):
+class SchemaDropper(InvokeDropDDLBase, _SchemaTableReflector):
     def __init__(
-        self, dialect, connection, checkfirst=False, tables=None, **kwargs
+        self,
+        dialect,
+        connection,
+        checkfirst=CheckFirst.NONE,
+        tables=None,
+        **kwargs,
     ):
-        super().__init__(connection, **kwargs)
-        self.checkfirst = checkfirst
-        self.tables = tables
+        InvokeDropDDLBase.__init__(self, connection, **kwargs)
+        _SchemaTableReflector.__init__(self, dialect, connection, tables)
+        self.checkfirst = CheckFirst(checkfirst)
         self.preparer = dialect.identifier_preparer
-        self.dialect = dialect
         self.memo = {}
 
     def visit_metadata(self, metadata):
-        if self.tables is not None:
-            tables = self.tables
-        else:
-            tables = list(metadata.tables.values())
+        tables = self._update_effective_tables(metadata)
 
         try:
             unsorted_tables = [t for t in tables if self._can_drop_table(t)]
@@ -1158,19 +1653,26 @@ class SchemaDropper(InvokeDropDDLBase):
         effective_schema = self.connection.schema_for_object(table)
         if effective_schema:
             self.dialect.validate_identifier(effective_schema)
-        return not self.checkfirst or self.dialect.has_table(
-            self.connection, table.name, schema=effective_schema
+        bool_to_check = (
+            CheckFirst.TABLES if not table.is_view else CheckFirst.VIEWS
+        )
+
+        return not self.checkfirst & bool_to_check or self._has_table(
+            table, effective_schema
         )
 
     def _can_drop_index(self, index):
         effective_schema = self.connection.schema_for_object(index.table)
         if effective_schema:
             self.dialect.validate_identifier(effective_schema)
-        return not self.checkfirst or self.dialect.has_index(
-            self.connection,
-            index.table.name,
-            index.name,
-            schema=effective_schema,
+        return (
+            not self.checkfirst & CheckFirst.INDEXES
+            or self.dialect.has_index(
+                self.connection,
+                index.table.name,
+                index.name,
+                schema=effective_schema,
+            )
         )
 
     def _can_drop_sequence(self, sequence):
@@ -1178,7 +1680,7 @@ class SchemaDropper(InvokeDropDDLBase):
         return self.dialect.supports_sequences and (
             (not self.dialect.sequences_optional or not sequence.optional)
             and (
-                not self.checkfirst
+                not self.checkfirst & CheckFirst.SEQUENCES
                 or self.dialect.has_sequence(
                     self.connection, sequence.name, schema=effective_schema
                 )
@@ -1207,7 +1709,11 @@ class SchemaDropper(InvokeDropDDLBase):
             checkfirst=self.checkfirst,
             _is_metadata_operation=_is_metadata_operation,
         ):
-            DropTable(table)._invoke_with(self.connection)
+            if table._dropper_ddl is not None:
+                table_dropper_ddl = table._dropper_ddl
+            else:
+                table_dropper_ddl = DropTable(table)
+            table_dropper_ddl._invoke_with(self.connection)
 
             # traverse client side defaults which may refer to server-side
             # sequences. noting that some of these client side defaults may
@@ -1273,13 +1779,6 @@ def sort_tables(
         collection when cycles are detected so that they may be applied
         to a schema separately.
 
-        .. versionchanged:: 1.3.17 - a warning is emitted when
-           :func:`_schema.sort_tables` cannot perform a proper sort due to
-           cyclical dependencies.  This will be an exception in a future
-           release.  Additionally, the sort will continue to return
-           other tables not involved in the cycle in dependency order
-           which was not the case previously.
-
     :param tables: a sequence of :class:`_schema.Table` objects.
 
     :param skip_fn: optional callable which will be passed a
@@ -1312,7 +1811,7 @@ def sort_tables(
                 return None
 
     else:
-        _skip_fn = None  # type: ignore
+        _skip_fn = None  # type: ignore[assignment]
 
     return [
         t
@@ -1326,6 +1825,7 @@ def sort_tables(
     ]
 
 
+@util.preload_module("sqlalchemy.sql.schema")
 def sort_tables_and_constraints(
     tables, filter_fn=None, extra_dependencies=None, _warn_for_cycles=False
 ):
@@ -1371,6 +1871,7 @@ def sort_tables_and_constraints(
 
 
     """
+    Table = util.preloaded.sql_schema.Table
 
     fixed_dependencies = set()
     mutable_dependencies = set()
@@ -1395,6 +1896,22 @@ def sort_tables_and_constraints(
             dependent_on = fkc.referred_table
             if dependent_on is not table:
                 mutable_dependencies.add((dependent_on, table))
+
+        if isinstance(table._creator_ddl, _TableViaSelect):
+            selectable = table._creator_ddl.selectable
+            for selected_table in sql_util.find_tables(
+                selectable,
+                check_columns=True,
+                include_aliases=True,
+                include_joins=True,
+                include_selects=True,
+                include_crud=True,
+            ):
+                if (
+                    isinstance(selected_table, Table)
+                    and selected_table.metadata is table.metadata
+                ):
+                    fixed_dependencies.add((selected_table, table))
 
         fixed_dependencies.update(
             (parent, table) for parent in table._extra_dependencies

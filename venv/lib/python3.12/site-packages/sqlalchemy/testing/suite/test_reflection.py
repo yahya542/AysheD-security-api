@@ -100,24 +100,23 @@ class HasTableTest(OneConnectionTablesTest):
 
     @classmethod
     def define_views(cls, metadata):
-        query = "CREATE VIEW vv AS SELECT id, data FROM test_table"
 
-        event.listen(metadata, "after_create", DDL(query))
-        event.listen(metadata, "before_drop", DDL("DROP VIEW vv"))
+        test_table = metadata.tables["test_table"]
+        sa.CreateView(
+            sa.select(test_table.c.id, test_table.c.data),
+            "vv",
+            metadata=metadata,
+        )
 
         if testing.requires.schemas.enabled:
-            query = (
-                "CREATE VIEW %s.vv AS SELECT id, data FROM %s.test_table_s"
-                % (
-                    config.test_schema,
-                    config.test_schema,
-                )
-            )
-            event.listen(metadata, "after_create", DDL(query))
-            event.listen(
-                metadata,
-                "before_drop",
-                DDL("DROP VIEW %s.vv" % (config.test_schema)),
+            test_table_s = metadata.tables[
+                f"{config.test_schema}.test_table_s"
+            ]
+            sa.CreateView(
+                sa.select(test_table_s.c.id, test_table_s.c.data),
+                "vv",
+                metadata=metadata,
+                schema=config.test_schema,
             )
 
     @classmethod
@@ -157,6 +156,20 @@ class HasTableTest(OneConnectionTablesTest):
             is_false(config.db.dialect.has_table(conn, "test_table_s"))
             is_false(config.db.dialect.has_table(conn, "nonexistent_table"))
 
+    def test_has_multi_table(self):
+        with config.db.begin() as conn:
+            res = dict(
+                config.db.dialect.has_multi_table(
+                    conn, ["test_table", "test_table_s", "nonexistent_table"]
+                )
+            )
+        exp = {
+            (None, "test_table"): True,
+            (None, "test_table_s"): False,
+            (None, "nonexistent_table"): False,
+        }
+        eq_(res, exp)
+
     def test_has_table_cache(self, metadata):
         insp = inspect(config.db)
         is_true(insp.has_table("test_table"))
@@ -190,12 +203,38 @@ class HasTableTest(OneConnectionTablesTest):
             )
 
     @testing.requires.schemas
+    def test_has_multi_table_schema(self):
+
+        with config.db.begin() as conn:
+            res = dict(
+                config.db.dialect.has_multi_table(
+                    conn,
+                    ["test_table", "test_table_s", "nonexistent_table"],
+                    schema=config.test_schema,
+                )
+            )
+        exp = {
+            (config.test_schema, "test_table"): False,
+            (config.test_schema, "test_table_s"): True,
+            (config.test_schema, "nonexistent_table"): False,
+        }
+        eq_(res, exp)
+
+    @testing.requires.schemas
     def test_has_table_nonexistent_schema(self):
         with config.db.begin() as conn:
             is_false(
                 config.db.dialect.has_table(
                     conn, "test_table", schema="nonexistent_schema"
                 )
+            )
+            eq_(
+                dict(
+                    config.db.dialect.has_multi_table(
+                        conn, ["test_table"], schema="nonexistent_schema"
+                    )
+                ),
+                {("nonexistent_schema", "test_table"): False},
             )
 
     @testing.requires.views
@@ -1282,7 +1321,6 @@ class ComponentReflectionTest(ComparesTables, OneConnectionTablesTest):
                 "column_names": list(cols),
                 "name": name,
                 "dialect_options": mock.ANY,
-                "include_columns": [],
             }
             if column_sorting:
                 res["column_sorting"] = column_sorting
@@ -1739,6 +1777,7 @@ class ComponentReflectionTest(ComparesTables, OneConnectionTablesTest):
                             [
                                 sql_types.Integer,
                                 sql_types.Numeric,
+                                sql_types.Float,
                                 sql_types.DateTime,
                                 sql_types.Date,
                                 sql_types.Time,
@@ -2079,8 +2118,6 @@ class ComponentReflectionTest(ComparesTables, OneConnectionTablesTest):
         expected = [
             {"unique": False, "column_names": ["foo"], "name": "user_tmp_ix"}
         ]
-        if testing.requires.index_reflects_included_columns.enabled:
-            expected[0]["include_columns"] = []
         eq_(
             [idx for idx in indexes if idx["name"] == "user_tmp_ix"],
             expected,
@@ -3002,7 +3039,6 @@ class ComponentReflectionTestExtra(ComparesIndexes, fixtures.TestBase):
 
         def completeIndex(entry):
             if testing.requires.index_reflects_included_columns.enabled:
-                entry["include_columns"] = []
                 entry["dialect_options"] = {
                     f"{connection.engine.name}_include": []
                 }
@@ -3085,7 +3121,6 @@ class ComponentReflectionTestExtra(ComparesIndexes, fixtures.TestBase):
                 {
                     "name": "t_idx",
                     "column_names": ["x"],
-                    "include_columns": ["y"],
                     "unique": False,
                     "dialect_options": mock.ANY,
                 }
@@ -3627,54 +3662,139 @@ class CompositeKeyReflectionTest(fixtures.TablesTest):
         eq_(fkey1.get("referred_columns"), ["name", "id", "attr"])
         eq_(fkey1.get("constrained_columns"), ["pname", "pid", "pattr"])
 
+
+class RepeatedColumnForeignKeyTest(fixtures.TestBase):
+    """round trip a FOREIGN KEY which names the same column more than
+    once, e.g. ``FOREIGN KEY (a, a) REFERENCES r (b, c)``.
+
+    """
+
+    __requires__ = ("foreign_key_constraint_reflection",)
+    __backend__ = True
+
     @testing.fixture
     @testing.requires.repeated_column_foreign_keys
-    def fk_repeated_col_fixture(self, connection):
-        connection.exec_driver_sql(
-            """
-            CREATE TABLE rep_fk_t (
-                id INTEGER NOT NULL,
-                cid INTEGER NOT NULL,
-                PRIMARY KEY (id),
-                UNIQUE (id, cid),
-                CONSTRAINT rem_fk_cons FOREIGN KEY (cid, cid) REFERENCES rep_fk_t (id, cid)
-            )"""  # noqa: E501  # can't put a line break in the FOREIGN KEY yet
+    def rep_fk_t(self, connection, metadata):
+        """a table with a FOREIGN KEY that repeats a local column."""
+
+        t = Table(
+            "rep_fk_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("cid", Integer, nullable=False),
+            sa.UniqueConstraint("id", "cid"),
+            sa.ForeignKeyConstraint(
+                ["cid", "cid"],
+                ["rep_fk_t.id", "rep_fk_t.cid"],
+                name="fk_rep_cid",
+            ),
+            test_needs_fk=True,
         )
-        yield
-        connection.exec_driver_sql("DROP TABLE rep_fk_t")
+        metadata.create_all(connection)
+        return t
 
-    def _exp_fk(self, entry):
-        """normalize an inspect.get_foreign_keys() entry across dialects."""
-        if testing.requires.comment_reflection.enabled:
-            entry["comment"] = None
-        return entry
+    @testing.fixture
+    @testing.requires.repeated_remote_col_foreign_keys
+    def remote_fk_t(self, connection, metadata, rep_fk_t):
+        """a table with a FOREIGN KEY that repeats a remote column."""
 
-    @testing.requires.foreign_key_constraint_reflection
-    def test_fk_repeated_source_cols_reported_by_inspector(
-        self, connection, fk_repeated_col_fixture
-    ):
-        """test the inspector can retrieve foreign keys with repeated
-        source columns.
+        t = Table(
+            "remote_fk_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("cid", Integer, nullable=False),
+            sa.UniqueConstraint("id", "cid"),
+            sa.ForeignKeyConstraint(
+                ["id", "cid"],
+                ["rep_fk_t.id", "rep_fk_t.id"],
+                name="fk_remote_cid",
+            ),
+            test_needs_fk=True,
+        )
+        metadata.create_all(connection)
+        return t
 
-        See issue #13525 which addressed this on the schema construction
-        side.
+    def _exp_fk(self, **kw):
+        """an expected ``get_foreign_keys()`` entry.
+
+        ``comment`` is only present for dialects that reflect constraint
+        comments.
 
         """
+        exp = dict(referred_schema=None, options={}, **kw)
+        if testing.requires.constraint_comment_reflection.enabled:
+            exp["comment"] = None
+        return exp
 
+    def test_get_foreign_keys_local_repeated(self, connection, rep_fk_t):
+        insp = inspect(connection)
+        fkeys = insp.get_foreign_keys("rep_fk_t")
         eq_(
-            inspect(connection).get_foreign_keys("rep_fk_t"),
+            fkeys,
             [
                 self._exp_fk(
-                    {
-                        "name": "rem_fk_cons",
-                        "constrained_columns": ["cid", "cid"],
-                        "referred_schema": None,
-                        "referred_table": "rep_fk_t",
-                        "referred_columns": ["id", "cid"],
-                        "options": {},
-                    }
+                    name="fk_rep_cid",
+                    constrained_columns=["cid", "cid"],
+                    referred_table="rep_fk_t",
+                    referred_columns=["id", "cid"],
                 )
             ],
+        )
+
+    def test_get_foreign_keys_remote_repeated(self, connection, remote_fk_t):
+        insp = inspect(connection)
+        fkeys = insp.get_foreign_keys("remote_fk_t")
+        eq_(
+            fkeys,
+            [
+                self._exp_fk(
+                    name="fk_remote_cid",
+                    constrained_columns=["id", "cid"],
+                    referred_table="rep_fk_t",
+                    referred_columns=["id", "id"],
+                )
+            ],
+        )
+
+    def test_reflect_constraint_local_repeated(self, connection, rep_fk_t):
+        t = Table("rep_fk_t", MetaData(), autoload_with=connection)
+
+        fkcs = [
+            const
+            for const in t.constraints
+            if isinstance(const, sa.ForeignKeyConstraint)
+        ]
+
+        eq_(len(fkcs), 1)
+        fkc = fkcs[0]
+
+        eq_(fkc.column_keys, ["cid", "cid"])
+        eq_(list(fkc.columns), [t.c.cid, t.c.cid])
+        eq_(
+            [(fk.parent, fk.column) for fk in fkc.elements],
+            [(t.c.cid, t.c.id), (t.c.cid, t.c.cid)],
+        )
+
+    def test_reflect_constraint_remote_repeated(self, connection, remote_fk_t):
+        t = Table("remote_fk_t", MetaData(), autoload_with=connection)
+
+        fkcs = [
+            const
+            for const in t.constraints
+            if isinstance(const, sa.ForeignKeyConstraint)
+        ]
+
+        eq_(len(fkcs), 1)
+        fkc = fkcs[0]
+
+        # the referred table is reflected into the same MetaData
+        remote = t.metadata.tables["rep_fk_t"]
+
+        eq_(fkc.column_keys, ["id", "cid"])
+        eq_(list(fkc.columns), [t.c.id, t.c.cid])
+        eq_(
+            [(fk.parent, fk.column) for fk in fkc.elements],
+            [(t.c.id, remote.c.id), (t.c.cid, remote.c.id)],
         )
 
 
@@ -3690,5 +3810,6 @@ __all__ = (
     "ComputedReflectionTest",
     "IdentityReflectionTest",
     "CompositeKeyReflectionTest",
+    "RepeatedColumnForeignKeyTest",
     "TempTableElementsTest",
 )

@@ -31,6 +31,7 @@ from typing import Callable
 from typing import Dict
 from typing import Iterable
 from typing import Optional
+from typing import Protocol
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
@@ -49,30 +50,31 @@ from ..orm.query import Query
 from ..orm.session import _BindArguments
 from ..orm.session import _PKIdentityArgument
 from ..orm.session import Session
-from ..util.typing import Protocol
 from ..util.typing import Self
+from ..util.typing import TupleAny
+from ..util.typing import TypeVarTuple
+from ..util.typing import Unpack
 
 if TYPE_CHECKING:
     from ..engine.base import Connection
     from ..engine.base import Engine
     from ..engine.base import OptionEngine
-    from ..engine.result import IteratorResult
     from ..engine.result import Result
     from ..orm import LoaderCallableStatus
     from ..orm._typing import _O
-    from ..orm.bulk_persistence import BulkUDCompileState
+    from ..orm.bulk_persistence import _BulkUDCompileState
     from ..orm.context import QueryContext
     from ..orm.session import _EntityBindKey
     from ..orm.session import _SessionBind
     from ..orm.session import ORMExecuteState
     from ..orm.state import InstanceState
     from ..sql import Executable
-    from ..sql._typing import _TP
     from ..sql.elements import ClauseElement
 
 __all__ = ["ShardedSession", "ShardedQuery"]
 
 _T = TypeVar("_T", bound=Any)
+_Ts = TypeVarTuple("_Ts")
 
 
 ShardIdentifier = str
@@ -423,13 +425,13 @@ class set_shard_id(ORMOption):
 
 def execute_and_instances(
     orm_context: ORMExecuteState,
-) -> Union[Result[_T], IteratorResult[_TP]]:
+) -> Result[Unpack[TupleAny]]:
     active_options: Union[
         None,
         QueryContext.default_load_options,
         Type[QueryContext.default_load_options],
-        BulkUDCompileState.default_update_options,
-        Type[BulkUDCompileState.default_update_options],
+        _BulkUDCompileState.default_update_options,
+        Type[_BulkUDCompileState.default_update_options],
     ]
 
     if orm_context.is_select:
@@ -445,7 +447,7 @@ def execute_and_instances(
 
     def iter_for_shard(
         shard_id: ShardIdentifier,
-    ) -> Union[Result[_T], IteratorResult[_TP]]:
+    ) -> Result[Unpack[TupleAny]]:
         bind_arguments = dict(orm_context.bind_arguments)
         bind_arguments["shard_id"] = shard_id
 

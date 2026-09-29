@@ -100,14 +100,6 @@ is set to ``False`` on any integer primary key column::
    ``dialect_options`` key in :meth:`_reflection.Inspector.get_columns`.
    Use the information in the ``identity`` key instead.
 
-.. deprecated:: 1.3
-
-   The use of :class:`.Sequence` to specify IDENTITY characteristics is
-   deprecated and will be removed in a future release.   Please use
-   the :class:`_schema.Identity` object parameters
-   :paramref:`_schema.Identity.start` and
-   :paramref:`_schema.Identity.increment`.
-
 .. versionchanged::  1.4   Removed the ability to use a :class:`.Sequence`
    object to modify IDENTITY characteristics. :class:`.Sequence` objects
    now only manipulate true T-SQL SEQUENCE types.
@@ -167,13 +159,6 @@ The CREATE TABLE for the above :class:`_schema.Table` object would be:
    The :class:`_schema.Identity` object supports many other parameter in
    addition to ``start`` and ``increment``. These are not supported by
    SQL Server and will be ignored when generating the CREATE TABLE ddl.
-
-.. versionchanged:: 1.3.19  The :class:`_schema.Identity` object is
-   now used to affect the
-   ``IDENTITY`` generator for a :class:`_schema.Column` under  SQL Server.
-   Previously, the :class:`.Sequence` object was used.  As SQL Server now
-   supports real sequences as a separate construct, :class:`.Sequence` will be
-   functional in the normal way starting from SQLAlchemy version 1.4.
 
 
 Using IDENTITY with Non-Integer numeric types
@@ -717,10 +702,6 @@ or embedded dots, use two sets of brackets::
         schema="[MyDataBase.Period].[MyOwner.Dot]",
     )
 
-.. versionchanged:: 1.2 the SQL Server dialect now treats brackets as
-   identifier delimiters splitting the schema into separate database
-   and owner tokens, to allow dots within either name itself.
-
 .. _legacy_schema_rendering:
 
 Legacy Schema Mode
@@ -880,8 +861,6 @@ names::
 
 would render the index as ``CREATE INDEX my_index ON table (x) WHERE x > 10``.
 
-.. versionadded:: 1.3.4
-
 Index ordering
 ^^^^^^^^^^^^^^
 
@@ -982,9 +961,11 @@ from __future__ import annotations
 
 import codecs
 import datetime
+from functools import lru_cache
 import operator
 import re
 from typing import Any
+from typing import Literal
 from typing import overload
 from typing import TYPE_CHECKING
 from uuid import UUID as _python_UUID
@@ -1002,19 +983,21 @@ from ... import text
 from ... import util
 from ...engine import cursor as _cursor
 from ...engine import default
+from ...engine import ObjectKind
+from ...engine import ObjectScope
 from ...engine import reflection
 from ...engine.reflection import ReflectionDefaults
 from ...sql import coercions
 from ...sql import compiler
 from ...sql import elements
 from ...sql import expression
-from ...sql import func
 from ...sql import quoted_name
 from ...sql import roles
 from ...sql import sqltypes
 from ...sql import try_cast as try_cast  # noqa: F401
 from ...sql import util as sql_util
 from ...sql._typing import is_sql_compiler
+from ...sql.compiler import AggregateOrderByStyle
 from ...sql.compiler import InsertmanyvaluesSentinelOpts
 from ...sql.elements import TryCast as TryCast  # noqa: F401
 from ...types import BIGINT
@@ -1032,7 +1015,6 @@ from ...types import SMALLINT
 from ...types import TEXT
 from ...types import VARCHAR
 from ...util import update_wrapper
-from ...util.typing import Literal
 
 if TYPE_CHECKING:
     from ...sql.ddl import DropIndex
@@ -1409,8 +1391,6 @@ class TIMESTAMP(sqltypes._Binary):
     TIMESTAMP type, which is not supported by SQL Server.  It
     is a read-only datatype that does not support INSERT of values.
 
-    .. versionadded:: 1.2
-
     .. seealso::
 
         :class:`_mssql.ROWVERSION`
@@ -1427,8 +1407,6 @@ class TIMESTAMP(sqltypes._Binary):
 
         :param convert_int: if True, binary integer values will
          be converted to integers on read.
-
-        .. versionadded:: 1.2
 
         """
         self.convert_int = convert_int
@@ -1462,8 +1440,6 @@ class ROWVERSION(TIMESTAMP):
     :class:`_mssql.TIMESTAMP`.
 
     This is a read-only datatype that does not support INSERT of values.
-
-    .. versionadded:: 1.2
 
     .. seealso::
 
@@ -1626,7 +1602,7 @@ class UNIQUEIDENTIFIER(sqltypes.Uuid[sqltypes._UUID_RETURN]):
          as Python uuid objects, converting to/from string via the
          DBAPI.
 
-         .. versionchanged: 2.0 Added direct "uuid" support to the
+         .. versionchanged:: 2.0 Added direct "uuid" support to the
             :class:`_mssql.UNIQUEIDENTIFIER` datatype; uuid interpretation
             defaults to ``True``.
 
@@ -1864,6 +1840,7 @@ class MSTypeCompiler(compiler.GenericTypeCompiler):
 
 
 class MSExecutionContext(default.DefaultExecutionContext):
+    _embedded_scope_identity = False
     _enable_identity_insert = False
     _select_lastrowid = False
     _lastrowid = None
@@ -1926,15 +1903,46 @@ class MSExecutionContext(default.DefaultExecutionContext):
                     self,
                 )
 
+            # don't embed the scope_identity select into an
+            # "INSERT .. DEFAULT VALUES"
+            if (
+                self._select_lastrowid
+                and self.dialect.scope_identity_must_be_embedded
+                and self.dialect.use_scope_identity
+                and len(self.parameters[0])
+            ):
+                self._embedded_scope_identity = True
+
+                self.statement += "; select scope_identity()"
+
     def post_exec(self):
-        """Disable IDENTITY_INSERT if enabled."""
 
         conn = self.root_connection
 
         if self.isinsert or self.isupdate or self.isdelete:
             self._rowcount = self.cursor.rowcount
 
-        if self._select_lastrowid:
+        # handle INSERT with embedded SELECT SCOPE_IDENTITY() call
+        if self._embedded_scope_identity:
+            # Fetch the last inserted id from the manipulated statement
+            # We may have to skip over a number of result sets with
+            # no data (due to triggers, etc.) so run up to three times
+
+            row = None
+            for _ in range(3):
+                if self.cursor.description:
+                    rows = self.cursor.fetchall()
+                    if rows:
+                        row = rows[0]
+                        break
+                else:
+                    self.cursor.nextset()
+
+            self._lastrowid = int(row[0]) if row else None
+
+            self.cursor_fetch_strategy = _cursor._NO_CURSOR_DML
+
+        elif self._select_lastrowid:
             if self.dialect.use_scope_identity:
                 conn._cursor_execute(
                     self.cursor,
@@ -1965,6 +1973,7 @@ class MSExecutionContext(default.DefaultExecutionContext):
             )
 
         if self._enable_identity_insert:
+            # Disable IDENTITY_INSERT if enabled.
             if TYPE_CHECKING:
                 assert is_sql_compiler(self.compiled)
                 assert isinstance(self.compiled.compile_state, DMLState)
@@ -2037,9 +2046,9 @@ class MSSQLCompiler(compiler.SQLCompiler):
         self.tablealiases = {}
         super().__init__(*args, **kwargs)
 
-    def _format_frame_clause(self, range_, **kw):
+    def visit_frame_clause(self, frameclause, **kw):
         kw["literal_execute"] = True
-        return super()._format_frame_clause(range_, **kw)
+        return super().visit_frame_clause(frameclause, **kw)
 
     def _with_legacy_schema_aliasing(fn):
         def decorate(self, *arg, **kw):
@@ -2064,10 +2073,19 @@ class MSSQLCompiler(compiler.SQLCompiler):
         return "LEN%s" % self.function_argspec(fn, **kw)
 
     def visit_aggregate_strings_func(self, fn, **kw):
-        expr = fn.clauses.clauses[0]._compiler_dispatch(self, **kw)
-        kw["literal_execute"] = True
-        delimiter = fn.clauses.clauses[1]._compiler_dispatch(self, **kw)
-        return f"string_agg({expr}, {delimiter})"
+        cl = list(fn.clauses)
+        expr, delimiter = cl[0:2]
+
+        literal_exec = dict(kw)
+        literal_exec["literal_execute"] = True
+
+        return (
+            f"string_agg({expr._compiler_dispatch(self, **kw)}, "
+            f"{delimiter._compiler_dispatch(self, **literal_exec)})"
+        )
+
+    def visit_pow_func(self, fn, **kw):
+        return f"POWER{self.function_argspec(fn)}"
 
     def visit_concat_op_expression_clauselist(
         self, clauselist, operator, **kw
@@ -2490,7 +2508,7 @@ class MSSQLCompiler(compiler.SQLCompiler):
                 self.process(binary.left, **kw),
                 self.process(binary.right, **kw),
             )
-        elif binary.type._type_affinity is sqltypes.Numeric:
+        elif binary.type._type_affinity in (sqltypes.Numeric, sqltypes.Float):
             type_expression = "ELSE CAST(JSON_VALUE(%s, %s) AS %s)" % (
                 self.process(binary.left, **kw),
                 self.process(binary.right, **kw),
@@ -2505,7 +2523,12 @@ class MSSQLCompiler(compiler.SQLCompiler):
             # the NULL handling is particularly weird with boolean, so
             # explicitly return numeric (BIT) constants
             type_expression = (
-                "WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE NULL"
+                "WHEN 'true' THEN 1 WHEN 'false' THEN 0 ELSE "
+                "CAST(JSON_VALUE(%s, %s) AS BIT)"
+                % (
+                    self.process(binary.left, **kw),
+                    self.process(binary.right, **kw),
+                )
             )
         elif binary.type._type_affinity is sqltypes.String:
             # TODO: does this comment (from mysql) apply to here, too?
@@ -2710,6 +2733,47 @@ class MSDDLCompiler(compiler.DDLCompiler):
         if_exists = " IF EXISTS" if drop.if_exists else ""
         return f"\nDROP INDEX{if_exists} {index_name} ON {table_name}"
 
+    def visit_create_table_as(self, element, **kw):
+        prep = self.preparer
+
+        # SQL Server doesn't support CREATE TABLE AS, use SELECT INTO instead
+        # Format: SELECT columns INTO new_table FROM source WHERE ...
+
+        qualified = prep.format_table(element.table)
+
+        # Get the inner SELECT SQL
+        inner_kw = dict(kw)
+        inner_kw["literal_binds"] = True
+        select_sql = self.sql_compiler.process(element.selectable, **inner_kw)
+
+        # Inject INTO clause before FROM keyword
+        # Find FROM position (case-insensitive)
+        select_upper = select_sql.upper()
+        from_idx = select_upper.find(" FROM ")
+        if from_idx == -1:
+            from_idx = select_upper.find("\nFROM ")
+
+        if from_idx == -1:
+            raise exc.CompileError(
+                "Could not find FROM keyword in selectable for CREATE TABLE AS"
+            )
+
+        # Insert INTO clause before FROM
+        result = (
+            select_sql[:from_idx]
+            + f"INTO {qualified} "
+            + select_sql[from_idx:]
+        )
+
+        return result
+
+    def visit_create_view(self, create, **kw):
+        # SQL Server uses CREATE OR ALTER instead of CREATE OR REPLACE
+        result = super().visit_create_view(create, **kw)
+        if create.or_replace:
+            result = result.replace("CREATE OR REPLACE", "CREATE OR ALTER")
+        return result
+
     def visit_primary_key_constraint(self, constraint, **kw):
         if len(constraint) == 0:
             return ""
@@ -2855,22 +2919,8 @@ class MSIdentifierPreparer(compiler.IdentifierPreparer):
     def _unescape_identifier(self, value):
         return value.replace("]]", "]")
 
-    def quote_schema(self, schema, force=None):
+    def quote_schema(self, schema):
         """Prepare a quoted table and schema name."""
-
-        # need to re-implement the deprecation warning entirely
-        if force is not None:
-            # not using the util.deprecated_params() decorator in this
-            # case because of the additional function call overhead on this
-            # very performance-critical spot.
-            util.warn_deprecated(
-                "The IdentifierPreparer.quote_schema.force parameter is "
-                "deprecated and will be removed in a future release.  This "
-                "flag has no effect on the behavior of the "
-                "IdentifierPreparer.quote method; please refer to "
-                "quoted_name().",
-                version="1.3",
-            )
 
         dbname, owner = _schema_elements(schema)
         if dbname:
@@ -2910,6 +2960,24 @@ def _db_plus_owner(fn):
             dialect,
             connection,
             tablename,
+            dbname,
+            owner,
+            schema,
+            **kw,
+        )
+
+    return update_wrapper(wrap, fn)
+
+
+def _db_plus_owner_multi(fn):
+    def wrap(dialect, connection, schema=None, **kw):
+        dbname, owner = _owner_plus_db(dialect, schema)
+        return _switch_db(
+            dbname,
+            connection,
+            fn,
+            dialect,
+            connection,
             dbname,
             owner,
             schema,
@@ -3004,13 +3072,14 @@ def _schema_elements(schema):
     return dbname, owner
 
 
-class MSDialect(default.DefaultDialect):
+class MSDialect(default._BackendsMultiReflection, default.DefaultDialect):
     # will assume it's at least mssql2005
     name = "mssql"
     supports_statement_cache = True
     supports_default_values = True
     supports_empty_insert = False
     favor_returning_over_lastrowid = True
+    scope_identity_must_be_embedded = False
 
     returns_native_bytes = True
 
@@ -3021,6 +3090,8 @@ class MSDialect(default.DefaultDialect):
     so we can't turn this on.
 
     """
+
+    aggregate_order_by_style = AggregateOrderByStyle.WITHIN_GROUP
 
     # supports_native_uuid is partial here, so we implement our
     # own impl type
@@ -3238,6 +3309,7 @@ class MSDialect(default.DefaultDialect):
                 'attempting to query the "{}" view.'.format(err, view_name)
             ) from err
         else:
+
             row = cursor.fetchone()
             return row[0].upper()
         finally:
@@ -3301,11 +3373,29 @@ class MSDialect(default.DefaultDialect):
         else:
             return self.schema_name
 
+    @reflection.cache
     @_db_plus_owner
     def has_table(self, connection, tablename, dbname, owner, schema, **kw):
         self._ensure_has_table_connection(connection)
 
-        return self._internal_has_table(connection, tablename, owner, **kw)
+        return self._internal_has_multi_table(
+            connection, [tablename], owner, schema, **kw
+        )[schema, tablename]
+
+    def has_multi_table(self, connection, table_names, schema=None, **kw):
+        # this does not really matche the signature of _db_plus_owner_multi
+        # so manually do the unpacking here
+        dbname, owner = _owner_plus_db(self, schema)
+        return _switch_db(
+            dbname,
+            connection,
+            self._internal_has_multi_table,
+            connection,
+            table_names,
+            owner,
+            schema,
+            **kw,
+        ).items()
 
     @reflection.cache
     @_db_plus_owner
@@ -3380,157 +3470,38 @@ class MSDialect(default.DefaultDialect):
         view_names = [r[0] for r in connection.execute(s)]
         return view_names
 
-    @reflection.cache
-    def _internal_has_table(self, connection, tablename, owner, **kw):
-        if tablename.startswith("#"):  # temporary table
+    def _internal_has_multi_table(
+        self, connection, table_names, owner, schema, **kw
+    ):
+        regular_names, multi_object_names, temp_names = (
+            self._partition_filter_names(
+                connection, owner, table_names, ObjectScope.ANY, ObjectKind.ANY
+            )
+        )
+
+        result = {}
+        if multi_object_names:
+            # in multi_object_names we already have the names that exist in
+            # the database, no need to do another query here
+            name_map = self._multi_name_map(regular_names)
+            for server_name in multi_object_names:
+                result[(schema, name_map(server_name))] = True
+
+        if temp_names:
             # mssql does not support temporary views
-            # SQL Error [4103] [S0001]: "#v": Temporary views are not allowed
-            return bool(
-                connection.scalar(
-                    # U filters on user tables only.
-                    text("SELECT object_id(:table_name, 'U')"),
-                    {"table_name": f"tempdb.dbo.[{tablename}]"},
+            # U filters on user tables only.
+            query = text("SELECT object_id(:table_name, 'U')")
+            for temp_name in temp_names:
+                result[(schema, temp_name)] = bool(
+                    connection.scalar(
+                        query,
+                        {"table_name": f"tempdb..[{temp_name}]"},
+                    )
                 )
-            )
-        else:
-            tables = ischema.tables
 
-            s = sql.select(tables.c.table_name).where(
-                sql.and_(
-                    sql.or_(
-                        tables.c.table_type == "BASE TABLE",
-                        tables.c.table_type == "VIEW",
-                    ),
-                    tables.c.table_name == tablename,
-                )
-            )
-
-            if owner:
-                s = s.where(tables.c.table_schema == owner)
-
-            c = connection.execute(s)
-
-            return c.first() is not None
-
-    def _default_or_error(self, connection, tablename, owner, method, **kw):
-        # TODO: try to avoid having to run a separate query here
-        if self._internal_has_table(connection, tablename, owner, **kw):
-            return method()
-        else:
-            raise exc.NoSuchTableError(f"{owner}.{tablename}")
-
-    @reflection.cache
-    @_db_plus_owner
-    def get_indexes(self, connection, tablename, dbname, owner, schema, **kw):
-        filter_definition = (
-            "ind.filter_definition"
-            if self.server_version_info >= MS_2008_VERSION
-            else "NULL as filter_definition"
-        )
-        rp = connection.execution_options(future_result=True).execute(
-            sql.text(f"""
-select
-    ind.index_id,
-    ind.is_unique,
-    ind.name,
-    ind.type,
-    {filter_definition}
-from
-    sys.indexes as ind
-join sys.tables as tab on
-    ind.object_id = tab.object_id
-join sys.schemas as sch on
-    sch.schema_id = tab.schema_id
-where
-    tab.name = :tabname
-    and sch.name = :schname
-    and ind.is_primary_key = 0
-    and ind.type != 0
-order by
-    ind.name
-                """)
-            .bindparams(
-                sql.bindparam("tabname", tablename, ischema.CoerceUnicode()),
-                sql.bindparam("schname", owner, ischema.CoerceUnicode()),
-            )
-            .columns(name=sqltypes.Unicode())
-        )
-        indexes = {}
-        for row in rp.mappings():
-            indexes[row["index_id"]] = current = {
-                "name": row["name"],
-                "unique": row["is_unique"] == 1,
-                "column_names": [],
-                "include_columns": [],
-                "dialect_options": {},
-            }
-
-            do = current["dialect_options"]
-            index_type = row["type"]
-            if index_type in {1, 2}:
-                do["mssql_clustered"] = index_type == 1
-            if index_type in {5, 6}:
-                do["mssql_clustered"] = index_type == 5
-                do["mssql_columnstore"] = True
-            if row["filter_definition"] is not None:
-                do["mssql_where"] = row["filter_definition"]
-
-        rp = connection.execution_options(future_result=True).execute(
-            sql.text("""
-select
-    ind_col.index_id,
-    col.name,
-    ind_col.is_included_column
-from
-    sys.columns as col
-join sys.tables as tab on
-    tab.object_id = col.object_id
-join sys.index_columns as ind_col on
-    ind_col.column_id = col.column_id
-    and ind_col.object_id = tab.object_id
-join sys.schemas as sch on
-    sch.schema_id = tab.schema_id
-where
-    tab.name = :tabname
-    and sch.name = :schname
-order by
-    ind_col.index_id,
-    ind_col.key_ordinal
-            """)
-            .bindparams(
-                sql.bindparam("tabname", tablename, ischema.CoerceUnicode()),
-                sql.bindparam("schname", owner, ischema.CoerceUnicode()),
-            )
-            .columns(name=sqltypes.Unicode())
-        )
-        for row in rp.mappings():
-            if row["index_id"] not in indexes:
-                continue
-            index_def = indexes[row["index_id"]]
-            is_colstore = index_def["dialect_options"].get("mssql_columnstore")
-            is_clustered = index_def["dialect_options"].get("mssql_clustered")
-            if not (is_colstore and is_clustered):
-                # a clustered columnstore index includes all columns but does
-                # not want them in the index definition
-                if row["is_included_column"] and not is_colstore:
-                    # a noncludsted columnstore index reports that includes
-                    # columns but requires that are listed as normal columns
-                    index_def["include_columns"].append(row["name"])
-                else:
-                    index_def["column_names"].append(row["name"])
-        for index_info in indexes.values():
-            # NOTE: "root level" include_columns is legacy, now part of
-            #       dialect_options (issue #7382)
-            index_info["dialect_options"]["mssql_include"] = index_info[
-                "include_columns"
-            ]
-
-        if indexes:
-            return list(indexes.values())
-        else:
-            return self._default_or_error(
-                connection, tablename, owner, ReflectionDefaults.indexes, **kw
-            )
+        for name in table_names:
+            result.setdefault((schema, name), False)
+        return result
 
     @reflection.cache
     @_db_plus_owner
@@ -3553,38 +3524,6 @@ order by
             return view_def
         else:
             raise exc.NoSuchTableError(f"{owner}.{viewname}")
-
-    @reflection.cache
-    def get_table_comment(self, connection, table_name, schema=None, **kw):
-        if not self.supports_comments:
-            raise NotImplementedError(
-                "Can't get table comments on current SQL Server version in use"
-            )
-
-        schema_name = schema if schema else self.default_schema_name
-        COMMENT_SQL = """
-            SELECT cast(com.value as nvarchar(max))
-            FROM fn_listextendedproperty('MS_Description',
-                'schema', :schema, 'table', :table, NULL, NULL
-            ) as com;
-        """
-
-        comment = connection.execute(
-            sql.text(COMMENT_SQL).bindparams(
-                sql.bindparam("schema", schema_name, ischema.CoerceUnicode()),
-                sql.bindparam("table", table_name, ischema.CoerceUnicode()),
-            )
-        ).scalar()
-        if comment:
-            return {"text": comment}
-        else:
-            return self._default_or_error(
-                connection,
-                table_name,
-                None,
-                ReflectionDefaults.table_comment,
-                **kw,
-            )
 
     def _temp_table_name_like_pattern(self, tablename):
         # LIKE uses '%' to match zero or more characters and '_' to match any
@@ -3621,9 +3560,113 @@ order by
                 % tablename
             ) from ne
 
-    @reflection.cache
-    @_db_plus_owner
-    def get_columns(self, connection, tablename, dbname, owner, schema, **kw):
+    def _parse_column_info(
+        self,
+        name,
+        type_,
+        nullable,
+        maxlen,
+        numericprec,
+        numericscale,
+        default,
+        collation,
+        definition,
+        is_persisted,
+        is_identity,
+        identity_start,
+        identity_increment,
+        comment,
+        base_type=None,
+    ):
+        # Try to resolve the user type first (e.g., "sysname"),
+        # then fall back to the base type (e.g., "nvarchar").
+        # base_type may be None for CLR types (geography, geometry,
+        # hierarchyid) which have no corresponding base type.
+        coltype = self.ischema_names.get(type_, None)
+        if coltype is None and base_type is not None and base_type != type_:
+            coltype = self.ischema_names.get(base_type, None)
+        kwargs = {}
+
+        if coltype in (MSBinary, MSVarBinary, sqltypes.LargeBinary):
+            kwargs["length"] = maxlen if maxlen != -1 else None
+        elif coltype in (MSString, MSChar):
+            kwargs["length"] = maxlen if maxlen != -1 else None
+            if collation:
+                kwargs["collation"] = collation
+        elif coltype in (MSNVarchar, MSNChar):
+            kwargs["length"] = maxlen // 2 if maxlen != -1 else None
+            if collation:
+                kwargs["collation"] = collation
+        elif coltype in (MSText, MSNText):
+            # TEXT / NTEXT are unlengthed LOB types.  sys.columns.max_length
+            # reports 16 for these, which is the size of the in-row LOB
+            # pointer and not a character length, so no length is applied.
+            if collation:
+                kwargs["collation"] = collation
+
+        if coltype is None:
+            if base_type is not None and base_type != type_:
+                util.warn(
+                    "Did not recognize type '%s' (user type) or '%s' "
+                    "(base type) of column '%s'" % (type_, base_type, name)
+                )
+            else:
+                util.warn(
+                    "Did not recognize type '%s' of column '%s'"
+                    % (type_, name)
+                )
+            coltype = sqltypes.NULLTYPE
+        else:
+            if issubclass(coltype, sqltypes.NumericCommon):
+                kwargs["precision"] = numericprec
+                if not issubclass(coltype, sqltypes.Float):
+                    kwargs["scale"] = numericscale
+            coltype = coltype(**kwargs)
+
+        cdict = {
+            "name": name,
+            "type": coltype,
+            "nullable": nullable,
+            "default": default,
+            "autoincrement": is_identity is not None,
+            "comment": comment,
+        }
+
+        if definition is not None and is_persisted is not None:
+            cdict["computed"] = {
+                "sqltext": definition,
+                "persisted": is_persisted,
+            }
+
+        if is_identity is not None:
+            if identity_start is None or identity_increment is None:
+                cdict["identity"] = {}
+            else:
+                if isinstance(
+                    coltype, (sqltypes.BigInteger, sqltypes.Integer)
+                ):
+                    start = int(identity_start)
+                    increment = int(identity_increment)
+                else:
+                    start = identity_start
+                    increment = identity_increment
+                cdict["identity"] = {
+                    "start": start,
+                    "increment": increment,
+                }
+
+        return cdict
+
+    @lru_cache()
+    def _columns_select(self):
+        """Build the unified Core sys.* select for column reflection.
+
+        Returns a ``select()`` that includes ``table_name`` and ``owner``
+        in the result so callers can group rows by table.
+
+        Used by :meth:`.get_multi_columns` (and indirectly by
+        :meth:`.get_columns` via the multi delegation).
+        """
         sys_columns = ischema.sys_columns
         sys_types = ischema.sys_types
         sys_base_types = ischema.sys_types.alias("base_types")
@@ -3631,30 +3674,8 @@ order by
         computed_cols = ischema.computed_columns
         identity_cols = ischema.identity_columns
         extended_properties = ischema.extended_properties
-
-        # to access sys tables, need an object_id.
-        # object_id() can normally match to the unquoted name even if it
-        # has special characters. however it also accepts quoted names,
-        # which means for the special case that the name itself has
-        # "quotes" (e.g. brackets for SQL Server) we need to "quote" (e.g.
-        # bracket) that name anyway.  Fixed as part of #12654
-
-        is_temp_table = tablename.startswith("#")
-        if is_temp_table:
-            owner, tablename = self._get_internal_temp_table_name(
-                connection, tablename
-            )
-
-        object_id_tokens = [self.identifier_preparer.quote(tablename)]
-        if owner:
-            object_id_tokens.insert(0, self.identifier_preparer.quote(owner))
-
-        if is_temp_table:
-            object_id_tokens.insert(0, "tempdb")
-
-        object_id = func.object_id(".".join(object_id_tokens))
-
-        whereclause = sys_columns.c.object_id == object_id
+        sys_objects = ischema.sys_objects
+        sys_schemas = ischema.sys_schemas
 
         if self._supports_nvarchar_max:
             computed_definition = computed_cols.c.definition
@@ -3666,23 +3687,34 @@ order by
 
         s = (
             sql.select(
-                sys_columns.c.name,
-                sys_types.c.name,
+                sys_objects.c.name.label("table_name"),
+                sys_schemas.c.name.label("owner"),
+                sys_columns.c.name.label("column_name"),
+                sys_types.c.name.label("type_name"),
                 sys_base_types.c.name.label("base_type"),
                 sys_columns.c.is_nullable,
                 sys_columns.c.max_length,
                 sys_columns.c.precision,
                 sys_columns.c.scale,
-                sys_default_constraints.c.definition,
+                sys_default_constraints.c.definition.label("default_value"),
                 sys_columns.c.collation_name,
-                computed_definition,
+                computed_definition.label("computed_definition"),
                 computed_cols.c.is_persisted,
                 identity_cols.c.is_identity,
                 identity_cols.c.seed_value,
                 identity_cols.c.increment_value,
                 extended_properties.c.value.label("comment"),
+                sys_columns.c.column_id,
             )
             .select_from(sys_columns)
+            .join(
+                sys_objects,
+                onclause=sys_columns.c.object_id == sys_objects.c.object_id,
+            )
+            .join(
+                sys_schemas,
+                onclause=sys_objects.c.schema_id == sys_schemas.c.schema_id,
+            )
             .join(
                 sys_types,
                 onclause=sys_columns.c.user_type_id
@@ -3729,208 +3761,19 @@ order by
                     sys_columns.c.column_id == extended_properties.c.minor_id,
                 ),
             )
-            .where(whereclause)
-            .order_by(sys_columns.c.column_id)
-        )
-
-        if is_temp_table:
-            exec_opts = {"schema_translate_map": {"sys": "tempdb.sys"}}
-        else:
-            exec_opts = {"schema_translate_map": {}}
-        c = connection.execution_options(**exec_opts).execute(s)
-
-        cols = []
-        for row in c.mappings():
-            name = row[sys_columns.c.name]
-            type_ = row[sys_types.c.name]
-            base_type = row["base_type"]
-            nullable = row[sys_columns.c.is_nullable] == 1
-            maxlen = row[sys_columns.c.max_length]
-            numericprec = row[sys_columns.c.precision]
-            numericscale = row[sys_columns.c.scale]
-            default = row[sys_default_constraints.c.definition]
-            collation = row[sys_columns.c.collation_name]
-            definition = row[computed_definition]
-            is_persisted = row[computed_cols.c.is_persisted]
-            is_identity = row[identity_cols.c.is_identity]
-            identity_start = row[identity_cols.c.seed_value]
-            identity_increment = row[identity_cols.c.increment_value]
-            comment = row[extended_properties.c.value]
-
-            # Try to resolve the user type first (e.g., "sysname"),
-            # then fall back to the base type (e.g., "nvarchar").
-            # base_type may be None for CLR types (geography, geometry,
-            # hierarchyid) which have no corresponding base type.
-            coltype = self.ischema_names.get(type_, None)
-            if (
-                coltype is None
-                and base_type is not None
-                and base_type != type_
-            ):
-                coltype = self.ischema_names.get(base_type, None)
-
-            kwargs = {}
-
-            if coltype in (
-                MSBinary,
-                MSVarBinary,
-                sqltypes.LargeBinary,
-            ):
-                kwargs["length"] = maxlen if maxlen != -1 else None
-            elif coltype in (
-                MSString,
-                MSChar,
-            ):
-                kwargs["length"] = maxlen if maxlen != -1 else None
-                if collation:
-                    kwargs["collation"] = collation
-            elif coltype in (
-                MSNVarchar,
-                MSNChar,
-            ):
-                kwargs["length"] = maxlen // 2 if maxlen != -1 else None
-                if collation:
-                    kwargs["collation"] = collation
-            elif coltype in (
-                MSText,
-                MSNText,
-            ):
-                # TEXT / NTEXT are unlengthed LOB types.
-                # sys.columns.max_length reports 16 for these, which is the
-                # size of the in-row LOB pointer and not a character length,
-                # so no length is applied.
-                if collation:
-                    kwargs["collation"] = collation
-
-            if coltype is None:
-                if base_type is not None and base_type != type_:
-                    util.warn(
-                        "Did not recognize type '%s' (user type) or '%s' "
-                        "(base type) of column '%s'" % (type_, base_type, name)
-                    )
-                else:
-                    util.warn(
-                        "Did not recognize type '%s' of column '%s'"
-                        % (type_, name)
-                    )
-                coltype = sqltypes.NULLTYPE
-            else:
-                if issubclass(coltype, sqltypes.Numeric):
-                    kwargs["precision"] = numericprec
-
-                    if not issubclass(coltype, sqltypes.Float):
-                        kwargs["scale"] = numericscale
-
-                coltype = coltype(**kwargs)
-            cdict = {
-                "name": name,
-                "type": coltype,
-                "nullable": nullable,
-                "default": default,
-                "autoincrement": is_identity is not None,
-                "comment": comment,
-            }
-
-            if definition is not None and is_persisted is not None:
-                cdict["computed"] = {
-                    "sqltext": definition,
-                    "persisted": is_persisted,
-                }
-
-            if is_identity is not None:
-                # identity_start and identity_increment are Decimal or None
-                if identity_start is None or identity_increment is None:
-                    cdict["identity"] = {}
-                else:
-                    if isinstance(coltype, sqltypes.BigInteger):
-                        start = int(identity_start)
-                        increment = int(identity_increment)
-                    elif isinstance(coltype, sqltypes.Integer):
-                        start = int(identity_start)
-                        increment = int(identity_increment)
-                    else:
-                        start = identity_start
-                        increment = identity_increment
-
-                    cdict["identity"] = {
-                        "start": start,
-                        "increment": increment,
-                    }
-
-            cols.append(cdict)
-
-        if cols:
-            return cols
-        else:
-            return self._default_or_error(
-                connection, tablename, owner, ReflectionDefaults.columns, **kw
-            )
-
-    @reflection.cache
-    @_db_plus_owner
-    def get_pk_constraint(
-        self, connection, tablename, dbname, owner, schema, **kw
-    ):
-        pkeys = []
-        TC = ischema.constraints
-        C = ischema.key_constraints.alias("C")
-
-        # Primary key constraints
-        s = (
-            sql.select(
-                C.c.column_name,
-                TC.c.constraint_type,
-                C.c.constraint_name,
-                func.objectproperty(
-                    func.object_id(
-                        C.c.table_schema + "." + C.c.constraint_name
-                    ),
-                    "CnstIsClustKey",
-                ).label("is_clustered"),
-            )
             .where(
-                sql.and_(
-                    TC.c.constraint_name == C.c.constraint_name,
-                    TC.c.table_schema == C.c.table_schema,
-                    C.c.table_name == tablename,
-                    C.c.table_schema == owner,
+                ischema.sys_schemas.c.name == sql.bindparam("owner"),
+                ischema.sys_objects.c.name.in_(
+                    sql.bindparam("filter_names", expanding=True)
                 ),
             )
-            .order_by(TC.c.constraint_name, C.c.ordinal_position)
+            .order_by(sys_objects.c.name, sys_columns.c.column_id)
         )
-        c = connection.execution_options(future_result=True).execute(s)
-        constraint_name = None
-        is_clustered = None
-        for row in c.mappings():
-            if "PRIMARY" in row[TC.c.constraint_type.name]:
-                pkeys.append(row["COLUMN_NAME"])
-                if constraint_name is None:
-                    constraint_name = row[C.c.constraint_name.name]
-                if is_clustered is None:
-                    is_clustered = row["is_clustered"]
-        if pkeys:
-            return {
-                "constrained_columns": pkeys,
-                "name": constraint_name,
-                "dialect_options": {"mssql_clustered": is_clustered},
-            }
-        else:
-            return self._default_or_error(
-                connection,
-                tablename,
-                owner,
-                ReflectionDefaults.pk_constraint,
-                **kw,
-            )
+        return s
 
-    @reflection.cache
-    @_db_plus_owner
-    def get_foreign_keys(
-        self, connection, tablename, dbname, owner, schema, **kw
-    ):
-        # Foreign key constraints
-        s = (
-            text("""\
+    @staticmethod
+    def _fk_query_sql(fk_info_where, extra_cols=""):
+        return """\
 WITH fk_info AS (
     SELECT
         ischema_ref_con.constraint_schema,
@@ -3948,11 +3791,11 @@ WITH fk_info AS (
         INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS ischema_ref_con
         INNER JOIN
         INFORMATION_SCHEMA.KEY_COLUMN_USAGE ischema_key_col ON
-            ischema_key_col.table_schema = ischema_ref_con.constraint_schema
+            ischema_key_col.table_schema =
+                ischema_ref_con.constraint_schema
             AND ischema_key_col.constraint_name =
-            ischema_ref_con.constraint_name
-    WHERE ischema_key_col.table_name = :tablename
-        AND ischema_key_col.table_schema = :owner
+                ischema_ref_con.constraint_name
+    WHERE %(fk_info_where)s
 ),
 constraint_info AS (
     SELECT
@@ -3975,22 +3818,19 @@ index_info AS (
         sys.columns.name AS column_name
     FROM
         sys.indexes
-        INNER JOIN
-        sys.objects ON
-            sys.objects.object_id = sys.indexes.object_id
-        INNER JOIN
-        sys.schemas ON
-            sys.schemas.schema_id = sys.objects.schema_id
-        INNER JOIN
-        sys.index_columns ON
-            sys.index_columns.object_id = sys.objects.object_id
+        INNER JOIN sys.objects
+            ON sys.objects.object_id = sys.indexes.object_id
+        INNER JOIN sys.schemas
+            ON sys.schemas.schema_id = sys.objects.schema_id
+        INNER JOIN sys.index_columns
+            ON sys.index_columns.object_id = sys.objects.object_id
             AND sys.index_columns.index_id = sys.indexes.index_id
-        INNER JOIN
-        sys.columns ON
-            sys.columns.object_id = sys.indexes.object_id
+        INNER JOIN sys.columns
+            ON sys.columns.object_id = sys.indexes.object_id
             AND sys.columns.column_id = sys.index_columns.column_id
 )
     SELECT
+        %(extra_cols)s
         fk_info.constraint_schema,
         fk_info.constraint_name,
         fk_info.ordinal_position,
@@ -4010,6 +3850,7 @@ index_info AS (
             AND constraint_info.ordinal_position = fk_info.ordinal_position
     UNION
     SELECT
+        %(extra_cols)s
         fk_info.constraint_schema,
         fk_info.constraint_name,
         fk_info.ordinal_position,
@@ -4030,15 +3871,521 @@ index_info AS (
 
     ORDER BY fk_info.constraint_schema, fk_info.constraint_name,
         fk_info.ordinal_position
-""")
+""" % {
+            "fk_info_where": fk_info_where,
+            "extra_cols": extra_cols,
+        }
+
+    # --- multi-reflection API ---
+
+    @lru_cache
+    def _partition_filter_names_query(self, add_filter_names: bool):
+        sys_objects = ischema.sys_objects
+        sys_schemas = ischema.sys_schemas
+
+        s = (
+            sql.select(sys_objects.c.name)
+            .select_from(sys_objects)
+            .join(
+                sys_schemas,
+                onclause=sys_objects.c.schema_id == sys_schemas.c.schema_id,
+            )
+            .where(
+                sys_schemas.c.name == sql.bindparam("schema"),
+                sys_objects.c.type.in_(
+                    sql.bindparam("type_filter", expanding=True)
+                ),
+            )
+        )
+        if add_filter_names:
+            s = s.where(
+                sys_objects.c.name.in_(
+                    sql.bindparam("filter_names", expanding=True)
+                )
+            )
+
+        return s
+
+    def _partition_filter_names(
+        self, connection, owner, filter_names, scope, kind
+    ):
+        """Split caller-supplied ``filter_names`` between the bulk
+        ``sys.*`` query path (regular objects in the user database) and
+        the temp object path (objects living in ``tempdb``), and resolve
+        the existing-in-catalog names for the bulk path in one shot.
+
+        Returns the tuple
+        ``(regular_names, multi_object_names, temp_names)``:
+
+        * ``regular_names`` -- list of caller-supplied names (with the
+          caller's casing) for the bulk path, used to build the
+          case-insensitive name map. Empty list when no regular names
+          were requested.
+        * ``multi_object_names`` -- list of names (with server-side
+          casing) that actually exist in the catalog and match the
+          requested ``kind``. This is what the bulk SQL's IN clause
+          gets filtered with. Empty list when no matches, disabling
+          the bulk query.
+        * ``temp_names`` -- list of ``#``-prefixed temp object names
+          that the caller asked for and that the requested
+          ``scope``/``kind`` allows.
+
+        ``scope=ObjectScope.DEFAULT`` excludes temp objects entirely.
+        ``scope=ObjectScope.TEMPORARY`` excludes regular objects.
+        ``ObjectKind.VIEW`` (without TABLE) excludes temp because SQL
+        Server does not have temp views in the same form. SQL Server
+        also has no ``get_temp_table_names`` implementation, so temp
+        objects can only be reflected when the caller supplies their
+        names explicitly.
+        """
+        include_default = scope is not ObjectScope.TEMPORARY
+        include_temp = (
+            scope is not ObjectScope.DEFAULT and ObjectKind.TABLE in kind
+        )
+
+        if filter_names:
+            if include_temp:
+                temp_names = [n for n in filter_names if n.startswith("#")]
+            else:
+                temp_names = []
+
+            if include_default:
+                regular_names = [
+                    n for n in filter_names if not n.startswith("#")
+                ]
+                run_bulk = bool(regular_names)
+            else:
+                regular_names = []
+                run_bulk = False
+        else:
+            temp_names = []
+            regular_names = []
+            run_bulk = include_default
+
+        if not run_bulk:
+            return (regular_names, [], temp_names)
+
+        type_filter = []
+        if ObjectKind.TABLE in kind:
+            type_filter.append("U")
+        if ObjectKind.VIEW in kind:
+            type_filter.append("V")
+        # SQL Server does not support materialized views, so ignore them
+        if not type_filter:
+            return (regular_names, [], temp_names)
+
+        has_regular_names = bool(regular_names)
+        query = self._partition_filter_names_query(has_regular_names)
+        params = {"schema": owner, "type_filter": type_filter}
+        if has_regular_names:
+            params["filter_names"] = regular_names
+
+        multi_object_names = connection.scalars(query, params).all()
+
+        return (regular_names, multi_object_names, temp_names)
+
+    @staticmethod
+    def _multi_name_map(filter_names):
+        """Build a case-insensitive ``server_name -> user_name`` mapper.
+
+        MSSQL object names are case-insensitive under the default
+        collation, so a user may pass ``"sOmEtAbLe"`` for a table
+        physically stored as ``"SomeTable"``. The bulk SQL returns the
+        server-side casing, but result keys must use the user-supplied
+        casing so that downstream code (e.g.
+        :meth:`.Inspector.reflect_table`) can find the entry.
+
+        Returns a callable ``(server_name) -> user_name``. When
+        ``filter_names`` is empty/None, returns identity.
+        """
+        if not filter_names:
+            return lambda n: n
+        lookup = {n.lower(): n for n in filter_names}
+        return lambda n: lookup.get(n.lower(), n)
+
+    @_db_plus_owner_multi
+    def get_multi_columns(
+        self,
+        connection,
+        dbname,
+        owner,
+        schema,
+        filter_names,
+        scope,
+        kind,
+        **kw,
+    ):
+        regular_names, multi_object_names, temp_names = (
+            self._partition_filter_names(
+                connection, owner, filter_names, scope, kind
+            )
+        )
+
+        result = {}
+
+        if multi_object_names:
+            name_map = self._multi_name_map(regular_names)
+            self._fetch_multi_columns(
+                connection,
+                owner=owner,
+                names=multi_object_names,
+                schema=schema,
+                name_map=name_map,
+                result=result,
+                exec_opts={"schema_translate_map": {}},
+            )
+
+        if temp_names:
+            self._fetch_multi_columns_temp(
+                connection,
+                temp_names=temp_names,
+                schema=schema,
+                result=result,
+            )
+
+        return result.items()
+
+    def _fetch_multi_columns(
+        self, connection, owner, names, schema, name_map, result, exec_opts
+    ):
+        """Execute the unified columns select for a single catalog pass.
+
+        Used by :meth:`.get_multi_columns` for both the main-database pass
+        (no ``schema_translate_map``) and the tempdb pass (with
+        ``schema_translate_map={"sys": "tempdb.sys"}`` applied).
+        """
+        s = self._columns_select()
+
+        rp = connection.execute(
+            s,
+            {"owner": owner, "filter_names": names},
+            execution_options=exec_opts,
+        )
+
+        for row in rp.mappings():
+            table_name = name_map(row["table_name"])
+            cdict = self._parse_column_info(
+                name=row["column_name"],
+                type_=row["type_name"],
+                base_type=row["base_type"],
+                nullable=row["is_nullable"] == 1,
+                maxlen=row["max_length"],
+                numericprec=row["precision"],
+                numericscale=row["scale"],
+                default=row["default_value"],
+                collation=row["collation_name"],
+                definition=row["computed_definition"],
+                is_persisted=row["is_persisted"],
+                is_identity=row["is_identity"],
+                identity_start=row["seed_value"],
+                identity_increment=row["increment_value"],
+                comment=row["comment"],
+            )
+            result.setdefault((schema, table_name), []).append(cdict)
+
+        for n in names:
+            key = (schema, name_map(n))
+            if key not in result:
+                result[key] = ReflectionDefaults.columns()
+
+    def _fetch_multi_columns_temp(
+        self, connection, temp_names, schema, result
+    ):
+        """Run the unified columns select against tempdb for temp names.
+
+        Resolves each ``#name`` to its mangled tempdb name (one round
+        trip per temp via :meth:`._get_internal_temp_table_name`), then
+        runs a single bulk select against ``tempdb.sys.*`` via
+        ``schema_translate_map``. The result rows (keyed by mangled
+        name) are mapped back to the original ``#name`` for the caller.
+        """
+        resolved_by_owner, temp_name_map = self._resolve_temp_names(
+            connection, temp_names
+        )
+        for temp_owner, mangled_names in resolved_by_owner.items():
+            self._fetch_multi_columns(
+                connection,
+                owner=temp_owner,
+                names=mangled_names,
+                schema=schema,
+                name_map=temp_name_map,
+                result=result,
+                exec_opts={"schema_translate_map": {"sys": "tempdb.sys"}},
+            )
+
+    def _resolve_temp_names(self, connection, temp_names):
+        """Resolve user-facing temp names (``#foo``) to their mangled
+        tempdb names, grouped by owner.
+
+        Returns ``(resolved_by_owner, temp_name_map)``:
+
+        * ``resolved_by_owner`` -- ``{owner: [mangled_name, ...]}``,
+          one bulk query per owner (typically just ``'dbo'``).
+        * ``temp_name_map`` -- a function that maps mangled names back
+          to the user-supplied name.
+
+        Names that don't resolve (no matching temp table in tempdb) are
+        silently dropped. The single-table reflection wrappers handle
+        the resulting absence by raising :exc:`.NoSuchTableError` via
+        :meth:`._value_or_raise`.
+        """
+        resolved_by_owner = {}
+        original_by_mangled = {}
+        for name in temp_names:
+            try:
+                temp_owner, mangled = self._get_internal_temp_table_name(
+                    connection, name
+                )
+            except exc.NoSuchTableError:
+                continue
+            resolved_by_owner.setdefault(temp_owner, []).append(mangled)
+            original_by_mangled[mangled] = name
+
+        def temp_name_map(server_name):
+            return original_by_mangled.get(server_name, server_name)
+
+        return resolved_by_owner, temp_name_map
+
+    @_db_plus_owner_multi
+    def get_multi_pk_constraint(
+        self,
+        connection,
+        dbname,
+        owner,
+        schema,
+        filter_names,
+        scope,
+        kind,
+        **kw,
+    ):
+        regular_names, multi_object_names, temp_names = (
+            self._partition_filter_names(
+                connection, owner, filter_names, scope, kind
+            )
+        )
+
+        result = {}
+
+        if multi_object_names:
+            name_map = self._multi_name_map(regular_names)
+            self._fetch_multi_pk_constraint(
+                connection,
+                owner=owner,
+                names=multi_object_names,
+                schema=schema,
+                name_map=name_map,
+                result=result,
+                exec_opts={"schema_translate_map": {}},
+            )
+
+        if temp_names:
+            self._fetch_multi_pk_constraint_temp(
+                connection,
+                temp_names=temp_names,
+                schema=schema,
+                result=result,
+            )
+
+        return result.items()
+
+    @lru_cache()
+    def _pk_constraint_select(self):
+        """Build the unified Core sys.* select for PK constraint reflection.
+
+        Returns a ``select()`` that includes ``table_name`` and ``owner``
+        in the result so callers can group rows by table. The clustered
+        flag comes directly from ``sys.indexes.type`` (1 = clustered).
+        """
+        sys_key_constraints = ischema.sys_key_constraints
+        sys_indexes = ischema.sys_indexes
+        sys_index_columns = ischema.sys_index_columns
+        sys_columns = ischema.sys_columns
+        sys_objects = ischema.sys_objects
+        sys_schemas = ischema.sys_schemas
+
+        s = (
+            sql.select(
+                sys_objects.c.name.label("table_name"),
+                sys_schemas.c.name.label("owner"),
+                sys_key_constraints.c.name.label("constraint_name"),
+                sys_columns.c.name.label("column_name"),
+                sys_index_columns.c.key_ordinal,
+                sys_indexes.c.type.label("index_type"),
+            )
+            .select_from(sys_key_constraints)
+            .join(
+                sys_objects,
+                onclause=sys_key_constraints.c.parent_object_id
+                == sys_objects.c.object_id,
+            )
+            .join(
+                sys_schemas,
+                onclause=sys_objects.c.schema_id == sys_schemas.c.schema_id,
+            )
+            .join(
+                sys_index_columns,
+                onclause=sql.and_(
+                    sys_index_columns.c.object_id
+                    == sys_key_constraints.c.parent_object_id,
+                    sys_index_columns.c.index_id
+                    == sys_key_constraints.c.unique_index_id,
+                ),
+            )
+            .join(
+                sys_columns,
+                onclause=sql.and_(
+                    sys_columns.c.object_id == sys_index_columns.c.object_id,
+                    sys_columns.c.column_id == sys_index_columns.c.column_id,
+                ),
+            )
+            .join(
+                sys_indexes,
+                onclause=sql.and_(
+                    sys_indexes.c.object_id
+                    == sys_key_constraints.c.parent_object_id,
+                    sys_indexes.c.index_id
+                    == sys_key_constraints.c.unique_index_id,
+                ),
+            )
+            .where(
+                sys_key_constraints.c.type == "PK",
+                ischema.sys_schemas.c.name == sql.bindparam("owner"),
+                ischema.sys_objects.c.name.in_(
+                    sql.bindparam("filter_names", expanding=True)
+                ),
+            )
+            .order_by(sys_objects.c.name, sys_index_columns.c.key_ordinal)
+        )
+        return s
+
+    def _fetch_multi_pk_constraint(
+        self, connection, owner, names, schema, name_map, result, exec_opts
+    ):
+        """Execute the unified pk_constraint select for one catalog pass.
+
+        Used by :meth:`.get_multi_pk_constraint` for both the main DB
+        pass and the tempdb pass (with ``schema_translate_map`` set).
+        """
+        s = self._pk_constraint_select()
+
+        rp = connection.execute(
+            s,
+            {"owner": owner, "filter_names": names},
+            execution_options=exec_opts,
+        )
+
+        for row in rp.mappings():
+            table_name = name_map(row["table_name"])
+            key = (schema, table_name)
+            if key not in result:
+                result[key] = {
+                    "constrained_columns": [],
+                    "name": row["constraint_name"],
+                    "dialect_options": {
+                        "mssql_clustered": row["index_type"] == 1
+                    },
+                }
+            result[key]["constrained_columns"].append(row["column_name"])
+
+        for n in names:
+            key = (schema, name_map(n))
+            if key not in result:
+                result[key] = ReflectionDefaults.pk_constraint()
+
+    def _fetch_multi_pk_constraint_temp(
+        self, connection, temp_names, schema, result
+    ):
+        """Run the unified pk_constraint select against tempdb."""
+        resolved_by_owner, temp_name_map = self._resolve_temp_names(
+            connection, temp_names
+        )
+
+        for temp_owner, mangled_names in resolved_by_owner.items():
+            self._fetch_multi_pk_constraint(
+                connection,
+                owner=temp_owner,
+                names=mangled_names,
+                schema=schema,
+                name_map=temp_name_map,
+                result=result,
+                exec_opts={"schema_translate_map": {"sys": "tempdb.sys"}},
+            )
+
+    @_db_plus_owner_multi
+    def get_multi_foreign_keys(
+        self,
+        connection,
+        dbname,
+        owner,
+        schema,
+        filter_names,
+        scope,
+        kind,
+        **kw,
+    ):
+        regular_names, multi_object_names, temp_names = (
+            self._partition_filter_names(
+                connection, owner, filter_names, scope, kind
+            )
+        )
+
+        final = {}
+
+        if multi_object_names:
+            name_map = self._multi_name_map(regular_names)
+            self._fetch_multi_foreign_keys(
+                connection,
+                dbname=dbname,
+                owner=owner,
+                names=multi_object_names,
+                schema=schema,
+                name_map=name_map,
+                final=final,
+            )
+
+        # FK reflection for temp tables: the INFORMATION_SCHEMA query in
+        # _fk_query_sql does not see tempdb objects (it queries the main
+        # DB's catalog). The pre-existing single-table behavior was to
+        # return empty foreign_keys for temp tables that exist. We
+        # preserve that here by checking existence and returning the
+        # default (empty) reflection for each temp that is reachable.
+        has_temp_tables = self._internal_has_multi_table(
+            connection, temp_names, owner="dbo", schema=schema, **kw
+        )
+        for name in temp_names:
+            key = (schema, name)
+            if has_temp_tables.get(key):
+                final[key] = ReflectionDefaults.foreign_keys()
+
+        return final.items()
+
+    def _fetch_multi_foreign_keys(
+        self, connection, dbname, owner, names, schema, name_map, final
+    ):
+        """Execute the unified FK query for the main-DB pass.
+
+        Uses the _fk_query_sql sql text, restricted to the provided owner and
+        IN-list of names. Groups result rows by table and constraint
+        name into the final dict.
+        """
+        rp = connection.execute(
+            sql.text(
+                self._fk_query_sql(
+                    fk_info_where=(
+                        "ischema_key_col.table_schema = :owner"
+                        "\n      AND ischema_key_col.table_name"
+                        " IN :filter_names"
+                    ),
+                    extra_cols="fk_info.table_name,",
+                )
+            )
             .bindparams(
-                sql.bindparam("tablename", tablename, ischema.CoerceUnicode()),
                 sql.bindparam("owner", owner, ischema.CoerceUnicode()),
+                sql.bindparam("filter_names", names, expanding=True),
             )
             .columns(
                 constraint_schema=sqltypes.Unicode(),
                 constraint_name=sqltypes.Unicode(),
-                table_schema=sqltypes.Unicode(),
                 table_name=sqltypes.Unicode(),
                 constrained_column=sqltypes.Unicode(),
                 referred_table_schema=sqltypes.Unicode(),
@@ -4047,41 +4394,40 @@ index_info AS (
             )
         )
 
-        # group rows by constraint ID, to handle multi-column FKs
-        fkeys = util.defaultdict(
-            lambda: {
-                "name": None,
-                "constrained_columns": [],
-                "referred_schema": None,
-                "referred_table": None,
-                "referred_columns": [],
-                "options": {},
-            }
-        )
-
-        for r in connection.execute(s).all():
+        grouped = {}
+        for r in rp.all():
             (
-                _,  # constraint schema
+                table_name,
+                _,  # constraint_schema
                 rfknm,
-                _,  # ordinal position
+                _,  # ordinal
                 scol,
                 rschema,
                 rtbl,
                 rcol,
-                # TODO: we support match=<keyword> for foreign keys so
-                # we can support this also, PG has match=FULL for example
-                # but this seems to not be a valid value for SQL Server
-                _,  # match rule
+                _,  # match
                 fkuprule,
                 fkdelrule,
             ) = r
 
-            rec = fkeys[rfknm]
+            key = (schema, name_map(table_name))
+            if key not in grouped:
+                grouped[key] = util.defaultdict(
+                    lambda: {
+                        "name": None,
+                        "constrained_columns": [],
+                        "referred_schema": None,
+                        "referred_table": None,
+                        "referred_columns": [],
+                        "options": {},
+                    }
+                )
+
+            rec = grouped[key][rfknm]
             rec["name"] = rfknm
 
             if fkuprule != "NO ACTION":
                 rec["options"]["onupdate"] = fkuprule
-
             if fkdelrule != "NO ACTION":
                 rec["options"]["ondelete"] = fkdelrule
 
@@ -4092,21 +4438,396 @@ index_info AS (
                         rschema = dbname + "." + rschema
                     rec["referred_schema"] = rschema
 
-            local_cols, remote_cols = (
-                rec["constrained_columns"],
-                rec["referred_columns"],
+            rec["constrained_columns"].append(scol)
+            rec["referred_columns"].append(rcol)
+
+        for key, fk_dict in grouped.items():
+            final[key] = list(fk_dict.values())
+
+        for n in names:
+            key = (schema, name_map(n))
+            if key not in final:
+                final[key] = ReflectionDefaults.foreign_keys()
+
+    @_db_plus_owner_multi
+    def get_multi_indexes(
+        self,
+        connection,
+        dbname,
+        owner,
+        schema,
+        filter_names,
+        scope,
+        kind,
+        **kw,
+    ):
+        regular_names, multi_object_names, temp_names = (
+            self._partition_filter_names(
+                connection, owner, filter_names, scope, kind
             )
+        )
 
-            local_cols.append(scol)
-            remote_cols.append(rcol)
+        result = {}
 
-        if fkeys:
-            return list(fkeys.values())
-        else:
-            return self._default_or_error(
+        if multi_object_names:
+            name_map = self._multi_name_map(regular_names)
+            self._fetch_multi_indexes(
                 connection,
-                tablename,
-                owner,
-                ReflectionDefaults.foreign_keys,
-                **kw,
+                owner=owner,
+                names=multi_object_names,
+                schema=schema,
+                name_map=name_map,
+                result=result,
+                exec_opts={"schema_translate_map": {}},
             )
+
+        if temp_names:
+            self._fetch_multi_indexes_temp(
+                connection,
+                temp_names=temp_names,
+                schema=schema,
+                result=result,
+            )
+
+        return result.items()
+
+    @lru_cache()
+    def _indexes_metadata_select(self):
+        """Build the Core sys.* select for index metadata (one row per
+        index per table).
+
+        Used by :meth:`._fetch_multi_indexes` for both the main-DB pass
+        and the tempdb pass (via ``schema_translate_map``). Replaces a
+        previous ``sql.text()`` body that did not honor
+        ``schema_translate_map`` (which only rewrites Core
+        schema-bearing objects, not literal SQL text).
+        """
+        sys_indexes = ischema.sys_indexes
+        sys_objects = ischema.sys_objects
+        sys_schemas = ischema.sys_schemas
+
+        if self.server_version_info >= MS_2008_VERSION:
+            filter_definition = sys_indexes.c.filter_definition
+        else:
+            filter_definition = sql.null()
+
+        s = (
+            sql.select(
+                sys_objects.c.name.label("table_name"),
+                sys_indexes.c.index_id,
+                sys_indexes.c.is_unique,
+                sys_indexes.c.name,
+                sys_indexes.c.type,
+                filter_definition.label("filter_definition"),
+            )
+            .select_from(sys_indexes)
+            .join(
+                sys_objects,
+                onclause=sys_indexes.c.object_id == sys_objects.c.object_id,
+            )
+            .join(
+                sys_schemas,
+                onclause=sys_schemas.c.schema_id == sys_objects.c.schema_id,
+            )
+            .where(
+                sys_indexes.c.is_primary_key == 0,
+                sys_indexes.c.type != 0,
+                ischema.sys_schemas.c.name == sql.bindparam("owner"),
+                ischema.sys_objects.c.name.in_(
+                    sql.bindparam("filter_names", expanding=True)
+                ),
+            )
+            .order_by(sys_objects.c.name, sys_indexes.c.name)
+        )
+        return s
+
+    @lru_cache()
+    def _indexes_columns_select(self):
+        """Build the Core sys.* select for index columns (one row per
+        index column per index per table)."""
+        sys_index_columns = ischema.sys_index_columns
+        sys_columns = ischema.sys_columns
+        sys_objects = ischema.sys_objects
+        sys_schemas = ischema.sys_schemas
+
+        s = (
+            sql.select(
+                sys_objects.c.name.label("table_name"),
+                sys_index_columns.c.index_id,
+                sys_columns.c.name,
+                sys_index_columns.c.is_included_column,
+            )
+            .select_from(sys_index_columns)
+            .join(
+                sys_columns,
+                onclause=sql.and_(
+                    sys_columns.c.object_id == sys_index_columns.c.object_id,
+                    sys_columns.c.column_id == sys_index_columns.c.column_id,
+                ),
+            )
+            .join(
+                sys_objects,
+                onclause=sys_objects.c.object_id
+                == sys_index_columns.c.object_id,
+            )
+            .join(
+                sys_schemas,
+                onclause=sys_schemas.c.schema_id == sys_objects.c.schema_id,
+            )
+            .where(
+                ischema.sys_schemas.c.name == sql.bindparam("owner"),
+                ischema.sys_objects.c.name.in_(
+                    sql.bindparam("filter_names", expanding=True)
+                ),
+            )
+            .order_by(
+                sys_objects.c.name,
+                sys_index_columns.c.index_id,
+                sys_index_columns.c.key_ordinal,
+            )
+        )
+        return s
+
+    def _fetch_multi_indexes(
+        self, connection, owner, names, schema, name_map, result, exec_opts
+    ):
+        """Execute the unified indexes queries for one catalog pass.
+
+        Runs two Core sys.* selects (index metadata + index columns),
+        grouped by table. Used for both the main-DB pass and the
+        tempdb pass (with ``schema_translate_map={"sys": "tempdb.sys"}``
+        applied).
+        """
+        meta_q = self._indexes_metadata_select()
+
+        rp = connection.execute(
+            meta_q,
+            {"owner": owner, "filter_names": names},
+            execution_options=exec_opts,
+        )
+
+        # {table_name: {index_id: index_dict}}
+        indexes_by_table = {}
+        for row in rp.mappings():
+            tname = name_map(row["table_name"])
+            if tname not in indexes_by_table:
+                indexes_by_table[tname] = {}
+
+            current = {
+                "name": row["name"],
+                "unique": row["is_unique"] == 1,
+                "column_names": [],
+                "dialect_options": {"mssql_include": []},
+            }
+            do = current["dialect_options"]
+            index_type = row["type"]
+            if index_type in {1, 2}:
+                do["mssql_clustered"] = index_type == 1
+            if index_type in {5, 6}:
+                do["mssql_clustered"] = index_type == 5
+                do["mssql_columnstore"] = True
+            if row["filter_definition"] is not None:
+                do["mssql_where"] = row["filter_definition"]
+
+            indexes_by_table[tname][row["index_id"]] = current
+
+        cols_q = self._indexes_columns_select()
+
+        rp2 = connection.execute(
+            cols_q,
+            {"owner": owner, "filter_names": names},
+            execution_options=exec_opts,
+        )
+
+        for row in rp2.mappings():
+            tname = name_map(row["table_name"])
+            idx_id = row["index_id"]
+            if tname not in indexes_by_table:
+                continue
+            if idx_id not in indexes_by_table[tname]:
+                continue
+            index_def = indexes_by_table[tname][idx_id]
+            do = index_def["dialect_options"]
+            is_colstore = do.get("mssql_columnstore")
+            is_clustered = do.get("mssql_clustered")
+            if not (is_colstore and is_clustered):
+                # a clustered columnstore index includes all columns but does
+                # not want them in the index definition
+                if row["is_included_column"] and not is_colstore:
+                    # a noncludsted columnstore index reports that includes
+                    # columns but requires that are listed as normal columns
+                    do["mssql_include"].append(row["name"])
+                else:
+                    index_def["column_names"].append(row["name"])
+
+        for tname, idx_dict in indexes_by_table.items():
+            result[(schema, tname)] = list(idx_dict.values())
+
+        for n in names:
+            key = (schema, name_map(n))
+            if key not in result:
+                result[key] = ReflectionDefaults.indexes()
+
+    def _fetch_multi_indexes_temp(
+        self, connection, temp_names, schema, result
+    ):
+        """Run the unified indexes queries against tempdb."""
+        resolved_by_owner, temp_name_map = self._resolve_temp_names(
+            connection, temp_names
+        )
+
+        for temp_owner, mangled_names in resolved_by_owner.items():
+            self._fetch_multi_indexes(
+                connection,
+                owner=temp_owner,
+                names=mangled_names,
+                schema=schema,
+                name_map=temp_name_map,
+                result=result,
+                exec_opts={"schema_translate_map": {"sys": "tempdb.sys"}},
+            )
+
+    @_db_plus_owner_multi
+    def get_multi_table_comment(
+        self,
+        connection,
+        dbname,
+        owner,
+        schema,
+        filter_names,
+        scope,
+        kind,
+        **kw,
+    ):
+        if not self.supports_comments:
+            raise NotImplementedError(
+                "Can't get table comments on current SQL Server "
+                "version in use"
+            )
+
+        regular_names, multi_object_names, temp_names = (
+            self._partition_filter_names(
+                connection, owner, filter_names, scope, kind
+            )
+        )
+
+        result = {}
+
+        if multi_object_names:
+            name_map = self._multi_name_map(regular_names)
+            self._fetch_multi_table_comment(
+                connection,
+                owner=owner,
+                names=multi_object_names,
+                schema=schema,
+                name_map=name_map,
+                result=result,
+                exec_opts={"schema_translate_map": {}},
+            )
+
+        if temp_names:
+            self._fetch_multi_table_comment_temp(
+                connection,
+                temp_names=temp_names,
+                schema=schema,
+                result=result,
+            )
+
+        return result.items()
+
+    @lru_cache()
+    def _table_comment_select(self):
+        """Build the Core sys.* select for table comment reflection."""
+        sys_objects = ischema.sys_objects
+        sys_schemas = ischema.sys_schemas
+        extended_properties = ischema.extended_properties
+
+        s = (
+            sql.select(
+                sys_objects.c.name.label("table_name"),
+                extended_properties.c.value.label("comment"),
+            )
+            .select_from(sys_objects)
+            .join(
+                sys_schemas,
+                onclause=sys_objects.c.schema_id == sys_schemas.c.schema_id,
+            )
+            .outerjoin(
+                extended_properties,
+                onclause=sql.and_(
+                    extended_properties.c["class"] == 1,
+                    extended_properties.c.name == "MS_Description",
+                    extended_properties.c.major_id == sys_objects.c.object_id,
+                    extended_properties.c.minor_id == 0,
+                ),
+            )
+            .where(
+                sys_objects.c.type.in_(("U", "V")),
+                ischema.sys_schemas.c.name == sql.bindparam("owner"),
+                ischema.sys_objects.c.name.in_(
+                    sql.bindparam("filter_names", expanding=True)
+                ),
+            )
+        )
+        return s
+
+    def _fetch_multi_table_comment(
+        self, connection, owner, names, schema, name_map, result, exec_opts
+    ):
+        """Execute the unified table comment query for one catalog pass.
+
+        Core sys.* select so ``schema_translate_map`` actually rewrites
+        the catalog reference for the tempdb pass.
+        """
+        q = self._table_comment_select()
+
+        rp = connection.execute(
+            q,
+            {"owner": owner, "filter_names": names},
+            execution_options=exec_opts,
+        )
+
+        for row in rp.mappings():
+            table_name = name_map(row["table_name"])
+            comment = row["comment"]
+            result[(schema, table_name)] = (
+                {"text": comment} if comment else {"text": None}
+            )
+
+        for n in names:
+            key = (schema, name_map(n))
+            if key not in result:
+                result[key] = ReflectionDefaults.table_comment()
+
+    def _fetch_multi_table_comment_temp(
+        self, connection, temp_names, schema, result
+    ):
+        """Run the unified table comment query against tempdb."""
+        resolved_by_owner, temp_name_map = self._resolve_temp_names(
+            connection, temp_names
+        )
+        for temp_owner, mangled_names in resolved_by_owner.items():
+            self._fetch_multi_table_comment(
+                connection,
+                owner=temp_owner,
+                names=mangled_names,
+                schema=schema,
+                name_map=temp_name_map,
+                result=result,
+                exec_opts={"schema_translate_map": {"sys": "tempdb.sys"}},
+            )
+
+    # override mixin methods for which this dialect has no native
+    # get_multi_* implementation, preventing infinite recursion
+    # through DefaultDialect._default_multi_reflect
+
+    def get_unique_constraints(
+        self, connection, table_name, schema=None, **kw
+    ):
+        raise NotImplementedError()
+
+    def get_check_constraints(self, connection, table_name, schema=None, **kw):
+        raise NotImplementedError()
+
+    def get_table_options(self, connection, table_name, schema=None, **kw):
+        raise NotImplementedError()

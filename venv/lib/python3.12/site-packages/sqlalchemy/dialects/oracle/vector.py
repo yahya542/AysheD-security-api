@@ -16,6 +16,7 @@ from typing import Optional
 from typing import Union
 
 from ... import types
+from ...sql.operators import OperatorClass
 from ...types import Float
 
 
@@ -242,6 +243,8 @@ class VECTOR(types.TypeEngine):
     """
 
     cache_ok = True
+
+    operator_classes = OperatorClass.BASE | OperatorClass.MATH
 
     __visit_name__ = "VECTOR"
 

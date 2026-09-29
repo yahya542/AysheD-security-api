@@ -33,15 +33,12 @@ from __future__ import annotations
 
 from types import ModuleType
 from typing import Any
-from typing import Dict
 from typing import Optional
-from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import Union
 
 from .pymysql import _connection_ping_reconnects_true
 from .pymysql import MySQLDialect_pymysql
-from ... import pool
 from ... import util
 from ...connectors.asyncio import AsyncAdapt_dbapi_connection
 from ...connectors.asyncio import AsyncAdapt_dbapi_cursor
@@ -49,8 +46,7 @@ from ...connectors.asyncio import AsyncAdapt_dbapi_module
 from ...connectors.asyncio import AsyncAdapt_dbapi_ss_cursor
 from ...connectors.asyncio import AsyncAdapt_terminate
 from ...util import langhelpers
-from ...util.concurrency import await_fallback
-from ...util.concurrency import await_only
+from ...util.concurrency import await_
 
 if TYPE_CHECKING:
 
@@ -96,22 +92,23 @@ class AsyncAdapt_aiomysql_connection(
 
     def ping(self, reconnect: bool = False) -> None:
         assert not reconnect
+
         if self.dbapi._send_false_to_ping:
-            self.await_(self._connection.ping(reconnect=False))
+            await_(self._connection.ping(reconnect=False))
         else:
-            self.await_(self._connection.ping())
+            await_(self._connection.ping())
 
     def character_set_name(self) -> Optional[str]:
         return self._connection.character_set_name()  # type: ignore[no-any-return]  # noqa: E501
 
     def autocommit(self, value: Any) -> None:
-        self.await_(self._connection.autocommit(value))
+        await_(self._connection.autocommit(value))
 
     def get_autocommit(self) -> bool:
-        return self._connection.get_autocommit()  # type: ignore
+        return self._connection.get_autocommit()  # type: ignore[no-any-return]
 
     def close(self) -> None:
-        self.await_(self._connection.ensure_closed())
+        await_(self._connection.ensure_closed())
 
     async def _terminate_graceful_close(self) -> None:
         await self._connection.ensure_closed()
@@ -121,14 +118,9 @@ class AsyncAdapt_aiomysql_connection(
         self._connection.close()
 
 
-class AsyncAdaptFallback_aiomysql_connection(AsyncAdapt_aiomysql_connection):
-    __slots__ = ()
-
-    await_ = staticmethod(await_fallback)
-
-
 class AsyncAdapt_aiomysql_dbapi(AsyncAdapt_dbapi_module):
     def __init__(self, aiomysql: ModuleType, pymysql: ModuleType):
+        super().__init__(aiomysql, dbapi_module=pymysql)
         self.aiomysql = aiomysql
         self.pymysql = pymysql
         self.paramstyle = "format"
@@ -162,19 +154,14 @@ class AsyncAdapt_aiomysql_dbapi(AsyncAdapt_dbapi_module):
             setattr(self, name, getattr(self.pymysql, name))
 
     def connect(self, *arg: Any, **kw: Any) -> AsyncAdapt_aiomysql_connection:
-        async_fallback = kw.pop("async_fallback", False)
         creator_fn = kw.pop("async_creator_fn", self.aiomysql.connect)
 
-        if util.asbool(async_fallback):
-            return AsyncAdaptFallback_aiomysql_connection(
+        return await_(
+            AsyncAdapt_aiomysql_connection.create(
                 self,
-                await_fallback(creator_fn(*arg, **kw)),
+                creator_fn(*arg, **kw),
             )
-        else:
-            return AsyncAdapt_aiomysql_connection(
-                self,
-                await_only(creator_fn(*arg, **kw)),
-            )
+        )
 
     @langhelpers.memoized_property
     def _send_false_to_ping(self) -> bool:
@@ -196,7 +183,7 @@ class AsyncAdapt_aiomysql_dbapi(AsyncAdapt_dbapi_module):
 
     def _init_cursors_subclasses(
         self,
-    ) -> Tuple[AsyncIODBAPICursor, AsyncIODBAPICursor]:
+    ) -> tuple[AsyncIODBAPICursor, AsyncIODBAPICursor]:
         # suppress unconditional warning emitted by aiomysql
         class Cursor(self.aiomysql.Cursor):  # type: ignore[misc, name-defined]
             async def _show_warnings(
@@ -229,20 +216,19 @@ class MySQLDialect_aiomysql(MySQLDialect_pymysql):
             __import__("aiomysql"), __import__("pymysql")
         )
 
-    @classmethod
-    def get_pool_class(cls, url: URL) -> type:
-        async_fallback = url.query.get("async_fallback", False)
-
-        if util.asbool(async_fallback):
-            return pool.FallbackAsyncAdaptedQueuePool
-        else:
-            return pool.AsyncAdaptedQueuePool
+    def retrieve_dbapi_version(self, dbapi: DBAPIModule) -> util.VersionInfo:
+        # the version of aiomysql itself, rather than that of the pymysql
+        # module it makes use of
+        aiomysql = getattr(dbapi, "aiomysql", None)
+        return util.parse_version_string(
+            getattr(aiomysql, "__version__", None)
+        )
 
     def do_terminate(self, dbapi_connection: DBAPIConnection) -> None:
         dbapi_connection.terminate()
 
     def create_connect_args(
-        self, url: URL, _translate_args: Optional[Dict[str, Any]] = None
+        self, url: URL, _translate_args: Optional[dict[str, Any]] = None
     ) -> ConnectArgsType:
         return super().create_connect_args(
             url, _translate_args=dict(username="user", database="db")
@@ -261,7 +247,7 @@ class MySQLDialect_aiomysql(MySQLDialect_pymysql):
             return "not connected" in str_e
 
     def _found_rows_client_flag(self) -> int:
-        from pymysql.constants import CLIENT  # type: ignore
+        from pymysql.constants import CLIENT  # type: ignore[import-untyped]
 
         return CLIENT.FOUND_ROWS  # type: ignore[no-any-return]
 

@@ -171,9 +171,9 @@ specified::
 
 from __future__ import annotations
 
-from collections import deque
+import collections
 import logging
-import re
+from types import NoneType
 from typing import cast
 from typing import TYPE_CHECKING
 
@@ -188,12 +188,13 @@ from .json import JSON
 from .json import JSONB
 from .json import JSONPathType
 from .types import CITEXT
-from ... import pool
 from ... import util
-from ...engine import AdaptedConnection
+from ...connectors.asyncio import AsyncAdapt_dbapi_connection
+from ...connectors.asyncio import AsyncAdapt_dbapi_cursor
+from ...connectors.asyncio import AsyncAdapt_dbapi_module
+from ...connectors.asyncio import AsyncAdapt_dbapi_ss_cursor
 from ...sql import sqltypes
-from ...util.concurrency import await_fallback
-from ...util.concurrency import await_only
+from ...util.concurrency import await_
 
 if TYPE_CHECKING:
     from typing import Iterable
@@ -213,18 +214,16 @@ class _PGREGCONFIG(REGCONFIG):
 
 class _PGJSON(JSON):
     def bind_processor(self, dialect):
+        """psycopg's bind processor is assembled on the type adapter,
+        but we still need to wrap the value in a psycopg.Json() object"""
         return self._make_bind_processor(None, dialect._psycopg_Json)
-
-    def result_processor(self, dialect, coltype):
-        return None
 
 
 class _PGJSONB(JSONB):
     def bind_processor(self, dialect):
+        """psycopg's bind processor is assembled on the type adapter,
+        but we still need to wrap the value in a psycopg.Jsonb() object"""
         return self._make_bind_processor(None, dialect._psycopg_Jsonb)
-
-    def result_processor(self, dialect, coltype):
-        return None
 
 
 class _PGJSONIntIndexType(sqltypes.JSON.JSONIntIndexType):
@@ -313,8 +312,6 @@ class _PsycopgMultiRange(ranges.AbstractMultiRangeImpl):
             PGDialect_psycopg, dialect
         )._psycopg_Multirange
 
-        NoneType = type(None)
-
         def to_range(value):
             if isinstance(value, (str, NoneType, psycopg_Multirange)):
                 return value
@@ -370,15 +367,20 @@ def _log_notices(diagnostic):
 class PGDialect_psycopg(_PGDialect_common_psycopg):
     driver = "psycopg"
 
+    minimum_dbapi_version = util.VersionInfo((3, 0, 2))
+
     supports_statement_cache = True
     supports_server_side_cursors = True
     default_paramstyle = "pyformat"
     supports_sane_multi_rowcount = True
 
+    supports_native_json_serialization = True
+    supports_native_json_deserialization = True
+    dialect_injects_custom_json_deserializer = True
+
     execution_ctx_cls = PGExecutionContext_psycopg
     statement_compiler = PGCompiler_psycopg
     preparer = PGIdentifierPreparer_psycopg
-    psycopg_version = (0, 0)
 
     _has_native_hstore = True
     _psycopg_adapters_map = None
@@ -408,21 +410,21 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
         },
     )
 
+    @property
+    def psycopg_version(self):
+        """Legacy accessor for :attr:`.Dialect.dbapi_version`.
+
+        Retained for backwards compatibility; ``(0, 0)`` is returned when
+        no version can be determined.
+
+        """
+        version = self._dbapi_version_or_none
+        return version if version is not None else (0, 0)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
         if self.dbapi:
-            m = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", self.dbapi.__version__)
-            if m:
-                self.psycopg_version = tuple(
-                    int(x) for x in m.group(1, 2, 3) if x is not None
-                )
-
-            if self.psycopg_version < (3, 0, 2):
-                raise ImportError(
-                    "psycopg version 3.0.2 or higher is required."
-                )
-
             from psycopg.adapt import AdaptersMap
 
             self._psycopg_adapters_map = adapters_map = AdaptersMap(
@@ -609,129 +611,95 @@ class PGDialect_psycopg(_PGDialect_common_psycopg):
         return ";"
 
 
-class AsyncAdapt_psycopg_cursor:
-    __slots__ = ("_cursor", "await_", "_rows")
+class AsyncAdapt_psycopg_cursor(AsyncAdapt_dbapi_cursor):
+    __slots__ = ()
 
-    _psycopg_ExecStatus = None
-
-    def __init__(self, cursor, await_) -> None:
-        self._cursor = cursor
-        self.await_ = await_
-        self._rows = deque()
-
-    def __getattr__(self, name):
-        return getattr(self._cursor, name)
-
-    @property
-    def arraysize(self):
-        return self._cursor.arraysize
-
-    @arraysize.setter
-    def arraysize(self, value):
-        self._cursor.arraysize = value
-
-    async def _async_soft_close(self) -> None:
-        return
+    _awaitable_cursor_close: bool = False
 
     def close(self):
         self._rows.clear()
         # Normal cursor just call _close() in a non-sync way.
         self._cursor._close()
 
-    def execute(self, query, params=None, **kw):
-        result = self.await_(self._cursor.execute(query, params, **kw))
+    async def _execute_async(self, operation, parameters):
+        # override to not use mutex, psycopg3 already has mutex
+
+        if parameters is None:
+            result = await self._cursor.execute(operation)
+        else:
+            result = await self._cursor.execute(operation, parameters)
+
         # sqlalchemy result is not async, so need to pull all rows here
+        # (assuming not a server side cursor)
         res = self._cursor.pgresult
 
         # don't rely on psycopg providing enum symbols, compare with
         # eq/ne
-        if res and res.status == self._psycopg_ExecStatus.TUPLES_OK:
-            rows = self.await_(self._cursor.fetchall())
-            self._rows = deque(rows)
+        if (
+            not self.server_side
+            and res
+            and res.status == self._adapt_connection.dbapi.ExecStatus.TUPLES_OK
+        ):
+            self._rows = collections.deque(await self._cursor.fetchall())
         return result
 
-    def executemany(self, query, params_seq):
-        return self.await_(self._cursor.executemany(query, params_seq))
-
-    def __iter__(self):
-        while self._rows:
-            yield self._rows.popleft()
-
-    def fetchone(self):
-        if self._rows:
-            return self._rows.popleft()
-        else:
-            return None
-
-    def fetchmany(self, size=None):
-        if size is None:
-            size = self._cursor.arraysize
-
-        rr = self._rows
-        return [rr.popleft() for _ in range(min(size, len(rr)))]
-
-    def fetchall(self):
-        retval = list(self._rows)
-        self._rows.clear()
-        return retval
+    async def _executemany_async(
+        self,
+        operation,
+        seq_of_parameters,
+    ):
+        # override to not use mutex, psycopg3 already has mutex
+        return await self._cursor.executemany(operation, seq_of_parameters)
 
 
-class AsyncAdapt_psycopg_ss_cursor(AsyncAdapt_psycopg_cursor):
-    def execute(self, query, params=None, **kw):
-        self.await_(self._cursor.execute(query, params, **kw))
-        return self
+class AsyncAdapt_psycopg_ss_cursor(
+    AsyncAdapt_dbapi_ss_cursor, AsyncAdapt_psycopg_cursor
+):
+    __slots__ = ("name",)
 
-    def close(self):
-        self.await_(self._cursor.close())
+    name: str
 
-    def fetchone(self):
-        return self.await_(self._cursor.fetchone())
+    def __init__(self, adapt_connection, name):
+        self.name = name
+        super().__init__(adapt_connection)
 
-    def fetchmany(self, size=0):
-        return self.await_(self._cursor.fetchmany(size))
-
-    def fetchall(self):
-        return self.await_(self._cursor.fetchall())
-
-    def __iter__(self):
-        iterator = self._cursor.__aiter__()
-        while True:
-            try:
-                yield self.await_(iterator.__anext__())
-            except StopAsyncIteration:
-                break
+    def _make_new_cursor(self, connection):
+        return connection.cursor(self.name)
 
 
-class AsyncAdapt_psycopg_connection(AdaptedConnection):
+class AsyncAdapt_psycopg_connection(AsyncAdapt_dbapi_connection):
     _connection: AsyncConnection
     __slots__ = ()
-    await_ = staticmethod(await_only)
 
-    def __init__(self, connection) -> None:
-        self._connection = connection
+    _cursor_cls = AsyncAdapt_psycopg_cursor
+    _ss_cursor_cls = AsyncAdapt_psycopg_ss_cursor
 
-    def __getattr__(self, name):
-        return getattr(self._connection, name)
+    def add_notice_handler(self, handler):
+        self._connection.add_notice_handler(handler)
 
-    def execute(self, query, params=None, **kw):
-        cursor = self.await_(self._connection.execute(query, params, **kw))
-        return AsyncAdapt_psycopg_cursor(cursor, self.await_)
+    @property
+    def info(self):
+        return self._connection.info
 
-    def cursor(self, *args, **kw):
-        cursor = self._connection.cursor(*args, **kw)
-        if hasattr(cursor, "name"):
-            return AsyncAdapt_psycopg_ss_cursor(cursor, self.await_)
-        else:
-            return AsyncAdapt_psycopg_cursor(cursor, self.await_)
+    @property
+    def adapters(self):
+        return self._connection.adapters
 
-    def commit(self):
-        self.await_(self._connection.commit())
+    @property
+    def closed(self):
+        return self._connection.closed
 
-    def rollback(self):
-        self.await_(self._connection.rollback())
+    @property
+    def broken(self):
+        return self._connection.broken
 
-    def close(self):
-        self.await_(self._connection.close())
+    @property
+    def read_only(self):
+        return self._connection.read_only
+
+    @property
+    def deferrable(self):
+        return self._connection.deferrable
 
     @property
     def autocommit(self):
@@ -742,59 +710,56 @@ class AsyncAdapt_psycopg_connection(AdaptedConnection):
         self.set_autocommit(value)
 
     def set_autocommit(self, value):
-        self.await_(self._connection.set_autocommit(value))
+        await_(self._connection.set_autocommit(value))
 
     def set_isolation_level(self, value):
-        self.await_(self._connection.set_isolation_level(value))
+        await_(self._connection.set_isolation_level(value))
 
     def set_read_only(self, value):
-        self.await_(self._connection.set_read_only(value))
+        await_(self._connection.set_read_only(value))
 
     def set_deferrable(self, value):
-        self.await_(self._connection.set_deferrable(value))
+        await_(self._connection.set_deferrable(value))
+
+    def cursor(self, name=None, /):
+        if name:
+            return AsyncAdapt_psycopg_ss_cursor(self, name)
+        else:
+            return AsyncAdapt_psycopg_cursor(self)
 
     def tpc_begin(self, xid):
-        return self.await_(self._connection.tpc_begin(xid))
+        return await_(self._connection.tpc_begin(xid))
 
     def tpc_prepare(self):
-        return self.await_(self._connection.tpc_prepare())
+        return await_(self._connection.tpc_prepare())
 
     def tpc_commit(self, xid=None):
-        return self.await_(self._connection.tpc_commit(xid))
+        return await_(self._connection.tpc_commit(xid))
 
     def tpc_rollback(self, xid=None):
-        return self.await_(self._connection.tpc_rollback(xid))
+        return await_(self._connection.tpc_rollback(xid))
 
     def tpc_recover(self):
-        return self.await_(self._connection.tpc_recover())
+        return await_(self._connection.tpc_recover())
 
 
-class AsyncAdaptFallback_psycopg_connection(AsyncAdapt_psycopg_connection):
-    __slots__ = ()
-    await_ = staticmethod(await_fallback)
-
-
-class PsycopgAdaptDBAPI:
-    def __init__(self, psycopg) -> None:
+class PsycopgAdaptDBAPI(AsyncAdapt_dbapi_module):
+    def __init__(self, psycopg, ExecStatus) -> None:
+        super().__init__(psycopg)
         self.psycopg = psycopg
+        self.ExecStatus = ExecStatus
 
         for k, v in self.psycopg.__dict__.items():
             if k != "connect":
                 self.__dict__[k] = v
 
     def connect(self, *arg, **kw):
-        async_fallback = kw.pop("async_fallback", False)
         creator_fn = kw.pop(
             "async_creator_fn", self.psycopg.AsyncConnection.connect
         )
-        if util.asbool(async_fallback):
-            return AsyncAdaptFallback_psycopg_connection(
-                await_fallback(creator_fn(*arg, **kw))
-            )
-        else:
-            return AsyncAdapt_psycopg_connection(
-                await_only(creator_fn(*arg, **kw))
-            )
+        return await_(
+            AsyncAdapt_psycopg_connection.create(self, creator_fn(*arg, **kw))
+        )
 
 
 class PGDialectAsync_psycopg(PGDialect_psycopg):
@@ -806,24 +771,13 @@ class PGDialectAsync_psycopg(PGDialect_psycopg):
         import psycopg
         from psycopg.pq import ExecStatus
 
-        AsyncAdapt_psycopg_cursor._psycopg_ExecStatus = ExecStatus
-
-        return PsycopgAdaptDBAPI(psycopg)
-
-    @classmethod
-    def get_pool_class(cls, url):
-        async_fallback = url.query.get("async_fallback", False)
-
-        if util.asbool(async_fallback):
-            return pool.FallbackAsyncAdaptedQueuePool
-        else:
-            return pool.AsyncAdaptedQueuePool
+        return PsycopgAdaptDBAPI(psycopg, ExecStatus)
 
     def _type_info_fetch(self, connection, name):
         from psycopg.types import TypeInfo
 
         adapted = connection.connection
-        return adapted.await_(TypeInfo.fetch(adapted.driver_connection, name))
+        return await_(TypeInfo.fetch(adapted.driver_connection, name))
 
     def _do_isolation_level(self, connection, autocommit, isolation_level):
         connection.set_autocommit(autocommit)

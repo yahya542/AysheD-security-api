@@ -23,8 +23,10 @@ from typing import Dict
 from typing import Iterable
 from typing import Iterator
 from typing import List
+from typing import Literal
 from typing import Optional
 from typing import overload
+from typing import Protocol
 from typing import Sequence
 from typing import Tuple
 from typing import TYPE_CHECKING
@@ -67,15 +69,14 @@ from .selectable import TableClause
 from .visitors import _ET
 from .. import exc
 from .. import util
-from ..util.typing import Literal
-from ..util.typing import Protocol
+from ..util.typing import Unpack
 
 if typing.TYPE_CHECKING:
     from ._typing import _EquivalentColumnMap
     from ._typing import _LimitOffsetType
     from ._typing import _TypeEngineArgument
+    from .elements import AbstractTextClause
     from .elements import BinaryExpression
-    from .elements import TextClause
     from .selectable import _JoinTargetElement
     from .selectable import _SelectIterable
     from .selectable import Selectable
@@ -303,11 +304,11 @@ def visit_binary_product(
             # those are just column elements by themselves
             yield element
         elif element.__visit_name__ == "binary" and operators.is_comparison(
-            element.operator  # type: ignore
+            element.operator  # type: ignore[attr-defined]
         ):
-            stack.insert(0, element)  # type: ignore
-            for l in visit(element.left):  # type: ignore
-                for r in visit(element.right):  # type: ignore
+            stack.insert(0, element)  # type: ignore[arg-type]
+            for l in visit(element.left):  # type: ignore[attr-defined]
+                for r in visit(element.right):  # type: ignore[attr-defined]
                     fn(stack[0], l, r)
             stack.pop(0)
             for elem in element.get_children():
@@ -319,7 +320,7 @@ def visit_binary_product(
                 yield from visit(elem)
 
     list(visit(expr))
-    visit = None  # type: ignore  # remove gc cycles
+    visit = None  # type: ignore[assignment]  # remove gc cycles
 
 
 def find_tables(
@@ -383,7 +384,7 @@ def unwrap_order_by(clause: Any) -> Any:
         t = stack.popleft()
         if isinstance(t, ColumnElement) and (
             not isinstance(t, UnaryExpression)
-            or not operators.is_ordering_modifier(t.modifier)  # type: ignore
+            or not operators.is_ordering_modifier(t.modifier)  # type: ignore[arg-type]  # noqa: E501
         ):
             if isinstance(t, Label) and not isinstance(
                 t.element, ScalarSelect
@@ -466,6 +467,15 @@ def tables_from_leftmost(clause: FromClause) -> Iterator[FromClause]:
         yield from tables_from_leftmost(clause.element)
     else:
         yield clause
+
+
+def surface_expressions(clause):
+    stack = [clause]
+    while stack:
+        elem = stack.pop()
+        yield elem
+        if isinstance(elem, ColumnElement):
+            stack.extend(elem.get_children())
 
 
 def surface_selectables(clause):
@@ -584,7 +594,9 @@ class _repr_row(_repr_base):
 
     __slots__ = ("row",)
 
-    def __init__(self, row: Row[Any], max_chars: int = 300):
+    def __init__(
+        self, row: Row[Unpack[Tuple[Any, ...]]], max_chars: int = 300
+    ):
         self.row = row
         self.max_chars = max_chars
 
@@ -882,14 +894,14 @@ def reduce_columns(
     columns: _SelectIterable,
     *clauses: Optional[ClauseElement],
     **kw: bool,
-) -> Sequence[Union[ColumnElement[Any], TextClause]]: ...
+) -> Sequence[Union[ColumnElement[Any], AbstractTextClause]]: ...
 
 
 def reduce_columns(
     columns: _SelectIterable,
     *clauses: Optional[ClauseElement],
     **kw: bool,
-) -> Collection[Union[ColumnElement[Any], TextClause]]:
+) -> Collection[Union[ColumnElement[Any], AbstractTextClause]]:
     r"""given a list of columns, return a 'reduced' set based on natural
     equivalents.
 
@@ -914,7 +926,7 @@ def reduce_columns(
 
     column_set = util.OrderedSet(columns)
     cset_no_text: util.OrderedSet[ColumnElement[Any]] = column_set.difference(
-        c for c in column_set if is_text_clause(c)  # type: ignore
+        c for c in column_set if is_text_clause(c)  # type: ignore[assignment]
     )
 
     omit = util.column_set()
@@ -1146,9 +1158,9 @@ class ClauseAdapter(visitors.ReplacingExternalTraversal):
 
         # TODO: cython candidate
 
-        if self.include_fn and not self.include_fn(col):  # type: ignore
+        if self.include_fn and not self.include_fn(col):  # type: ignore[arg-type]  # noqa: E501
             return None
-        elif self.exclude_fn and self.exclude_fn(col):  # type: ignore
+        elif self.exclude_fn and self.exclude_fn(col):  # type: ignore[arg-type]  # noqa: E501
             return None
 
         if isinstance(col, FromClause) and not isinstance(
@@ -1161,7 +1173,7 @@ class ClauseAdapter(visitors.ReplacingExternalTraversal):
                             break
                     else:
                         return None
-                return self.selectable  # type: ignore
+                return self.selectable  # type: ignore[return-value]
             elif isinstance(col, Alias) and isinstance(
                 col.element, TableClause
             ):
@@ -1207,7 +1219,7 @@ class ClauseAdapter(visitors.ReplacingExternalTraversal):
         if TYPE_CHECKING:
             assert isinstance(col, KeyedColumnElement)
 
-        return self._corresponding_column(  # type: ignore
+        return self._corresponding_column(  # type: ignore[no-any-return]
             col, require_embedded=True
         )
 
@@ -1291,7 +1303,7 @@ class ColumnAdapter(ClauseAdapter):
             adapt_from_selectables=adapt_from_selectables,
         )
 
-        self.columns = util.WeakPopulateDict(self._locate_col)  # type: ignore
+        self.columns = util.WeakPopulateDict(self._locate_col)  # type: ignore[arg-type, assignment]  # noqa: E501
         if self.include_fn or self.exclude_fn:
             self.columns = self._IncludeExcludeMapping(self, self.columns)
         self.adapt_required = adapt_required
@@ -1316,7 +1328,7 @@ class ColumnAdapter(ClauseAdapter):
     def wrap(self, adapter):
         ac = copy.copy(self)
         ac._wrap = adapter
-        ac.columns = util.WeakPopulateDict(ac._locate_col)  # type: ignore
+        ac.columns = util.WeakPopulateDict(ac._locate_col)  # type: ignore[arg-type, assignment]  # noqa: E501
         if ac.include_fn or ac.exclude_fn:
             ac.columns = self._IncludeExcludeMapping(ac, ac.columns)
 
@@ -1346,9 +1358,7 @@ class ColumnAdapter(ClauseAdapter):
     adapt_clause = traverse
     adapt_list = ClauseAdapter.copy_and_process
 
-    def adapt_check_present(
-        self, col: ColumnElement[Any]
-    ) -> Optional[ColumnElement[Any]]:
+    def adapt_check_present(self, col: _ET) -> Optional[_ET]:
         newcol = self.columns[col]
 
         if newcol is col and self._corresponding_column(col, True) is None:
@@ -1456,7 +1466,7 @@ def _make_slice(
             offset_clause = 0
 
         if start != 0:
-            offset_clause = offset_clause + start  # type: ignore
+            offset_clause = offset_clause + start  # type: ignore[operator]
 
         if offset_clause == 0:
             offset_clause = None

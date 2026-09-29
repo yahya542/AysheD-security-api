@@ -137,13 +137,13 @@ from typing import List
 from typing import Optional
 from typing import overload
 from typing import Sequence
+from typing import SupportsIndex
 from typing import Type
 from typing import TypeVar
 from typing import Union
 
 from ..orm.collections import collection
 from ..orm.collections import collection_adapter
-from ..util.typing import SupportsIndex
 
 _T = TypeVar("_T")
 OrderingFunc = Callable[[int, Sequence[_T]], object]

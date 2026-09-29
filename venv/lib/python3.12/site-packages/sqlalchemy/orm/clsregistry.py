@@ -38,6 +38,7 @@ from . import attributes
 from . import interfaces
 from .descriptor_props import SynonymProperty
 from .properties import ColumnProperty
+from .util import _metadata_for_cls
 from .util import class_mapper
 from .. import exc
 from .. import inspection
@@ -52,16 +53,16 @@ if TYPE_CHECKING:
 
 _T = TypeVar("_T", bound=Any)
 
-_ClsRegistryType = MutableMapping[str, Union[type, "ClsRegistryToken"]]
+_ClsRegistryType = MutableMapping[str, Union[type, "_ClsRegistryToken"]]
 
 # strong references to registries which we place in
 # the _decl_class_registry, which is usually weak referencing.
 # the internal registries here link to classes with weakrefs and remove
 # themselves when all references to contained classes are removed.
-_registries: Set[ClsRegistryToken] = set()
+_registries: Set[_ClsRegistryToken] = set()
 
 
-def add_class(
+def _add_class(
     classname: str, cls: Type[_T], decl_class_registry: _ClsRegistryType
 ) -> None:
     """Add a class to the _decl_class_registry associated with the
@@ -115,7 +116,7 @@ def add_class(
                 raise
 
 
-def remove_class(
+def _remove_class(
     classname: str, cls: Type[Any], decl_class_registry: _ClsRegistryType
 ) -> None:
     if classname in decl_class_registry:
@@ -180,13 +181,13 @@ def _key_is_empty(
         return not test(thing)
 
 
-class ClsRegistryToken:
+class _ClsRegistryToken:
     """an object that can be in the registry._class_registry as a value."""
 
     __slots__ = ()
 
 
-class _MultipleClassMarker(ClsRegistryToken):
+class _MultipleClassMarker(_ClsRegistryToken):
     """refers to multiple classes of the same name
     within _decl_class_registry.
 
@@ -255,7 +256,7 @@ class _MultipleClassMarker(ClsRegistryToken):
         self.contents.add(weakref.ref(item, self._remove_item))
 
 
-class _ModuleMarker(ClsRegistryToken):
+class _ModuleMarker(_ClsRegistryToken):
     """Refers to a module name within
     _decl_class_registry.
 
@@ -282,7 +283,7 @@ class _ModuleMarker(ClsRegistryToken):
     def __contains__(self, name: str) -> bool:
         return name in self.contents
 
-    def __getitem__(self, name: str) -> ClsRegistryToken:
+    def __getitem__(self, name: str) -> _ClsRegistryToken:
         return self.contents[name]
 
     def _remove_item(self, name: str) -> None:
@@ -418,14 +419,14 @@ class _class_resolver:
         "fallback",
         "_dict",
         "_resolvers",
-        "favor_tables",
+        "tables_only",
     )
 
     cls: Type[Any]
     prop: RelationshipProperty[Any]
     fallback: Mapping[str, Any]
     arg: str
-    favor_tables: bool
+    tables_only: bool
     _resolvers: Tuple[Callable[[str], Any], ...]
 
     def __init__(
@@ -434,7 +435,7 @@ class _class_resolver:
         prop: RelationshipProperty[Any],
         fallback: Mapping[str, Any],
         arg: str,
-        favor_tables: bool = False,
+        tables_only: bool = False,
     ):
         self.cls = cls
         self.prop = prop
@@ -442,40 +443,71 @@ class _class_resolver:
         self.fallback = fallback
         self._dict = util.PopulateDict(self._access_cls)
         self._resolvers = ()
-        self.favor_tables = favor_tables
+        self.tables_only = tables_only
+
+    def _resolve_table_key(
+        self, key: str, metadata: MetaData
+    ) -> Optional[Table]:
+        if metadata.schema is not None and "." not in key:
+            schema_key = _get_table_key(key, metadata.schema)
+            if schema_key in metadata.tables:
+                return metadata.tables[schema_key]
+            if key in metadata.tables:
+                util.warn_deprecated(
+                    "The string '%s' was resolved to the "
+                    "non-schema-qualified table '%s', however "
+                    "the MetaData object has a default schema "
+                    "of '%s'. In a future version of SQLAlchemy, "
+                    "this unqualified name will be resolved as "
+                    "'%s'. To reference a table without a "
+                    "schema, use the Table object directly."
+                    % (key, key, metadata.schema, schema_key),
+                    "2.1",
+                )
+                return metadata.tables[key]
+        elif key in metadata.tables:
+            return metadata.tables[key]
+        return None
 
     def _access_cls(self, key: str) -> Any:
         cls = self.cls
 
         manager = attributes.manager_of_class(cls)
-        decl_base = manager.registry
-        assert decl_base is not None
-        decl_class_registry = decl_base._class_registry
-        metadata = decl_base.metadata
+        registry = manager.registry
+        assert registry is not None
+        decl_class_registry = registry._class_registry
+        metadata = _metadata_for_cls(cls, registry)
 
-        if self.favor_tables:
-            if key in metadata.tables:
-                return metadata.tables[key]
+        if self.tables_only:
+            table = self._resolve_table_key(key, metadata)
+            if table is not None:
+                return table
             elif key in metadata._schemas:
-                return _GetTable(key, getattr(cls, "metadata", metadata))
+                return _GetTable(key, metadata)
 
         if key in decl_class_registry:
-            return _determine_container(key, decl_class_registry[key])
+            dt = _determine_container(key, decl_class_registry[key])
+            if self.tables_only:
+                return dt.cls
+            else:
+                return dt
 
-        if not self.favor_tables:
-            if key in metadata.tables:
-                return metadata.tables[key]
+        if not self.tables_only:
+            table = self._resolve_table_key(key, metadata)
+            if table is not None:
+                return table
             elif key in metadata._schemas:
-                return _GetTable(key, getattr(cls, "metadata", metadata))
+                return _GetTable(key, metadata)
 
         if "_sa_module_registry" in decl_class_registry and key in cast(
             _ModuleMarker, decl_class_registry["_sa_module_registry"]
         ):
-            registry = cast(
+            _module_registry = cast(
                 _ModuleMarker, decl_class_registry["_sa_module_registry"]
             )
-            return registry.resolve_attr(key)
-        elif self._resolvers:
+            return _module_registry.resolve_attr(key)
+
+        if self._resolvers:
             for resolv in self._resolvers:
                 value = resolv(key)
                 if value is not None:
@@ -498,12 +530,33 @@ class _class_resolver:
                 f"['{clsarg}']] = relationship()\""
             ) from err
         else:
+            manager = attributes.manager_of_class(self.cls)
+            registry = manager.registry
+            metadata = (
+                _metadata_for_cls(self.cls, registry)
+                if registry is not None
+                else None
+            )
+
+            # when deprecated fallback lookup in
+            # _resolve_table_key is removed, consider adding
+            # additional context to the error message if the
+            # unqualified key is located under BLANK_SCHEMA
+            if metadata is not None and metadata.schema is not None:
+                schema_key = _get_table_key(name, metadata.schema)
+                assert schema_key not in metadata.tables
+
             raise exc.InvalidRequestError(
                 "When initializing mapper %s, expression %r failed to "
                 "locate a name (%r). If this is a class name, consider "
                 "adding this relationship() to the %r class after "
                 "both dependent classes have been defined."
-                % (self.prop.parent, self.arg, name, self.cls)
+                % (
+                    self.prop.parent,
+                    self.arg,
+                    name,
+                    self.cls,
+                )
             ) from err
 
     def _resolve_name(self) -> Union[Table, Type[Any], _ModNS]:
@@ -529,18 +582,24 @@ class _class_resolver:
                 return rval
 
     def __call__(self) -> Any:
-        try:
-            x = eval(self.arg, globals(), self._dict)
+        if self.tables_only:
+            try:
+                return self._dict[self.arg]
+            except KeyError as k:
+                self._raise_for_name(self.arg, k)
+        else:
+            try:
+                x = eval(self.arg, globals(), self._dict)
 
-            if isinstance(x, _GetColumns):
-                return x.cls
-            else:
-                return x
-        except NameError as n:
-            self._raise_for_name(n.args[0], n)
+                if isinstance(x, _GetColumns):
+                    return x.cls
+                else:
+                    return x
+            except NameError as n:
+                self._raise_for_name(n.args[0], n)
 
 
-_fallback_dict: Mapping[str, Any] = None  # type: ignore
+_fallback_dict: Mapping[str, Any] = None  # type: ignore[assignment]
 
 
 def _resolver(cls: Type[Any], prop: RelationshipProperty[Any]) -> Tuple[
@@ -558,9 +617,9 @@ def _resolver(cls: Type[Any], prop: RelationshipProperty[Any]) -> Tuple[
             {"foreign": foreign, "remote": remote}
         )
 
-    def resolve_arg(arg: str, favor_tables: bool = False) -> _class_resolver:
+    def resolve_arg(arg: str, tables_only: bool = False) -> _class_resolver:
         return _class_resolver(
-            cls, prop, _fallback_dict, arg, favor_tables=favor_tables
+            cls, prop, _fallback_dict, arg, tables_only=tables_only
         )
 
     def resolve_name(

@@ -203,7 +203,7 @@ def deprecated_params(**specs: Tuple[str, str]) -> Callable[[_F], _F]:
 
         @deprecated_params(
             weak_identity_map=(
-                "0.7",
+                "2.0",
                 "the :paramref:`.Session.weak_identity_map parameter "
                 "is deprecated.",
             )
@@ -280,7 +280,7 @@ def deprecated_params(**specs: Tuple[str, str]) -> Callable[[_F], _F]:
                     )
             return fn(*args, **kwargs)  # type: ignore[no-any-return]
 
-        doc = fn.__doc__ is not None and fn.__doc__ or ""
+        doc = fn.__doc__ if fn.__doc__ is not None else ""
         if doc:
             doc = inject_param_text(
                 doc,
@@ -395,7 +395,7 @@ def _decorate_with_warning(
 
     decorated = warned(func)
     decorated.__doc__ = doc
-    decorated._sa_warn = lambda: _warn_with_version(  # type: ignore
+    decorated._sa_warn = lambda: _warn_with_version(  # type: ignore[attr-defined]  # noqa: E501
         message, version, wtype, stacklevel=3
     )
     return decorated

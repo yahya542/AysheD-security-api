@@ -11,12 +11,13 @@ import contextlib
 from typing import Any
 from typing import AsyncIterator
 from typing import Callable
+from typing import Concatenate
 from typing import Dict
 from typing import Generator
 from typing import NoReturn
 from typing import Optional
 from typing import overload
-from typing import Tuple
+from typing import ParamSpec
 from typing import Type
 from typing import TYPE_CHECKING
 from typing import TypeVar
@@ -40,9 +41,12 @@ from ...engine import Engine
 from ...engine.base import NestedTransaction
 from ...engine.base import Transaction
 from ...exc import ArgumentError
+from ...util import immutabledict
 from ...util.concurrency import greenlet_spawn
-from ...util.typing import Concatenate
-from ...util.typing import ParamSpec
+from ...util.typing import Never
+from ...util.typing import TupleAny
+from ...util.typing import TypeVarTuple
+from ...util.typing import Unpack
 
 if TYPE_CHECKING:
     from ...engine.cursor import CursorResult
@@ -65,6 +69,8 @@ if TYPE_CHECKING:
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T", bound=Any)
+_Ts = TypeVarTuple("_Ts")
+_stream_results = immutabledict(stream_results=True)
 
 
 def create_async_engine(url: Union[str, URL], **kw: Any) -> AsyncEngine:
@@ -112,7 +118,7 @@ def create_async_engine(url: Union[str, URL], **kw: Any) -> AsyncEngine:
             # note that to send adapted arguments like
             # prepared_statement_cache_size, user would use
             # "creator" and emulate this form here
-            return sync_engine.dialect.dbapi.connect(  # type: ignore
+            return sync_engine.dialect.dbapi.connect(  # type: ignore[union-attr]  # noqa: E501
                 async_creator_fn=async_creator
             )
 
@@ -163,6 +169,8 @@ def create_async_pool_from_url(url: Union[str, URL], **kwargs: Any) -> Pool:
 
 class AsyncConnectable:
     __slots__ = "_slots_dispatch", "__weakref__"
+
+    sync_engine: Engine
 
     @classmethod
     def _no_async_engine_events(cls) -> NoReturn:
@@ -420,6 +428,7 @@ class AsyncConnection(  # type: ignore[misc]
         insertmanyvalues_page_size: int = ...,
         schema_translate_map: Optional[SchemaTranslateMapType] = ...,
         preserve_rowcount: bool = False,
+        driver_column_names: bool = False,
         **opt: Any,
     ) -> AsyncConnection: ...
 
@@ -518,11 +527,11 @@ class AsyncConnection(  # type: ignore[misc]
     @overload
     def stream(
         self,
-        statement: TypedReturnsRows[_T],
+        statement: TypedReturnsRows[Unpack[_Ts]],
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> GeneratorStartableContext[AsyncResult[_T]]: ...
+    ) -> GeneratorStartableContext[AsyncResult[Unpack[_Ts]]]: ...
 
     @overload
     def stream(
@@ -531,7 +540,7 @@ class AsyncConnection(  # type: ignore[misc]
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> GeneratorStartableContext[AsyncResult[Any]]: ...
+    ) -> GeneratorStartableContext[AsyncResult[Unpack[TupleAny]]]: ...
 
     @asyncstartablecontext
     async def stream(
@@ -540,7 +549,7 @@ class AsyncConnection(  # type: ignore[misc]
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> AsyncIterator[AsyncResult[Any]]:
+    ) -> AsyncIterator[AsyncResult[Unpack[TupleAny]]]:
         """Execute a statement and return an awaitable yielding a
         :class:`_asyncio.AsyncResult` object.
 
@@ -586,7 +595,7 @@ class AsyncConnection(  # type: ignore[misc]
             statement,
             parameters,
             execution_options=util.EMPTY_DICT.merge_with(
-                execution_options, {"stream_results": True}
+                execution_options, _stream_results
             ),
             _require_await=True,
         )
@@ -603,11 +612,11 @@ class AsyncConnection(  # type: ignore[misc]
     @overload
     async def execute(
         self,
-        statement: TypedReturnsRows[_T],
+        statement: TypedReturnsRows[Unpack[_Ts]],
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> CursorResult[_T]: ...
+    ) -> CursorResult[Unpack[_Ts]]: ...
 
     @overload
     async def execute(
@@ -616,7 +625,7 @@ class AsyncConnection(  # type: ignore[misc]
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> CursorResult[Any]: ...
+    ) -> CursorResult[Unpack[TupleAny]]: ...
 
     async def execute(
         self,
@@ -624,7 +633,7 @@ class AsyncConnection(  # type: ignore[misc]
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
-    ) -> CursorResult[Any]:
+    ) -> CursorResult[Unpack[TupleAny]]:
         r"""Executes a SQL statement construct and return a buffered
         :class:`_engine.Result`.
 
@@ -665,10 +674,21 @@ class AsyncConnection(  # type: ignore[misc]
         )
         return await _ensure_sync_result(result, self.execute)
 
+    # special case to handle mypy issue:
+    # https://github.com/python/mypy/issues/20651
     @overload
     async def scalar(
         self,
-        statement: TypedReturnsRows[Tuple[_T]],
+        statement: TypedReturnsRows[Never],
+        parameters: Optional[_CoreSingleExecuteParams] = None,
+        *,
+        execution_options: Optional[CoreExecuteOptionsParameter] = None,
+    ) -> Optional[Any]: ...
+
+    @overload
+    async def scalar(
+        self,
+        statement: TypedReturnsRows[_T],
         parameters: Optional[_CoreSingleExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
@@ -708,7 +728,7 @@ class AsyncConnection(  # type: ignore[misc]
     @overload
     async def scalars(
         self,
-        statement: TypedReturnsRows[Tuple[_T]],
+        statement: TypedReturnsRows[_T],
         parameters: Optional[_CoreAnyExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
@@ -749,7 +769,7 @@ class AsyncConnection(  # type: ignore[misc]
     @overload
     def stream_scalars(
         self,
-        statement: TypedReturnsRows[Tuple[_T]],
+        statement: TypedReturnsRows[_T],
         parameters: Optional[_CoreSingleExecuteParams] = None,
         *,
         execution_options: Optional[CoreExecuteOptionsParameter] = None,
@@ -1207,8 +1227,6 @@ class AsyncEngine(ProxyComparable[Engine], AsyncConnectable):  # type: ignore[mi
 
             Proxied for the :class:`_engine.Engine` class on
             behalf of the :class:`_asyncio.AsyncEngine` class.
-
-        .. versionadded: 1.3
 
         .. seealso::
 

@@ -455,9 +455,6 @@ indicated from a :class:`_schema.Column` object.
     `ON CONFLICT <https://www.sqlite.org/lang_conflict.html>`_ - in the SQLite
     documentation
 
-.. versionadded:: 1.3
-
-
 The ``sqlite_on_conflict`` parameters accept a  string argument which is just
 the resolution name to be chosen, which on SQLite can be one of ROLLBACK,
 ABORT, FAIL, IGNORE, and REPLACE.   For example, to add a UNIQUE constraint
@@ -747,6 +744,54 @@ occurs:
     >>> print(stmt)
     {printsql}INSERT INTO my_table (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING
 
+.. _sqlite_on_conflict_multiple:
+
+Specifying Multiple ON CONFLICT Clauses
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SQLite accepts more than one ``ON CONFLICT`` clause within a single INSERT
+statement.  The :meth:`_sqlite.Insert.on_conflict_do_update` and
+:meth:`_sqlite.Insert.on_conflict_do_nothing` methods may therefore be
+invoked repeatedly against the same construct, and may be combined with each
+other; each clause renders in the order in which it was established:
+
+.. sourcecode:: pycon+sql
+
+    >>> stmt = insert(my_table).values(id="some_id", data="inserted value")
+    >>> stmt = stmt.on_conflict_do_update(
+    ...     index_elements=["id"], set_=dict(data="updated value")
+    ... ).on_conflict_do_nothing(index_elements=["data"])
+    >>> print(stmt)
+    {printsql}INSERT INTO my_table (id, data) VALUES (?, ?)
+    ON CONFLICT (id) DO UPDATE SET data = ?
+    ON CONFLICT (data) DO NOTHING
+
+SQLite tests the clauses in the order given, and applies at most one of them
+to any particular row, that being the first clause whose conflict target
+matches the constraint that was violated.
+
+Only the last ``ON CONFLICT`` clause of a statement may omit its conflict
+target, in which case it fires for any unique violation not already captured
+by a preceding clause.  A :meth:`_sqlite.Insert.on_conflict_do_nothing` call
+that omits
+:paramref:`_sqlite.Insert.on_conflict_do_nothing.index_elements` must
+therefore be the last clause established, else
+:class:`.InvalidRequestError` is raised:
+
+.. sourcecode:: pycon+sql
+
+    >>> stmt = insert(my_table).values(id="some_id", data="inserted value")
+    >>> stmt = stmt.on_conflict_do_update(
+    ...     index_elements=["id"], set_=dict(data="updated value")
+    ... ).on_conflict_do_nothing()
+    >>> print(stmt)
+    {printsql}INSERT INTO my_table (id, data) VALUES (?, ?)
+    ON CONFLICT (id) DO UPDATE SET data = ?
+    ON CONFLICT DO NOTHING
+
+.. versionadded:: 2.1  Multiple ``ON CONFLICT`` clauses may be established
+   on a single :class:`_sqlite.Insert` construct.
+
 .. _sqlite_type_reflection:
 
 Type Reflection
@@ -1004,6 +1049,7 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from .json import JSON
+from .json import JSONB
 from .json import JSONIndexType
 from .json import JSONPathType
 from ... import exc
@@ -1018,6 +1064,7 @@ from ...engine import reflection
 from ...engine.reflection import ReflectionDefaults
 from ...sql import coercions
 from ...sql import compiler
+from ...sql import ddl as sa_ddl
 from ...sql import elements
 from ...sql import roles
 from ...sql import schema
@@ -1038,6 +1085,7 @@ if TYPE_CHECKING:
     from ...engine.interfaces import DBAPIConnection
     from ...engine.interfaces import Dialect
     from ...engine.interfaces import IsolationLevel
+    from ...sql.sqltypes import _JSON_VALUE
     from ...sql.type_api import _BindProcessorType
     from ...sql.type_api import _ResultProcessorType
 
@@ -1408,6 +1456,7 @@ colspecs = {
     sqltypes.JSON.JSONIndexType: JSONIndexType,
     sqltypes.JSON.JSONPathType: JSONPathType,
     sqltypes.Time: TIME,
+    JSONB: JSONB,
 }
 
 ischema_names = {
@@ -1426,6 +1475,7 @@ ischema_names = {
     "INT": sqltypes.INTEGER,
     "INTEGER": sqltypes.INTEGER,
     "JSON": JSON,
+    "JSONB": JSONB,
     "NUMERIC": sqltypes.NUMERIC,
     "REAL": sqltypes.REAL,
     "SMALLINT": sqltypes.SMALLINT,
@@ -1479,7 +1529,9 @@ class SQLiteCompiler(compiler.SQLCompiler):
         return "length%s" % self.function_argspec(fn)
 
     def visit_aggregate_strings_func(self, fn, **kw):
-        return "group_concat%s" % self.function_argspec(fn)
+        return super().visit_aggregate_strings_func(
+            fn, use_function_name="group_concat", **kw
+        )
 
     def visit_cast(self, cast, **kwargs):
         if self.dialect.supports_cast:
@@ -1548,7 +1600,16 @@ class SQLiteCompiler(compiler.SQLCompiler):
             self.process(binary.right),
         )
 
-    def visit_json_getitem_op_binary(self, binary, operator, **kw):
+    def visit_json_getitem_op_binary(
+        self, binary, operator, _cast_applied=False, **kw
+    ):
+        if (
+            not _cast_applied
+            and binary.type._type_affinity is not sqltypes.JSON
+        ):
+            kw["_cast_applied"] = True
+            return self.process(sql.cast(binary, binary.type), **kw)
+
         if binary.type._type_affinity is sqltypes.JSON:
             expr = "JSON_QUOTE(JSON_EXTRACT(%s, %s))"
         else:
@@ -1559,7 +1620,16 @@ class SQLiteCompiler(compiler.SQLCompiler):
             self.process(binary.right, **kw),
         )
 
-    def visit_json_path_getitem_op_binary(self, binary, operator, **kw):
+    def visit_json_path_getitem_op_binary(
+        self, binary, operator, _cast_applied=False, **kw
+    ):
+        if (
+            not _cast_applied
+            and binary.type._type_affinity is not sqltypes.JSON
+        ):
+            kw["_cast_applied"] = True
+            return self.process(sql.cast(binary, binary.type), **kw)
+
         if binary.type._type_affinity is sqltypes.JSON:
             expr = "JSON_QUOTE(JSON_EXTRACT(%s, %s))"
         else:
@@ -1646,16 +1716,12 @@ class SQLiteCompiler(compiler.SQLCompiler):
             else:
                 continue
 
-            if coercions._is_literal(value):
-                value = elements.BindParameter(None, value, type_=c.type)
+            if (
+                isinstance(value, elements.BindParameter)
+                and value.type._isnull
+            ):
+                value = value._with_binary_element_type(c.type)
 
-            else:
-                if (
-                    isinstance(value, elements.BindParameter)
-                    and value.type._isnull
-                ):
-                    value = value._clone()
-                    value.type = c.type
             value_text = self.process(
                 value.self_group(), is_upsert_set=True, **set_kw
             )
@@ -1893,6 +1959,17 @@ class SQLiteDDLCompiler(compiler.DDLCompiler):
         else:
             return ""
 
+    def visit_create_view(self, create, **kw):
+        """Handle SQLite if_not_exists dialect option for CREATE VIEW."""
+        # Get the if_not_exists dialect option from the CreateView object
+        if_not_exists = create.dialect_options["sqlite"].get(
+            "if_not_exists", False
+        )
+
+        # Pass if_not_exists through kw to the parent's _generate_table_select
+        kw["if_not_exists"] = if_not_exists
+        return super().visit_create_view(create, **kw)
+
 
 class SQLiteTypeCompiler(compiler.GenericTypeCompiler):
     def visit_large_binary(self, type_, **kw):
@@ -1930,6 +2007,9 @@ class SQLiteTypeCompiler(compiler.GenericTypeCompiler):
         # should not be an issue unless the JSON value consists of a single
         # numeric value.   JSONTEXT can be used if this case is required.
         return "JSON"
+
+    def visit_JSONB(self, type_, **kw):
+        return "JSONB"
 
 
 class SQLiteIdentifierPreparer(compiler.IdentifierPreparer):
@@ -2170,40 +2250,21 @@ class SQLiteDialect(default.DefaultDialect):
             },
         ),
         (sa_schema.Constraint, {"on_conflict": None}),
+        (sa_ddl.CreateView, {"if_not_exists": False}),
     ]
 
     _broken_fk_pragma_quotes = False
     _broken_dotted_colnames = False
 
-    @util.deprecated_params(
-        _json_serializer=(
-            "1.3.7",
-            "The _json_serializer argument to the SQLite dialect has "
-            "been renamed to the correct name of json_serializer.  The old "
-            "argument name will be removed in a future release.",
-        ),
-        _json_deserializer=(
-            "1.3.7",
-            "The _json_deserializer argument to the SQLite dialect has "
-            "been renamed to the correct name of json_deserializer.  The old "
-            "argument name will be removed in a future release.",
-        ),
-    )
     def __init__(
         self,
         native_datetime: bool = False,
-        json_serializer: Optional[Callable[..., Any]] = None,
-        json_deserializer: Optional[Callable[..., Any]] = None,
-        _json_serializer: Optional[Callable[..., Any]] = None,
-        _json_deserializer: Optional[Callable[..., Any]] = None,
+        json_serializer: Callable[[_JSON_VALUE], str] | None = None,
+        json_deserializer: Callable[[str], _JSON_VALUE] | None = None,
         **kwargs: Any,
     ) -> None:
         default.DefaultDialect.__init__(self, **kwargs)
 
-        if _json_serializer:
-            json_serializer = _json_serializer
-        if _json_deserializer:
-            json_deserializer = _json_deserializer
         self._json_serializer = json_serializer
         self._json_deserializer = json_deserializer
 

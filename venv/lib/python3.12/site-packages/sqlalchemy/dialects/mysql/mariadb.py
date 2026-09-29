@@ -9,10 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import MariaDBIdentifierPreparer
 from .base import MySQLDialect
-from .base import MySQLIdentifierPreparer
-from .base import MySQLTypeCompiler
 from ...sql import sqltypes
 
 
@@ -34,20 +31,18 @@ class INET6(sqltypes.TypeEngine[str]):
     __visit_name__ = "INET6"
 
 
-class MariaDBTypeCompiler(MySQLTypeCompiler):
-    def visit_INET4(self, type_: INET4, **kwargs: Any) -> str:
-        return "INET4"
-
-    def visit_INET6(self, type_: INET6, **kwargs: Any) -> str:
-        return "INET6"
-
-
 class MariaDBDialect(MySQLDialect):
     is_mariadb = True
     supports_statement_cache = True
+    supports_native_uuid = True
+
+    _allows_uuid_binds = True
+
     name = "mariadb"
-    preparer: type[MySQLIdentifierPreparer] = MariaDBIdentifierPreparer
-    type_compiler_cls = MariaDBTypeCompiler
+
+    def __init__(self, **kw: Any) -> None:
+        kw["is_mariadb"] = True
+        super().__init__(**kw)
 
 
 def loader(driver: str) -> type[MariaDBDialect]:

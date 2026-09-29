@@ -50,7 +50,6 @@ import re
 from typing import Any
 from typing import Callable
 from typing import Optional
-from typing import Tuple
 from typing import TYPE_CHECKING
 from typing import Union
 
@@ -124,7 +123,7 @@ class MySQLDialect_pyodbc(PyODBCConnector, MySQLDialect):
 
     def _get_server_version_info(
         self, connection: Connection
-    ) -> Tuple[int, ...]:
+    ) -> tuple[int, ...]:
         return MySQLDialect._get_server_version_info(self, connection)
 
     def _extract_error_code(self, exception: BaseException) -> Optional[int]:

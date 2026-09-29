@@ -12,9 +12,11 @@ from typing import Any
 from typing import Dict
 from typing import Mapping
 from typing import Optional
+from typing import Protocol
 from typing import Tuple
 from typing import Type
 from typing import TYPE_CHECKING
+from typing import TypeGuard
 from typing import TypeVar
 from typing import Union
 
@@ -26,13 +28,11 @@ from ..sql._orm_types import (
 )
 from ..sql._typing import _HasClauseElement
 from ..sql.elements import ColumnElement
-from ..util.typing import Protocol
-from ..util.typing import TypeGuard
 
 if TYPE_CHECKING:
-    from .attributes import AttributeImpl
-    from .attributes import CollectionAttributeImpl
-    from .attributes import HasCollectionAdapter
+    from .attributes import _AttributeImpl
+    from .attributes import _CollectionAttributeImpl
+    from .attributes import _HasCollectionAdapter
     from .attributes import QueryableAttribute
     from .base import PassiveFlag
     from .decl_api import registry as _registry_type
@@ -49,9 +49,6 @@ if TYPE_CHECKING:
     from ..sql.base import ExecutableOption
 
 _T = TypeVar("_T", bound=Any)
-
-
-_T_co = TypeVar("_T_co", bound=Any, covariant=True)
 
 _O = TypeVar("_O", bound=object)
 """The 'ORM mapped object' type.
@@ -101,6 +98,10 @@ OrmExecuteOptionsParameter = Union[
 ]
 
 
+class _HasPathString(Protocol):
+    def path_string(self) -> str: ...
+
+
 class _ORMAdapterProto(Protocol):
     """protocol for the :class:`.AliasedInsp._orm_adapt_element` method
     which is a synonym for :class:`.AliasedInsp._adapt_element`.
@@ -126,7 +127,7 @@ def is_orm_option(
 def is_user_defined_option(
     opt: ExecutableOption,
 ) -> TypeGuard[UserDefinedOption]:
-    return not opt._is_core and opt._is_user_defined  # type: ignore
+    return not opt._is_core and opt._is_user_defined  # type: ignore[attr-defined]  # noqa: E501
 
 
 def is_composite_class(obj: Any) -> bool:
@@ -159,12 +160,12 @@ if TYPE_CHECKING:
     ) -> TypeGuard[RelationshipProperty[Any]]: ...
 
     def is_collection_impl(
-        impl: AttributeImpl,
-    ) -> TypeGuard[CollectionAttributeImpl]: ...
+        impl: _AttributeImpl,
+    ) -> TypeGuard[_CollectionAttributeImpl]: ...
 
     def is_has_collection_adapter(
-        impl: AttributeImpl,
-    ) -> TypeGuard[HasCollectionAdapter]: ...
+        impl: _AttributeImpl,
+    ) -> TypeGuard[_HasCollectionAdapter]: ...
 
 else:
     insp_is_mapper_property = operator.attrgetter("is_property")

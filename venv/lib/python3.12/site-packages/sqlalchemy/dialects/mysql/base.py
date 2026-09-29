@@ -510,16 +510,30 @@ available.
 
     select(...).prefix_with(["HIGH_PRIORITY", "SQL_SMALL_RESULT"])
 
-* UPDATE with LIMIT::
+* UPDATE
+  with LIMIT::
 
-    update(...).with_dialect_options(mysql_limit=10, mariadb_limit=10)
+    from sqlalchemy.dialects.mysql import limit
+
+    update(...).ext(limit(10))
+
+  .. versionchanged:: 2.1 the :func:`_mysql.limit()` extension supersedes the
+     previous use of ``mysql_limit``
 
 * DELETE
   with LIMIT::
 
-    delete(...).with_dialect_options(mysql_limit=10, mariadb_limit=10)
+    from sqlalchemy.dialects.mysql import limit
 
-  .. versionadded:: 2.0.37 Added delete with limit
+    delete(...).ext(limit(10))
+
+  .. versionchanged:: 2.1 the :func:`_mysql.limit()` extension supersedes the
+     previous use of ``mysql_limit``
+
+* DELETE with an explicit ``USING`` expression such as a JOIN, use
+  :meth:`_sql.Delete.using`.  See :ref:`tutorial_multi_table_deletes`.
+
+  .. versionadded:: 2.1
 
 * optimizer hints, use :meth:`_expression.Select.prefix_with` and
   :meth:`_query.Query.prefix_with`::
@@ -662,9 +676,6 @@ this context is unambiguous:
     {printsql}INSERT INTO my_table (id, data) VALUES (%s, %s)
     ON DUPLICATE KEY UPDATE data = %s, updated_at = CURRENT_TIMESTAMP
 
-.. versionchanged:: 1.3 support for parameter-ordered UPDATE clause within
-   MySQL ON DUPLICATE KEY UPDATE
-
 .. warning::
 
     The :meth:`_mysql.Insert.on_duplicate_key_update`
@@ -698,10 +709,6 @@ table:
 
 When rendered, the "inserted" namespace will produce the expression
 ``VALUES(<columnname>)``.
-
-.. versionadded:: 1.2 Added support for MySQL ON DUPLICATE KEY UPDATE clause
-
-
 
 rowcount Support
 ----------------
@@ -806,9 +813,6 @@ is available using the keyword argument ``mysql_with_parser``::
         mariadb_prefix="FULLTEXT",
         mariadb_with_parser="ngram",
     )
-
-.. versionadded:: 1.3
-
 
 .. _mysql_foreign_keys:
 
@@ -1072,28 +1076,26 @@ import re
 from typing import Any
 from typing import Callable
 from typing import cast
-from typing import DefaultDict
-from typing import Dict
-from typing import List
 from typing import NoReturn
 from typing import Optional
 from typing import overload
 from typing import Sequence
-from typing import Tuple
 from typing import TYPE_CHECKING
+from typing import TypeVar
 from typing import Union
 
+from . import _mariadb_shim
 from . import reflection as _reflection
 from .enumerated import ENUM
 from .enumerated import SET
 from .json import JSON
 from .json import JSONIndexType
 from .json import JSONPathType
-from .reserved_words import RESERVED_WORDS_MARIADB
 from .reserved_words import RESERVED_WORDS_MYSQL
 from .types import _FloatType
 from .types import _IntegerType
 from .types import _MatchType
+from .types import _NumericCommonType
 from .types import _NumericType
 from .types import _StringType
 from .types import BIGINT
@@ -1127,7 +1129,6 @@ from ... import literal_column
 from ... import schema as sa_schema
 from ... import sql
 from ... import util
-from ...engine import cursor as _cursor
 from ...engine import default
 from ...engine import reflection
 from ...engine.reflection import ReflectionDefaults
@@ -1141,8 +1142,6 @@ from ...sql import sqltypes
 from ...sql import util as sql_util
 from ...sql import visitors
 from ...sql.compiler import InsertmanyvaluesSentinelOpts
-from ...sql.compiler import SQLCompiler
-from ...sql.schema import SchemaConst
 from ...types import BINARY
 from ...types import BLOB
 from ...types import BOOLEAN
@@ -1150,11 +1149,13 @@ from ...types import DATE
 from ...types import LargeBinary
 from ...types import UUID
 from ...types import VARBINARY
+from ...util import OrderedSet
 from ...util import topological
 
 if TYPE_CHECKING:
 
     from ...dialects.mysql import expression
+    from ...dialects.mysql.dml import DMLLimitClause
     from ...dialects.mysql.dml import OnDuplicateClause
     from ...engine.base import Connection
     from ...engine.cursor import CursorResult
@@ -1170,8 +1171,8 @@ if TYPE_CHECKING:
     from ...engine.interfaces import ReflectedPrimaryKeyConstraint
     from ...engine.interfaces import ReflectedTableComment
     from ...engine.interfaces import ReflectedUniqueConstraint
+    from ...engine.result import _Ts
     from ...engine.row import Row
-    from ...engine.url import URL
     from ...schema import Table
     from ...sql import ddl
     from ...sql import selectable
@@ -1183,12 +1184,13 @@ if TYPE_CHECKING:
     from ...sql.functions import random
     from ...sql.functions import rollup
     from ...sql.functions import sysdate
-    from ...sql.schema import IdentityOptions
-    from ...sql.schema import Sequence as Sequence_SchemaItem
+    from ...sql.sqltypes import _JSON_VALUE
     from ...sql.type_api import TypeEngine
     from ...sql.visitors import ExternallyTraversible
+    from ...util.typing import TupleAny
+    from ...util.typing import Unpack
 
-
+_T = TypeVar("_T", bound=Any)
 SET_RE = re.compile(
     r"\s*SET\s+(?:(?:GLOBAL|SESSION)\s+)?\w", re.I | re.UNICODE
 )
@@ -1227,6 +1229,7 @@ MSInteger = INTEGER
 
 colspecs = {
     _IntegerType: _IntegerType,
+    _NumericCommonType: _NumericCommonType,
     _NumericType: _NumericType,
     _FloatType: _FloatType,
     sqltypes.Numeric: NUMERIC,
@@ -1281,33 +1284,9 @@ ischema_names = {
 }
 
 
-class MySQLExecutionContext(default.DefaultExecutionContext):
-    def post_exec(self) -> None:
-        if (
-            self.isdelete
-            and cast(SQLCompiler, self.compiled).effective_returning
-            and not self.cursor.description
-        ):
-            # All MySQL/mariadb drivers appear to not include
-            # cursor.description for DELETE..RETURNING with no rows if the
-            # WHERE criteria is a straight "false" condition such as our EMPTY
-            # IN condition. manufacture an empty result in this case (issue
-            # #10505)
-            #
-            # taken from cx_Oracle implementation
-            self.cursor_fetch_strategy = (
-                _cursor.FullyBufferedCursorFetchStrategy(
-                    self.cursor,
-                    [
-                        (entry.keyname, None)  # type: ignore[misc]
-                        for entry in cast(
-                            SQLCompiler, self.compiled
-                        )._result_columns
-                    ],
-                    [],
-                )
-            )
-
+class MySQLExecutionContext(
+    _mariadb_shim.MariadbExecutionContextShim, default.DefaultExecutionContext
+):
     def create_server_side_cursor(self) -> DBAPICursor:
         if self.dialect.supports_server_side_cursors:
             return self._dbapi_connection.cursor(
@@ -1316,19 +1295,10 @@ class MySQLExecutionContext(default.DefaultExecutionContext):
         else:
             raise NotImplementedError()
 
-    def fire_sequence(
-        self, seq: Sequence_SchemaItem, type_: sqltypes.Integer
-    ) -> int:
-        return self._execute_scalar(  # type: ignore[no-any-return]
-            (
-                "select nextval(%s)"
-                % self.identifier_preparer.format_sequence(seq)
-            ),
-            type_,
-        )
 
-
-class MySQLCompiler(compiler.SQLCompiler):
+class MySQLCompiler(
+    _mariadb_shim.MariaDBSQLCompilerShim, compiler.SQLCompiler
+):
     dialect: MySQLDialect
     render_table_with_column_in_update_from = True
     """Overridden from base SQLCompiler value"""
@@ -1360,13 +1330,28 @@ class MySQLCompiler(compiler.SQLCompiler):
     def visit_aggregate_strings_func(
         self, fn: aggregate_strings, **kw: Any
     ) -> str:
-        expr, delimiter = (
-            elem._compiler_dispatch(self, **kw) for elem in fn.clauses
-        )
-        return f"group_concat({expr} SEPARATOR {delimiter})"
 
-    def visit_sequence(self, sequence: sa_schema.Sequence, **kw: Any) -> str:
-        return "nextval(%s)" % self.preparer.format_sequence(sequence)
+        order_by = getattr(fn.clauses, "aggregate_order_by", None)
+
+        cl = list(fn.clauses)
+        expr, delimiter = cl[0:2]
+
+        literal_exec = dict(kw)
+        literal_exec["literal_execute"] = True
+
+        if order_by is not None:
+            return (
+                f"group_concat({expr._compiler_dispatch(self, **kw)} "
+                f"ORDER BY {order_by._compiler_dispatch(self, **kw)} "
+                "SEPARATOR "
+                f"{delimiter._compiler_dispatch(self, **literal_exec)})"
+            )
+        else:
+            return (
+                f"group_concat({expr._compiler_dispatch(self, **kw)} "
+                "SEPARATOR "
+                f"{delimiter._compiler_dispatch(self, **literal_exec)})"
+            )
 
     def visit_sysdate_func(self, fn: sysdate, **kw: Any) -> str:
         return "SYSDATE()"
@@ -1399,7 +1384,7 @@ class MySQLCompiler(compiler.SQLCompiler):
                     self.process(binary.right, **kw),
                 )
             )
-        elif binary.type._type_affinity is sqltypes.Numeric:
+        elif binary.type._type_affinity in (sqltypes.Numeric, sqltypes.Float):
             binary_type = cast(sqltypes.Numeric[Any], binary.type)
             if (
                 binary_type.scale is not None
@@ -1461,7 +1446,7 @@ class MySQLCompiler(compiler.SQLCompiler):
     ) -> str:
         statement: ValuesBase = self.current_executable
 
-        cols: List[elements.KeyedColumnElement[Any]]
+        cols: list[elements.KeyedColumnElement[Any]]
         if on_duplicate._parameter_ordering:
             parameter_ordering = [
                 coercions.expect(roles.DMLColumnRole, key)
@@ -1497,41 +1482,34 @@ class MySQLCompiler(compiler.SQLCompiler):
         for column in (col for col in cols if col.key in on_duplicate_update):
             val = on_duplicate_update[column.key]
 
-            # TODO: this coercion should be up front.  we can't cache
-            # SQL constructs with non-bound literals buried in them
-            if coercions._is_literal(val):
-                val = elements.BindParameter(None, val, type_=column.type)
-                value_text = self.process(val.self_group(), use_schema=False)
-            else:
-
-                def replace(
-                    element: ExternallyTraversible, **kw: Any
-                ) -> Optional[ExternallyTraversible]:
-                    if (
-                        isinstance(element, elements.BindParameter)
-                        and element.type._isnull
-                    ):
-                        return element._with_binary_element_type(column.type)
-                    elif (
-                        isinstance(element, elements.ColumnClause)
-                        and element.table is on_duplicate.inserted_alias
-                    ):
-                        if requires_mysql8_alias:
-                            column_literal_clause = (
-                                f"{_on_dup_alias_name}."
-                                f"{self.preparer.quote(element.name)}"
-                            )
-                        else:
-                            column_literal_clause = (
-                                f"VALUES({self.preparer.quote(element.name)})"
-                            )
-                        return literal_column(column_literal_clause)
+            def replace(
+                element: ExternallyTraversible, **kw: Any
+            ) -> Optional[ExternallyTraversible]:
+                if (
+                    isinstance(element, elements.BindParameter)
+                    and element.type._isnull
+                ):
+                    return element._with_binary_element_type(column.type)
+                elif (
+                    isinstance(element, elements.ColumnClause)
+                    and element.table is on_duplicate.inserted_alias
+                ):
+                    if requires_mysql8_alias:
+                        column_literal_clause = (
+                            f"{_on_dup_alias_name}."
+                            f"{self.preparer.quote(element.name)}"
+                        )
                     else:
-                        # element is not replaced
-                        return None
+                        column_literal_clause = (
+                            f"VALUES({self.preparer.quote(element.name)})"
+                        )
+                    return literal_column(column_literal_clause)
+                else:
+                    # element is not replaced
+                    return None
 
-                val = visitors.replacement_traverse(val, {}, replace)
-                value_text = self.process(val.self_group(), use_schema=False)
+            val = visitors.replacement_traverse(val, {}, replace)
+            value_text = self.process(val.self_group(), use_schema=False)
 
             name_text = self.preparer.quote(column.name)
             clauses.append("%s = %s" % (name_text, value_text))
@@ -1543,7 +1521,7 @@ class MySQLCompiler(compiler.SQLCompiler):
                 "any column keys in table '%s': %s"
                 % (
                     self.statement.table.name,  # type: ignore[union-attr]
-                    (", ".join("'%s'" % c for c in non_matching)),
+                    ", ".join("'%s'" % c for c in non_matching),
                 )
             )
 
@@ -1558,8 +1536,8 @@ class MySQLCompiler(compiler.SQLCompiler):
     def visit_concat_op_expression_clauselist(
         self, clauselist: elements.ClauseList, operator: Any, **kw: Any
     ) -> str:
-        return "concat(%s)" % (
-            ", ".join(self.process(elem, **kw) for elem in clauselist.clauses)
+        return "concat(%s)" % ", ".join(
+            self.process(elem, **kw) for elem in clauselist.clauses
         )
 
     def visit_concat_op_binary(
@@ -1718,7 +1696,7 @@ class MySQLCompiler(compiler.SQLCompiler):
     ) -> str:
         """Add special MySQL keywords in place of DISTINCT.
 
-        .. deprecated:: 1.4  This usage is deprecated.
+        .. deprecated:: 1.4 This usage is deprecated.
            :meth:`_expression.Select.prefix_with` should be used for special
            keywords at the start of a SELECT.
 
@@ -1838,25 +1816,47 @@ class MySQLCompiler(compiler.SQLCompiler):
             # No offset provided, so just use the limit
             return " \n LIMIT %s" % (self.process(limit_clause, **kw),)
 
-    def update_limit_clause(self, update_stmt: Update) -> Optional[str]:
+    def update_post_criteria_clause(
+        self, update_stmt: Update, **kw: Any
+    ) -> Optional[str]:
         limit = update_stmt.kwargs.get("%s_limit" % self.dialect.name, None)
-        if limit is not None:
-            return f"LIMIT {int(limit)}"
-        else:
-            return None
+        supertext = super().update_post_criteria_clause(update_stmt, **kw)
 
-    def delete_limit_clause(self, delete_stmt: Delete) -> Optional[str]:
-        limit = delete_stmt.kwargs.get("%s_limit" % self.dialect.name, None)
         if limit is not None:
-            return f"LIMIT {int(limit)}"
+            limit_text = f"LIMIT {int(limit)}"
+            if supertext is not None:
+                return f"{limit_text} {supertext}"
+            else:
+                return limit_text
         else:
-            return None
+            return supertext
+
+    def delete_post_criteria_clause(
+        self, delete_stmt: Delete, **kw: Any
+    ) -> Optional[str]:
+        limit = delete_stmt.kwargs.get("%s_limit" % self.dialect.name, None)
+        supertext = super().delete_post_criteria_clause(delete_stmt, **kw)
+
+        if limit is not None:
+            limit_text = f"LIMIT {int(limit)}"
+            if supertext is not None:
+                return f"{limit_text} {supertext}"
+            else:
+                return limit_text
+        else:
+            return supertext
+
+    def visit_mysql_dml_limit_clause(
+        self, element: DMLLimitClause, **kw: Any
+    ) -> str:
+        kw["literal_execute"] = True
+        return f"LIMIT {self.process(element._limit_clause, **kw)}"
 
     def update_tables_clause(
         self,
         update_stmt: Update,
         from_table: _DMLTableElement,
-        extra_froms: List[selectable.FromClause],
+        extra_froms: list[selectable.FromClause],
         **kw: Any,
     ) -> str:
         kw["asfrom"] = True
@@ -1869,7 +1869,7 @@ class MySQLCompiler(compiler.SQLCompiler):
         self,
         update_stmt: Update,
         from_table: _DMLTableElement,
-        extra_froms: List[selectable.FromClause],
+        extra_froms: list[selectable.FromClause],
         from_hints: Any,
         **kw: Any,
     ) -> None:
@@ -1879,7 +1879,7 @@ class MySQLCompiler(compiler.SQLCompiler):
         self,
         delete_stmt: Delete,
         from_table: _DMLTableElement,
-        extra_froms: List[selectable.FromClause],
+        extra_froms: list[selectable.FromClause],
         **kw: Any,
     ) -> str:
         """If we have extra froms make sure we render any alias as hint."""
@@ -1894,23 +1894,31 @@ class MySQLCompiler(compiler.SQLCompiler):
         self,
         delete_stmt: Delete,
         from_table: _DMLTableElement,
-        extra_froms: List[selectable.FromClause],
+        extra_froms: list[selectable.FromClause],
         from_hints: Any,
         **kw: Any,
     ) -> str:
         """Render the DELETE .. USING clause specific to MySQL."""
         kw["asfrom"] = True
+        if any(
+            from_table in elem._cloned_set
+            for extra_from in extra_froms
+            for elem in sql_util.surface_selectables_only(extra_from)
+        ):
+            froms = extra_froms
+        else:
+            froms = [from_table] + extra_froms
+
         return "USING " + ", ".join(
             t._compiler_dispatch(self, fromhints=from_hints, **kw)
-            for t in [from_table] + extra_froms
+            for t in froms
         )
 
     def visit_empty_set_expr(
-        self, element_types: List[TypeEngine[Any]], **kw: Any
+        self, element_types: list[TypeEngine[Any]], **kw: Any
     ) -> str:
         return (
-            "SELECT %(outer)s FROM (SELECT %(inner)s) "
-            "as _empty_set WHERE 1!=1"
+            "SELECT %(outer)s FROM (SELECT %(inner)s) as _empty_set WHERE 1!=1"
             % {
                 "inner": ", ".join(
                     "1 AS _in_%s" % idx
@@ -1938,13 +1946,24 @@ class MySQLCompiler(compiler.SQLCompiler):
             self.process(binary.right),
         )
 
-    def _mariadb_regexp_flags(
-        self, flags: str, pattern: elements.ColumnElement[Any], **kw: Any
+    def _mysql_regexp_match(
+        self,
+        op_string: str,
+        binary: elements.BinaryExpression[Any],
+        operator: Any,
+        **kw: Any,
     ) -> str:
-        return "CONCAT('(?', %s, ')', %s)" % (
+        flags = binary.modifiers["flags"]
+
+        text = "REGEXP_LIKE(%s, %s, %s)" % (
+            self.process(binary.left, **kw),
+            self.process(binary.right, **kw),
             self.render_literal_value(flags, sqltypes.STRINGTYPE),
-            self.process(pattern, **kw),
         )
+        if op_string == " NOT REGEXP ":
+            return "NOT %s" % text
+        else:
+            return text
 
     def _regexp_match(
         self,
@@ -1957,22 +1976,15 @@ class MySQLCompiler(compiler.SQLCompiler):
         flags = binary.modifiers["flags"]
         if flags is None:
             return self._generate_generic_binary(binary, op_string, **kw)
-        elif self.dialect.is_mariadb:
-            return "%s%s%s" % (
-                self.process(binary.left, **kw),
-                op_string,
-                self._mariadb_regexp_flags(flags, binary.right),
-            )
         else:
-            text = "REGEXP_LIKE(%s, %s, %s)" % (
-                self.process(binary.left, **kw),
-                self.process(binary.right, **kw),
-                self.render_literal_value(flags, sqltypes.STRINGTYPE),
+            return self.dialect._dispatch_for_vendor(
+                self._mysql_regexp_match,
+                self._mariadb_regexp_match,
+                op_string,
+                binary,
+                operator,
+                **kw,
             )
-            if op_string == " NOT REGEXP ":
-                return "NOT %s" % text
-            else:
-                return text
 
     def visit_regexp_match_op_binary(
         self, binary: elements.BinaryExpression[Any], operator: Any, **kw: Any
@@ -1994,33 +2006,52 @@ class MySQLCompiler(compiler.SQLCompiler):
                 self.process(binary.left, **kw),
                 self.process(binary.right, **kw),
             )
-        elif self.dialect.is_mariadb:
-            return "REGEXP_REPLACE(%s, %s, %s)" % (
-                self.process(binary.left, **kw),
-                self._mariadb_regexp_flags(flags, binary.right.clauses[0]),
-                self.process(binary.right.clauses[1], **kw),
-            )
         else:
-            return "REGEXP_REPLACE(%s, %s, %s)" % (
-                self.process(binary.left, **kw),
-                self.process(binary.right, **kw),
-                self.render_literal_value(flags, sqltypes.STRINGTYPE),
+            return self.dialect._dispatch_for_vendor(
+                self._mysql_regexp_replace_op_binary,
+                self._mariadb_regexp_replace_op_binary,
+                binary,
+                operator,
+                **kw,
             )
 
+    def _mysql_regexp_replace_op_binary(
+        self, binary: elements.BinaryExpression[Any], operator: Any, **kw: Any
+    ) -> str:
+        flags = binary.modifiers["flags"]
 
-class MySQLDDLCompiler(compiler.DDLCompiler):
+        return "REGEXP_REPLACE(%s, %s, %s)" % (
+            self.process(binary.left, **kw),
+            self.process(binary.right, **kw),
+            self.render_literal_value(flags, sqltypes.STRINGTYPE),
+        )
+
+
+class MySQLDDLCompiler(
+    _mariadb_shim.MariaDBDDLCompilerShim, compiler.DDLCompiler
+):
     dialect: MySQLDialect
 
     def get_column_specification(
         self, column: sa_schema.Column[Any], **kw: Any
     ) -> str:
         """Builds column DDL."""
-        if (
-            self.dialect.is_mariadb is True
-            and column.computed is not None
-            and column._user_defined_nullable is SchemaConst.NULL_UNSPECIFIED
-        ):
-            column.nullable = True
+
+        return self.dialect._dispatch_for_vendor(
+            self._mysql_get_column_specification,
+            self._mariadb_get_column_specification,
+            column,
+            **kw,
+        )
+
+    def _mysql_get_column_specification(
+        self,
+        column: sa_schema.Column[Any],
+        *,
+        _force_column_to_nullable: bool = False,
+        **kw: Any,
+    ) -> str:
+
         colspec = [
             self.preparer.format_column(column),
             self.dialect.type_compiler_instance.process(
@@ -2036,7 +2067,7 @@ class MySQLDDLCompiler(compiler.DDLCompiler):
             sqltypes.TIMESTAMP,
         )
 
-        if not column.nullable:
+        if not column.nullable and not _force_column_to_nullable:
             colspec.append("NOT NULL")
 
         # see: https://docs.sqlalchemy.org/en/latest/dialects/mysql.html#mysql_timestamp_null  # noqa
@@ -2105,8 +2136,8 @@ class MySQLDDLCompiler(compiler.DDLCompiler):
             "SUBPARTITION_BY",
         ]
 
-        nonpart_options = util.OrderedSet(opts).difference(partition_options)
-        part_options = util.OrderedSet(opts).intersection(partition_options)
+        nonpart_options = OrderedSet(opts).difference(partition_options)
+        part_options = OrderedSet(opts).intersection(partition_options)
 
         for opt in topological.sort(
             [
@@ -2288,14 +2319,27 @@ class MySQLDDLCompiler(compiler.DDLCompiler):
             qual = "INDEX "
             const = self.preparer.format_constraint(constraint)
         elif isinstance(constraint, sa_schema.CheckConstraint):
-            if self.dialect.is_mariadb:
-                qual = "CONSTRAINT "
-            else:
-                qual = "CHECK "
-            const = self.preparer.format_constraint(constraint)
+            return self.dialect._dispatch_for_vendor(
+                self._mysql_visit_drop_check_constraint,
+                self._mariadb_visit_drop_check_constraint,
+                drop,
+                **kw,
+            )
         else:
             qual = ""
             const = self.preparer.format_constraint(constraint)
+        return "ALTER TABLE %s DROP %s%s" % (
+            self.preparer.format_table(constraint.table),
+            qual,
+            const,
+        )
+
+    def _mysql_visit_drop_check_constraint(
+        self, drop: ddl.DropConstraint, **kw: Any
+    ) -> str:
+        constraint = drop.element
+        qual = "CHECK "
+        const = self.preparer.format_constraint(constraint)
         return "ALTER TABLE %s DROP %s%s" % (
             self.preparer.format_table(constraint.table),
             qual,
@@ -2338,18 +2382,11 @@ class MySQLDDLCompiler(compiler.DDLCompiler):
             self.get_column_specification(create.element),
         )
 
-    def get_identity_options(self, identity_options: IdentityOptions) -> str:
-        """mariadb-specific sequence option; this will move to a
-        mariadb-specific module in 2.1
 
-        """
-        text = super().get_identity_options(identity_options)
-        text = text.replace("NO CYCLE", "NOCYCLE")
-        return text
-
-
-class MySQLTypeCompiler(compiler.GenericTypeCompiler):
-    def _extend_numeric(self, type_: _NumericType, spec: str) -> str:
+class MySQLTypeCompiler(
+    _mariadb_shim.MariaDBTypeCompilerShim, compiler.GenericTypeCompiler
+):
+    def _extend_numeric(self, type_: _NumericCommonType, spec: str) -> str:
         "Extend a numeric-type declaration with MySQL specific extensions."
 
         if not self._mysql_type(type_):
@@ -2362,7 +2399,7 @@ class MySQLTypeCompiler(compiler.GenericTypeCompiler):
         return spec
 
     def _extend_string(
-        self, type_: _StringType, defaults: Dict[str, Any], spec: str
+        self, type_: _StringType, defaults: dict[str, Any], spec: str
     ) -> str:
         """Extend a string-type declaration with standard SQL CHARACTER SET /
         COLLATE annotations and MySQL specific extensions.
@@ -2399,7 +2436,7 @@ class MySQLTypeCompiler(compiler.GenericTypeCompiler):
         )
 
     def _mysql_type(self, type_: Any) -> bool:
-        return isinstance(type_, (_StringType, _NumericType))
+        return isinstance(type_, (_StringType, _NumericCommonType))
 
     def visit_NUMERIC(self, type_: NUMERIC, **kw: Any) -> str:  # type: ignore[override]  # NOQA: E501
         if type_.precision is None:
@@ -2611,7 +2648,7 @@ class MySQLTypeCompiler(compiler.GenericTypeCompiler):
     def visit_VARBINARY(self, type_: VARBINARY, **kw: Any) -> str:
         return "VARBINARY(%d)" % type_.length  # type: ignore[str-format]
 
-    def visit_JSON(self, type_: JSON, **kw: Any) -> str:
+    def visit_JSON(self, type_: JSON[Any], **kw: Any) -> str:
         return "JSON"
 
     def visit_large_binary(self, type_: LargeBinary, **kw: Any) -> str:
@@ -2660,7 +2697,9 @@ class MySQLTypeCompiler(compiler.GenericTypeCompiler):
         return "BOOL"
 
 
-class MySQLIdentifierPreparer(compiler.IdentifierPreparer):
+class MySQLIdentifierPreparer(
+    _mariadb_shim.MariaDBIdentifierPreparerShim, compiler.IdentifierPreparer
+):
     reserved_words = RESERVED_WORDS_MYSQL
 
     def __init__(
@@ -2676,22 +2715,21 @@ class MySQLIdentifierPreparer(compiler.IdentifierPreparer):
 
         super().__init__(dialect, initial_quote=quote, escape_quote=quote)
 
-    def _quote_free_identifiers(self, *ids: Optional[str]) -> Tuple[str, ...]:
+    def _quote_free_identifiers(self, *ids: Optional[str]) -> tuple[str, ...]:
         """Unilaterally identifier-quote any number of strings."""
 
         return tuple([self.quote_identifier(i) for i in ids if i is not None])
 
 
-class MariaDBIdentifierPreparer(MySQLIdentifierPreparer):
-    reserved_words = RESERVED_WORDS_MARIADB
-
-
-class MySQLDialect(default.DefaultDialect):
+class MySQLDialect(_mariadb_shim.MariaDBShim, default.DefaultDialect):
     """Details of the MySQL dialect.
     Not used directly in application code.
     """
 
     name = "mysql"
+
+    is_mariadb = False
+
     supports_statement_cache = True
 
     supports_alter = True
@@ -2757,17 +2795,16 @@ class MySQLDialect(default.DefaultDialect):
     ischema_names = ischema_names
     preparer: type[MySQLIdentifierPreparer] = MySQLIdentifierPreparer
 
-    is_mariadb: bool = False
-    _mariadb_normalized_version_info = None
-
     # default SQL compilation settings -
     # these are modified upon initialize(),
     # i.e. first connect
     _backslash_escapes = True
     _server_ansiquotes = False
     _casing = 0
+    _support_default_function = True
+    _support_float_cast = False
 
-    server_version_info: Tuple[int, ...]
+    server_version_info: tuple[int, ...]
     identifier_preparer: MySQLIdentifierPreparer
 
     construct_arguments = [
@@ -2788,8 +2825,8 @@ class MySQLDialect(default.DefaultDialect):
 
     def __init__(
         self,
-        json_serializer: Optional[Callable[..., Any]] = None,
-        json_deserializer: Optional[Callable[..., Any]] = None,
+        json_serializer: Callable[[_JSON_VALUE], str] | None = None,
+        json_deserializer: Callable[[str], _JSON_VALUE] | None = None,
         is_mariadb: Optional[bool] = None,
         **kwargs: Any,
     ) -> None:
@@ -2838,27 +2875,9 @@ class MySQLDialect(default.DefaultDialect):
             val = val.decode()
         return val.upper().replace("-", " ")  # type: ignore[no-any-return]
 
-    @classmethod
-    def _is_mariadb_from_url(cls, url: URL) -> bool:
-        dbapi = cls.import_dbapi()
-        dialect = cls(dbapi=dbapi)
-
-        cargs, cparams = dialect.create_connect_args(url)
-        conn = dialect.connect(*cargs, **cparams)
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT VERSION() LIKE '%MariaDB%'")
-            val = cursor.fetchone()[0]  # type: ignore[index]
-        except:
-            raise
-        else:
-            return bool(val)
-        finally:
-            conn.close()
-
     def _get_server_version_info(
         self, connection: Connection
-    ) -> Tuple[int, ...]:
+    ) -> tuple[int, ...]:
         # get database server version info explicitly over the wire
         # to avoid proxy servers like MaxScale getting in the
         # way with their own values, see #4205
@@ -2873,12 +2892,14 @@ class MySQLDialect(default.DefaultDialect):
 
         return self._parse_server_version(val)
 
-    def _parse_server_version(self, val: str) -> Tuple[int, ...]:
-        version: List[int] = []
+    def _parse_server_version(self, val: str) -> tuple[int, ...]:
+        version: list[int] = []
         is_mariadb = False
 
         r = re.compile(r"[.\-+]")
         tokens = r.split(val)
+
+        _mariadb_normalized_version_info = None
         for token in tokens:
             parsed_token = re.match(
                 r"^(?:(\d+)(?:a|b|c)?|(MariaDB\w*))$", token
@@ -2886,20 +2907,20 @@ class MySQLDialect(default.DefaultDialect):
             if not parsed_token:
                 continue
             elif parsed_token.group(2):
-                self._mariadb_normalized_version_info = tuple(version[-3:])
+                _mariadb_normalized_version_info = tuple(version[-3:])
                 is_mariadb = True
             else:
                 digit = int(parsed_token.group(1))
                 version.append(digit)
 
-        server_version_info = tuple(version)
+        if _mariadb_normalized_version_info:
+            server_version_info = _mariadb_normalized_version_info
+        else:
+            server_version_info = tuple(version)
 
         self._set_mariadb(
             bool(server_version_info and is_mariadb), server_version_info
         )
-
-        if not is_mariadb:
-            self._mariadb_normalized_version_info = server_version_info
 
         if server_version_info < (5, 0, 2):
             raise NotImplementedError(
@@ -2910,32 +2931,6 @@ class MySQLDialect(default.DefaultDialect):
         # setting it here to help w the test suite
         self.server_version_info = server_version_info
         return server_version_info
-
-    def _set_mariadb(
-        self, is_mariadb: Optional[bool], server_version_info: Tuple[int, ...]
-    ) -> None:
-        if is_mariadb is None:
-            return
-
-        if not is_mariadb and self.is_mariadb:
-            raise exc.InvalidRequestError(
-                "MySQL version %s is not a MariaDB variant."
-                % (".".join(map(str, server_version_info)),)
-            )
-        if is_mariadb:
-
-            if not issubclass(self.preparer, MariaDBIdentifierPreparer):
-                self.preparer = MariaDBIdentifierPreparer
-                # this would have been set by the default dialect already,
-                # so set it again
-                self.identifier_preparer = self.preparer(self)
-
-            # this will be updated on first connect in initialize()
-            # if using older mariadb version
-            self.delete_returning = True
-            self.insert_returning = True
-
-        self.is_mariadb = is_mariadb
 
     def do_begin_twophase(self, connection: Connection, xid: Any) -> None:
         connection.execute(sql.text("XA BEGIN :xid"), dict(xid=xid))
@@ -2966,7 +2961,7 @@ class MySQLDialect(default.DefaultDialect):
             self.do_prepare_twophase(connection, xid)
         connection.execute(sql.text("XA COMMIT :xid"), dict(xid=xid))
 
-    def do_recover_twophase(self, connection: Connection) -> List[Any]:
+    def do_recover_twophase(self, connection: Connection) -> list[Any]:
         resultset = connection.exec_driver_sql("XA RECOVER")
         return [
             row["data"][0 : row["gtrid_length"]]
@@ -2982,9 +2977,9 @@ class MySQLDialect(default.DefaultDialect):
         if isinstance(
             e,
             (
-                self.dbapi.OperationalError,  # type: ignore
-                self.dbapi.ProgrammingError,  # type: ignore
-                self.dbapi.InterfaceError,  # type: ignore
+                self.dbapi.OperationalError,  # type: ignore[union-attr]
+                self.dbapi.ProgrammingError,  # type: ignore[union-attr]
+                self.dbapi.InterfaceError,  # type: ignore[union-attr]
             ),
         ) and self._extract_error_code(e) in (
             1927,
@@ -2997,7 +2992,7 @@ class MySQLDialect(default.DefaultDialect):
         ):
             return True
         elif isinstance(
-            e, (self.dbapi.InterfaceError, self.dbapi.InternalError)  # type: ignore  # noqa: E501
+            e, (self.dbapi.InterfaceError, self.dbapi.InternalError)  # type: ignore[union-attr]  # noqa: E501
         ):
             # if underlying connection is closed,
             # this is the error you get
@@ -3006,16 +3001,16 @@ class MySQLDialect(default.DefaultDialect):
             return False
 
     def _compat_fetchall(
-        self, rp: CursorResult[Any], charset: Optional[str] = None
-    ) -> Union[Sequence[Row[Any]], Sequence[_DecodingRow]]:
+        self, rp: CursorResult[Unpack[TupleAny]], charset: Optional[str] = None
+    ) -> Union[Sequence[Row[Unpack[TupleAny]]], Sequence[_DecodingRow]]:
         """Proxy result rows to smooth over MySQL-Python driver
         inconsistencies."""
 
         return [_DecodingRow(row, charset) for row in rp.fetchall()]
 
     def _compat_fetchone(
-        self, rp: CursorResult[Any], charset: Optional[str] = None
-    ) -> Union[Row[Any], None, _DecodingRow]:
+        self, rp: CursorResult[Unpack[TupleAny]], charset: Optional[str] = None
+    ) -> Union[Row[Unpack[TupleAny]], None, _DecodingRow]:
         """Proxy a result row to smooth over MySQL-Python driver
         inconsistencies."""
 
@@ -3026,7 +3021,7 @@ class MySQLDialect(default.DefaultDialect):
             return None
 
     def _compat_first(
-        self, rp: CursorResult[Any], charset: Optional[str] = None
+        self, rp: CursorResult[Unpack[TupleAny]], charset: Optional[str] = None
     ) -> Optional[_DecodingRow]:
         """Proxy a result row to smooth over MySQL-Python driver
         inconsistencies."""
@@ -3093,7 +3088,7 @@ class MySQLDialect(default.DefaultDialect):
             #
             # there's more "doesn't exist" kinds of messages but they are
             # less clear if mysql 8 would suddenly start using one of those
-            if self._extract_error_code(e.orig) in (1146, 1049, 1051):  # type: ignore  # noqa: E501
+            if self._extract_error_code(e.orig) in (1146, 1049, 1051):  # type: ignore[arg-type, operator]  # noqa: E501
                 return False
             raise
 
@@ -3133,7 +3128,7 @@ class MySQLDialect(default.DefaultDialect):
     @reflection.cache
     def get_sequence_names(
         self, connection: Connection, schema: Optional[str] = None, **kw: Any
-    ) -> List[str]:
+    ) -> list[str]:
         if not self.supports_sequences:
             self._sequences_not_supported()
         if not schema:
@@ -3152,6 +3147,18 @@ class MySQLDialect(default.DefaultDialect):
                 cursor, charset=self._connection_charset
             )
         ]
+
+    def _dispatch_for_vendor(
+        self,
+        mysql_callable: Callable[..., _T],
+        mariadb_callable: Callable[..., _T],
+        *arg: Any,
+        **kw: Any,
+    ) -> _T:
+        if not self.is_mariadb:
+            return mysql_callable(*arg, **kw)
+        else:
+            return mariadb_callable(*arg, **kw)
 
     def initialize(self, connection: Connection) -> None:
         # this is driver-based, does not need server version info
@@ -3176,106 +3183,49 @@ class MySQLDialect(default.DefaultDialect):
                 self, server_ansiquotes=self._server_ansiquotes
             )
 
-        self.supports_sequences = (
-            self.is_mariadb and self.server_version_info >= (10, 3)
+        self._dispatch_for_vendor(
+            self._initialize_mysql, self._initialize_mariadb, connection
         )
 
-        self.supports_for_update_of = (
-            self._is_mysql and self.server_version_info >= (8,)
-        )
+    def _initialize_mysql(self, connection: Connection) -> None:
+        assert not self.is_mariadb
 
-        self.use_mysql_for_share = (
-            self._is_mysql and self.server_version_info >= (8, 0, 1)
-        )
+        self.supports_for_update_of = self.server_version_info >= (8,)
+
+        self.use_mysql_for_share = self.server_version_info >= (8, 0, 1)
 
         self._needs_correct_for_88718_96365 = self.server_version_info >= (
             8,
         ) and (self.server_version_info < (8, 0, 14) or self._casing == 2)
 
-        self.delete_returning = (
-            self.is_mariadb and self.server_version_info >= (10, 0, 5)
-        )
-
-        self.insert_returning = (
-            self.is_mariadb and self.server_version_info >= (10, 5)
-        )
-
         self._requires_alias_for_on_duplicate_key = (
-            self._is_mysql and self.server_version_info >= (8, 0, 20)
+            self.server_version_info >= (8, 0, 20)
         )
 
-        self._warn_for_known_db_issues()
+        # ref https://dev.mysql.com/doc/refman/8.0/en/data-type-defaults.html # noqa
+        self._support_default_function = self.server_version_info >= (8, 0, 13)
 
-    def _warn_for_known_db_issues(self) -> None:
-        if self.is_mariadb:
-            mdb_version = self._mariadb_normalized_version_info
-            assert mdb_version is not None
-            if mdb_version > (10, 2) and mdb_version < (10, 2, 9):
-                util.warn(
-                    "MariaDB %r before 10.2.9 has known issues regarding "
-                    "CHECK constraints, which impact handling of NULL values "
-                    "with SQLAlchemy's boolean datatype (MDEV-13596). An "
-                    "additional issue prevents proper migrations of columns "
-                    "with CHECK constraints (MDEV-11114).  Please upgrade to "
-                    "MariaDB 10.2.9 or greater, or use the MariaDB 10.1 "
-                    "series, to avoid these issues." % (mdb_version,)
-                )
-
-    @property
-    def _support_float_cast(self) -> bool:
-        if not self.server_version_info:
-            return False
-        elif self.is_mariadb:
-            # ref https://mariadb.com/kb/en/mariadb-1045-release-notes/
-            return self.server_version_info >= (10, 4, 5)
-        else:
-            # ref https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-17.html#mysqld-8-0-17-feature  # noqa
-            return self.server_version_info >= (8, 0, 17)
-
-    @property
-    def _support_default_function(self) -> bool:
-        if not self.server_version_info:
-            return False
-        elif self.is_mariadb:
-            # ref https://mariadb.com/kb/en/mariadb-1021-release-notes/
-            return self.server_version_info >= (10, 2, 1)
-        else:
-            # ref https://dev.mysql.com/doc/refman/8.0/en/data-type-defaults.html # noqa
-            return self.server_version_info >= (8, 0, 13)
-
-    @property
-    def _is_mariadb(self) -> bool:
-        return self.is_mariadb
+        # ref https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-17.html#mysqld-8-0-17-feature  # noqa
+        self._support_float_cast = self.server_version_info >= (8, 0, 17)
 
     @property
     def _is_mysql(self) -> bool:
         return not self.is_mariadb
 
-    @property
-    def _is_mariadb_102(self) -> bool:
-        return (
-            self.is_mariadb
-            and self._mariadb_normalized_version_info  # type: ignore[operator]
-            > (
-                10,
-                2,
-            )
-        )
-
     @reflection.cache
-    def get_schema_names(self, connection: Connection, **kw: Any) -> List[str]:
+    def get_schema_names(self, connection: Connection, **kw: Any) -> list[str]:
         rp = connection.exec_driver_sql("SHOW schemas")
         return [r[0] for r in rp]
 
     @reflection.cache
     def get_table_names(
         self, connection: Connection, schema: Optional[str] = None, **kw: Any
-    ) -> List[str]:
+    ) -> list[str]:
         """Return a Unicode SHOW TABLES from a given schema."""
         if schema is not None:
             current_schema: str = schema
         else:
-            current_schema = self.default_schema_name  # type: ignore
+            current_schema = self.default_schema_name  # type: ignore[assignment]  # noqa: E501
 
         charset = self._connection_charset
 
@@ -3293,7 +3243,7 @@ class MySQLDialect(default.DefaultDialect):
     @reflection.cache
     def get_view_names(
         self, connection: Connection, schema: Optional[str] = None, **kw: Any
-    ) -> List[str]:
+    ) -> list[str]:
         if schema is None:
             schema = self.default_schema_name
         assert schema is not None
@@ -3315,7 +3265,7 @@ class MySQLDialect(default.DefaultDialect):
         table_name: str,
         schema: Optional[str] = None,
         **kw: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         parsed_state = self._parsed_state_or_create(
             connection, table_name, schema, **kw
         )
@@ -3331,7 +3281,7 @@ class MySQLDialect(default.DefaultDialect):
         table_name: str,
         schema: Optional[str] = None,
         **kw: Any,
-    ) -> List[ReflectedColumn]:
+    ) -> list[ReflectedColumn]:
         parsed_state = self._parsed_state_or_create(
             connection, table_name, schema, **kw
         )
@@ -3365,13 +3315,13 @@ class MySQLDialect(default.DefaultDialect):
         table_name: str,
         schema: Optional[str] = None,
         **kw: Any,
-    ) -> List[ReflectedForeignKeyConstraint]:
+    ) -> list[ReflectedForeignKeyConstraint]:
         parsed_state = self._parsed_state_or_create(
             connection, table_name, schema, **kw
         )
         default_schema = None
 
-        fkeys: List[ReflectedForeignKeyConstraint] = []
+        fkeys: list[ReflectedForeignKeyConstraint] = []
 
         for spec in parsed_state.fk_constraints:
             ref_name = spec["table"][-1]
@@ -3401,14 +3351,14 @@ class MySQLDialect(default.DefaultDialect):
             }
             fkeys.append(fkey_d)
 
-        if self._needs_correct_for_88718_96365:
+        if self._is_mysql and self._needs_correct_for_88718_96365:
             self._correct_for_mysql_bugs_88718_96365(fkeys, connection)
 
         return fkeys if fkeys else ReflectionDefaults.foreign_keys()
 
     def _correct_for_mysql_bugs_88718_96365(
         self,
-        fkeys: List[ReflectedForeignKeyConstraint],
+        fkeys: list[ReflectedForeignKeyConstraint],
         connection: Connection,
     ) -> None:
         # Foreign key is always in lower case (MySQL 8.0)
@@ -3436,14 +3386,14 @@ class MySQLDialect(default.DefaultDialect):
             def lower(s: str) -> str:
                 return s
 
-        default_schema_name: str = connection.dialect.default_schema_name  # type: ignore  # noqa: E501
+        default_schema_name: str = connection.dialect.default_schema_name  # type: ignore[assignment]  # noqa: E501
 
         # NOTE: using (table_schema, table_name, lower(column_name)) in (...)
         # is very slow since mysql does not seem able to properly use indexse.
         # Unpack the where condition instead.
-        schema_by_table_by_column: DefaultDict[
-            str, DefaultDict[str, List[str]]
-        ] = DefaultDict(lambda: DefaultDict(list))
+        schema_by_table_by_column: defaultdict[
+            str, defaultdict[str, list[str]]
+        ] = defaultdict(lambda: defaultdict(list))
         for rec in fkeys:
             sch = lower(rec["referred_schema"] or default_schema_name)
             tbl = lower(rec["referred_table"])
@@ -3478,7 +3428,7 @@ class MySQLDialect(default.DefaultDialect):
                 _info_columns.c.column_name,
             ).where(condition)
 
-            correct_for_wrong_fk_case: CursorResult[Tuple[str, str, str]] = (
+            correct_for_wrong_fk_case: CursorResult[str, str, str] = (
                 connection.execute(select)
             )
 
@@ -3492,7 +3442,7 @@ class MySQLDialect(default.DefaultDialect):
             # SHOW CREATE TABLE converts them to *lower case*, therefore
             # not matching.  So for this case, case-insensitive lookup
             # is necessary
-            d: DefaultDict[Tuple[str, str], Dict[str, str]] = defaultdict(dict)
+            d: defaultdict[tuple[str, str], dict[str, str]] = defaultdict(dict)
             for schema, tname, cname in correct_for_wrong_fk_case:
                 d[(lower(schema), lower(tname))]["SCHEMANAME"] = schema
                 d[(lower(schema), lower(tname))]["TABLENAME"] = tname
@@ -3521,12 +3471,12 @@ class MySQLDialect(default.DefaultDialect):
         table_name: str,
         schema: Optional[str] = None,
         **kw: Any,
-    ) -> List[ReflectedCheckConstraint]:
+    ) -> list[ReflectedCheckConstraint]:
         parsed_state = self._parsed_state_or_create(
             connection, table_name, schema, **kw
         )
 
-        cks: List[ReflectedCheckConstraint] = [
+        cks: list[ReflectedCheckConstraint] = [
             {"name": spec["name"], "sqltext": spec["sqltext"]}
             for spec in parsed_state.ck_constraints
         ]
@@ -3557,12 +3507,12 @@ class MySQLDialect(default.DefaultDialect):
         table_name: str,
         schema: Optional[str] = None,
         **kw: Any,
-    ) -> List[ReflectedIndex]:
+    ) -> list[ReflectedIndex]:
         parsed_state = self._parsed_state_or_create(
             connection, table_name, schema, **kw
         )
 
-        indexes: List[ReflectedIndex] = []
+        indexes: list[ReflectedIndex] = []
 
         for spec in parsed_state.keys:
             dialect_options = {}
@@ -3573,16 +3523,14 @@ class MySQLDialect(default.DefaultDialect):
             if flavor == "UNIQUE":
                 unique = True
             elif flavor in ("FULLTEXT", "SPATIAL"):
-                dialect_options["%s_prefix" % self.name] = flavor
+                dialect_options[f"{self.name}_prefix"] = flavor
             elif flavor is not None:
                 util.warn(
-                    "Converting unknown KEY type %s to a plain KEY", flavor
+                    f"Converting unknown KEY type {flavor} to a plain KEY"
                 )
 
             if spec["parser"]:
-                dialect_options["%s_with_parser" % (self.name)] = spec[
-                    "parser"
-                ]
+                dialect_options[f"{self.name}_with_parser"] = spec["parser"]
 
             index_d: ReflectedIndex = {
                 "name": spec["name"],
@@ -3594,10 +3542,7 @@ class MySQLDialect(default.DefaultDialect):
                 s[0]: s[1] for s in spec["columns"] if s[1] is not None
             }
             if mysql_length:
-                dialect_options["%s_length" % self.name] = mysql_length
-
-            if flavor:
-                index_d["type"] = flavor  # type: ignore[typeddict-unknown-key]
+                dialect_options[f"{self.name}_length"] = mysql_length
 
             if dialect_options:
                 index_d["dialect_options"] = dialect_options
@@ -3613,12 +3558,12 @@ class MySQLDialect(default.DefaultDialect):
         table_name: str,
         schema: Optional[str] = None,
         **kw: Any,
-    ) -> List[ReflectedUniqueConstraint]:
+    ) -> list[ReflectedUniqueConstraint]:
         parsed_state = self._parsed_state_or_create(
             connection, table_name, schema, **kw
         )
 
-        ucs: List[ReflectedUniqueConstraint] = [
+        ucs: list[ReflectedUniqueConstraint] = [
             {
                 "name": key["name"],
                 "column_names": [col[0] for col in key["columns"]],
@@ -3752,7 +3697,7 @@ class MySQLDialect(default.DefaultDialect):
         self._casing = cs
         return cs
 
-    def _detect_collations(self, connection: Connection) -> Dict[str, str]:
+    def _detect_collations(self, connection: Connection) -> dict[str, str]:
         """Pull the active COLLATIONS list from the server.
 
         Cached per-connection.
@@ -3845,7 +3790,7 @@ class MySQLDialect(default.DefaultDialect):
         table: Optional[Table],
         charset: Optional[str],
         full_name: str,
-    ) -> Union[Sequence[Row[Any]], Sequence[_DecodingRow]]: ...
+    ) -> Union[Sequence[Row[Unpack[TupleAny]]], Sequence[_DecodingRow]]: ...
 
     @overload
     def _describe_table(
@@ -3854,7 +3799,7 @@ class MySQLDialect(default.DefaultDialect):
         table: Table,
         charset: Optional[str] = None,
         full_name: None = None,
-    ) -> Union[Sequence[Row[Any]], Sequence[_DecodingRow]]: ...
+    ) -> Union[Sequence[Row[Unpack[TupleAny]]], Sequence[_DecodingRow]]: ...
 
     def _describe_table(
         self,
@@ -3862,7 +3807,7 @@ class MySQLDialect(default.DefaultDialect):
         table: Optional[Table],
         charset: Optional[str] = None,
         full_name: Optional[str] = None,
-    ) -> Union[Sequence[Row[Any]], Sequence[_DecodingRow]]:
+    ) -> Union[Sequence[Row[Unpack[TupleAny]]], Sequence[_DecodingRow]]:
         """Run DESCRIBE for a ``Table`` and return processed rows."""
 
         if full_name is None:
@@ -3883,8 +3828,8 @@ class MySQLDialect(default.DefaultDialect):
 
                 elif code == 1356:
                     raise exc.UnreflectableTableError(
-                        "Table or view named %s could not be "
-                        "reflected: %s" % (full_name, e)
+                        "Table or view named %s could not be reflected: %s"
+                        % (full_name, e)
                     ) from e
 
                 else:
@@ -3909,7 +3854,7 @@ class _DecodingRow:
     # sets.Set(['value']) (seriously) but thankfully that doesn't
     # seem to come up in DDL queries.
 
-    _encoding_compat: Dict[str, str] = {
+    _encoding_compat: dict[str, str] = {
         "koi8r": "koi8_r",
         "koi8u": "koi8_u",
         "utf16": "utf-16-be",  # MySQL's uft16 is always bigendian
@@ -3919,7 +3864,7 @@ class _DecodingRow:
         "eucjpms": "ujis",
     }
 
-    def __init__(self, rowproxy: Row[Any], charset: Optional[str]):
+    def __init__(self, rowproxy: Row[Unpack[_Ts]], charset: Optional[str]):
         self.rowproxy = rowproxy
         self.charset = (
             self._encoding_compat.get(charset, charset)

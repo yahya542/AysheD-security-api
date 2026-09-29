@@ -14,6 +14,7 @@ import re
 import typing
 from typing import Any
 from typing import Dict
+from typing import Literal
 from typing import Optional
 from typing import Union
 import warnings
@@ -24,8 +25,7 @@ from .util import decorator
 from .util import gc_collect
 from .. import event
 from .. import pool
-from ..util import await_only
-from ..util.typing import Literal
+from ..util import await_
 
 if typing.TYPE_CHECKING:
     from ..engine import Engine
@@ -68,19 +68,33 @@ class ConnectionKiller:
                 "testing_reaper couldn't rollback/close connection: %s" % e
             )
 
+    def _checked_out_proxies(self):
+        """Return the connection fairies we've seen checked out that still
+        hold onto a DBAPI connection.
+
+        ``proxy_refs`` keeps a weak reference to every fairy handed out by a
+        pool we're watching; a fairy that's been checked in has had its
+        ``dbapi_connection`` dropped, so those that remain "valid" are the
+        ones still checked out (or detached and left open).
+
+        """
+        return [
+            rec
+            for rec in list(self.proxy_refs)
+            if rec is not None and rec.is_valid
+        ]
+
     def rollback_all(self):
-        for rec in list(self.proxy_refs):
-            if rec is not None and rec.is_valid:
-                self._safe(rec.rollback)
+        for rec in self._checked_out_proxies():
+            self._safe(rec.rollback)
 
     def checkin_all(self):
         # run pool.checkin() for all ConnectionFairy instances we have
         # tracked.
 
-        for rec in list(self.proxy_refs):
-            if rec is not None and rec.is_valid:
-                self.dbapi_connections.discard(rec.dbapi_connection)
-                self._safe(rec._checkin)
+        for rec in self._checked_out_proxies():
+            self.dbapi_connections.discard(rec.dbapi_connection)
+            self._safe(rec._checkin)
 
         # for fairy refs that were GCed and could not close the connection,
         # such as asyncio, roll back those remaining connections
@@ -112,7 +126,7 @@ class ConnectionKiller:
                         self._safe(proxy_ref._checkin)
 
             if hasattr(rec, "sync_engine"):
-                await_only(rec.dispose())
+                await_(rec.dispose())
             else:
                 rec.dispose()
 
@@ -122,7 +136,7 @@ class ConnectionKiller:
         eng = self.testing_engines[scope]
         for rec in list(eng):
             if hasattr(rec, "sync_engine"):
-                await_only(rec.dispose())
+                await_(rec.dispose())
             else:
                 rec.dispose()
 
@@ -155,12 +169,12 @@ class ConnectionKiller:
     def stop_test_class_outside_fixtures(self):
         # ensure no refs to checked out connections at all.
 
-        if pool.base._strong_ref_connection_records:
+        if self._checked_out_proxies():
             gc_collect()
 
-            if pool.base._strong_ref_connection_records:
-                ln = len(pool.base._strong_ref_connection_records)
-                pool.base._strong_ref_connection_records.clear()
+            ln = len(self._checked_out_proxies())
+            if ln:
+                self.checkin_all()
 
                 if ln > 2:
                     # allow two connections to linger, as on loaded down
