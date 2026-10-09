@@ -34,3 +34,5 @@ def decode_access_token(token: str) -> Optional[dict]:
         return payload
     except jwt.PyJWTError:
         return None
+
+DUMMY_HASH = hash_password("dummy_password_for_timing_safety")

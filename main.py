@@ -1,7 +1,7 @@
 import time
 import psutil
 import re
-from datetime import datetime
+from datetime import datetime, timezone 
 from fastapi import FastAPI, Depends, HTTPException, status, Request 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -11,9 +11,13 @@ from zoneinfo import ZoneInfo
 
 
 # 💡 1. Pastikan LoginLog sudah dimasukkan ke dalam daftar import di bawah ini
-from apiSEC.database import init_db, get_db, User, UserRole, LoginLog 
+from apiSEC.database import (
+    init_db, get_db, User, UserRole, LoginLog,
+    LoginFailureReason, AccountLock,
+    get_active_account_lock, record_failed_attempt, clear_account_lock,
+)
 
-from apiSEC.auth import hash_password, verify_password, create_access_token
+from apiSEC.auth import hash_password, verify_password, create_access_token, DUMMY_HASH
 from apiSEC.schemas import (
     RegisterRequest, RegisterResponse,
     LoginRequest, LoginResponse,
@@ -26,8 +30,13 @@ from apiSEC.dependencies import get_current_user, get_current_admin
 from fastapi import APIRouter
 
 
-def get_wib_time():
-    return datetime.now(ZoneInfo("Asia/Jakarta"))
+""" def get_wib_time():
+    return datetime.now(ZoneInfo("Asia/Jakarta")) """
+
+def get_utc_time():
+    return datetime.now(timezone.utc)
+
+start_time = time.time()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -98,52 +107,84 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
 
 @auth_router.post("/login", response_model=LoginResponse)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), request: Request = None):
-    result = await db.execute(select(User).where(User.email == payload.email))
-    user = result.scalar_one_or_none()
-    
-    # 💡 Perbaikan Logika Gagal: Catat ke database dulu, baru lempar HTTPException
-    if not user or not verify_password(payload.password, user.password_hash):
+    ip = request.client.host if request and request.client else None
+    ua = request.headers.get('user-agent') if request else None
+
+    # Check for active account lock (temporary lockout) before touching user table
+    active_lock = await get_active_account_lock(db, payload.email)
+    if active_lock:
         login_log = LoginLog(
             email=payload.email,
-            ip_address=request.client.host if request and request.client else None,
-            user_agent=request.headers.get('user-agent') if request else None,
+            ip_address=ip,
+            user_agent=ua,
             success=False,
-            failure_reason="Invalid credentials",
-            timestamp=get_wib_time()
+            failure_reason=LoginFailureReason.locked,
+            timestamp=get_utc_time()
         )
         db.add(login_log)
         await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    result = await db.execute(select(User).where(User.email == payload.email))
+    user = result.scalar_one_or_none()
+
+    # Timing-safe: always run verify_password even when user doesn't exist
+    stored_hash = user.password_hash if user else DUMMY_HASH
+    password_valid = verify_password(payload.password, stored_hash)
+
+    # Admin-suspended (permanent) accounts -> 401 generic, logged as admin_suspended
+    if user and not user.is_active:
+        login_log = LoginLog(
+            email=payload.email,
+            ip_address=ip,
+            user_agent=ua,
+            success=False,
+            failure_reason=LoginFailureReason.admin_suspended,
+            timestamp=get_utc_time()
+        )
+        db.add(login_log)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user or not password_valid:
+        reason = LoginFailureReason.unknown_user if not user else LoginFailureReason.bad_password
+        login_log = LoginLog(
+            email=payload.email,
+            ip_address=ip,
+            user_agent=ua,
+            success=False,
+            failure_reason=reason,
+            timestamp=get_utc_time()
+        )
+        db.add(login_log)
+        await db.commit()
+
+        # Track failed attempts and lock account if threshold is reached
+        await record_failed_attempt(db, payload.email)
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    if not user.is_active:
-        login_log = LoginLog(
-            email=payload.email,
-            ip_address=request.client.host if request and request.client else None,
-            user_agent=request.headers.get('user-agent') if request else None,
-            success=False,
-            failure_reason="Account suspended",
-            timestamp=get_wib_time()
-        )
-        db.add(login_log)
-        await db.commit()
 
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Account suspended",
-        )
-    
-    # 💡 Perbaikan Logika Sukses: Catat log sukses sebelum melakukan 'return'
+    # Login successful - clear any previous failed attempt lock
+    await clear_account_lock(db, payload.email)
+
     login_log = LoginLog(
         email=payload.email,
-        ip_address=request.client.host if request and request.client else None,
-        user_agent=request.headers.get('user-agent') if request else None,
+        ip_address=ip,
+        user_agent=ua,
         success=True,
-        timestamp=get_wib_time()
+        timestamp=get_utc_time()
     )
     db.add(login_log)
     await db.commit()
@@ -151,12 +192,21 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
     access_token = create_access_token(
         data={"sub": str(user.id), "role": user.role.value}
     )
-    
+
     return LoginResponse(access_token=access_token, token_type="bearer")
 
 @auth_router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+@auth_router.get ("/users", response_model=list[UserResponse])
+async def get_users(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    result = await db.execute(select(User))
+    users = result.scalars().all()
+    return users
 
 @auth_router.post("/logout", response_model=LogoutResponse)
 async def logout(current_user: User = Depends(get_current_user)):
