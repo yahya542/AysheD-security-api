@@ -3,6 +3,7 @@ from typing import Optional, List
 from datetime import datetime
 import uuid
 from apiSEC.database import UserRole
+from pydantic import BaseModel
 
 class RegisterRequest(BaseModel):
     email: EmailStr = Field(description="User email address")
@@ -173,3 +174,15 @@ class LoginLogResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+class UFWLogEntry(BaseModel):
+    timestamp: str = Field(description="Event timestamp")
+    ip: str = Field(description="Source IP")
+    action: str = Field(description="ALLOW atau DROP")
+    interface: str = Field(description="Network interface, e.g. eth0")
+
+class UFWLogsResponse(BaseModel):
+    logs: List[UFWLogEntry]
+    total: int
+
+    

@@ -22,9 +22,10 @@ from apiSEC.schemas import (
     RegisterRequest, RegisterResponse,
     LoginRequest, LoginResponse,
     HealthResponse, ThreatLogsResponse, ThreatLogEntry,
-    SuspendUserRequest, SuspendUserResponse, UserResponse,
+    SuspendUserRequest, SuspendUserResponse, UFWLogsResponse, UserResponse,
     LoginLogResponse ,
-    LogoutRequest, LogoutResponse
+    LogoutRequest, LogoutResponse, 
+    UFWLogsResponse, UFWLogEntry
 )
 from apiSEC.dependencies import get_current_user, get_current_admin
 from fastapi import APIRouter
@@ -285,6 +286,40 @@ async def get_threat_logs(current_user: User = Depends(get_current_admin)):
     
     return ThreatLogsResponse(threats=threats, total=len(threats))
 
+@admin_router.get("/ufw-logs", response_model=UFWLogsResponse)
+async def get_ufw_logs(current_user: User = Depends(get_current_admin)):
+    log_path = settings.ufw_log_path
+    logs = []
+
+    try:
+        with open(log_path, "r") as f:
+            lines = f.readlines()
+
+        for line in reversed(lines[-1000:]):
+            match = ufw_pattern.search(line)
+            if match:
+                timestamp, action, ip, interface = match.groups()
+                logs.append(UFWLogEntry(
+                    timestamp=timestamp,
+                    ip=ip,
+                    action=action,
+                    interface=interface
+                ))
+                if len(logs) >= 50:
+                    break
+
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cannot read UFW log (permission denied)"
+        )
+
+    return UFWLogsResponse(logs=logs, total=len(logs))
+
+
+
 @admin_router.post("/suspend-user", response_model=SuspendUserResponse)
 async def suspend_user(
     payload: SuspendUserRequest,
@@ -313,6 +348,7 @@ async def suspend_user(
         message=f"User {user.email} suspended",
         user_id=user.id
     )
+
 
 # --- REGISTER ROUTERS ---
 app.include_router(auth_router)
