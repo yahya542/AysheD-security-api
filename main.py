@@ -116,64 +116,37 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
     ip = request.client.host if request and request.client else None
     ua = request.headers.get('user-agent') if request else None
 
-    # Check for active account lock (temporary lockout) before touching user table
-    active_lock = await get_active_account_lock(db, payload.email)
-    if active_lock:
-        login_log = LoginLog(
-            email=payload.email,
-            ip_address=ip,
-            user_agent=ua,
-            success=False,
-            failure_reason=LoginFailureReason.locked,
-            timestamp=get_utc_time()
-        )
-        db.add(login_log)
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
+    # Timing-safe: always run verify_password even when user doesn't exist
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalar_one_or_none()
 
-    # Timing-safe: always run verify_password even when user doesn't exist
     stored_hash = user.password_hash if user else DUMMY_HASH
     password_valid = verify_password(payload.password, stored_hash)
 
-    # Admin-suspended (permanent) accounts -> 401 generic, logged as admin_suspended
-    if user and not user.is_active:
+    # Check for active account lock (temporary lockout)
+    active_lock = await get_active_account_lock(db, payload.email)
+
+    failure_reason = None
+    if active_lock:
+        failure_reason = LoginFailureReason.locked
+    elif user and not user.is_active:
+        failure_reason = LoginFailureReason.admin_suspended
+    elif not user:
+        failure_reason = LoginFailureReason.unknown_user
+    elif not password_valid:
+        failure_reason = LoginFailureReason.bad_password
+
+    if failure_reason is not None:
         login_log = LoginLog(
             email=payload.email,
             ip_address=ip,
             user_agent=ua,
             success=False,
-            failure_reason=LoginFailureReason.admin_suspended,
+            failure_reason=failure_reason,
             timestamp=get_utc_time()
         )
         db.add(login_log)
         await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    if not user or not password_valid:
-        reason = LoginFailureReason.unknown_user if not user else LoginFailureReason.bad_password
-        login_log = LoginLog(
-            email=payload.email,
-            ip_address=ip,
-            user_agent=ua,
-            success=False,
-            failure_reason=reason,
-            timestamp=get_utc_time()
-        )
-        db.add(login_log)
-        await db.commit()
-
-        # Track failed attempts and lock account if threshold is reached
         await record_failed_attempt(db, payload.email)
 
         raise HTTPException(
@@ -331,7 +304,7 @@ async def suspend_user(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin)
 ):
-    result = await db.execute(select(User).where(User.id == payload.user_id))
+    result = await db.execute(select(User).where(User.id == str(payload.user_id)))
     user = result.scalar_one_or_none()
     
     if not user:

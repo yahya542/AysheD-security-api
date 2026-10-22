@@ -141,7 +141,7 @@ class ThreatLogsResponse(BaseModel):
         }
 
 class SuspendUserRequest(BaseModel):
-    user_id: uuid.UUID = Field(description="UUID of user to suspend")
+    user_id: str = Field(description="UUID of user to suspend (string format)")
 
     class Config:
         json_schema_extra = {
