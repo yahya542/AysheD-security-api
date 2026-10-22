@@ -25,16 +25,28 @@ jobs:
             # 1. Tarik kode terbaru dari GitHub
             git pull origin main
 
-            # 2. Hentikan dan hapus container lama yang membeku
+            # 2. Buat kembali berkas Dockerfile secara otomatis di server
+            cat << 'EOF' > Dockerfile
+            FROM python:3.11-slim
+            WORKDIR /app
+            COPY requirements.txt .
+            RUN pip install --no-cache-dir -r requirements.txt
+            COPY . .
+            EXPOSE 8000
+            CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+            EOF
+
+            # 3. Build ulang menggunakan Dockerfile yang baru dibuat
+            docker build -t apisec-api .
+
+            # 4. Hentikan dan hapus kontainer lama
             docker stop ayshe_api || true
             docker rm ayshe_api || true
 
-            # 3. Jalankan container baru menggunakan base image Python bawaan tanpa perlu Dockerfile
+            # 5. Jalankan kontainer baru dengan aman dan berikan hak akses log (jika perlu)
             docker run -d \
               --name ayshe_api \
               -p 8069:8000 \
-              -v /var/www/AysheD/apiSEC:/app \
-              -w /app \
-              python:3.11-slim \
-              bash -c "pip install -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port 8000"
+              --restart unless-stopped \
+              apisec-api
 
