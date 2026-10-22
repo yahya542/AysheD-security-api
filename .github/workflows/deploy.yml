@@ -25,30 +25,39 @@ jobs:
             # 1. Tarik kode terbaru dari GitHub
             git pull origin main
 
-                        # 2. Buat kembali berkas Dockerfile dengan perintah uvicorn yang benar
+                      script: |
+            cd /var/www/AysheD/apiSEC
+
+            # 1. Tarik kode terbaru dari GitHub
+            git pull origin main
+
+            # 2. Buat ulang Dockerfile dengan konfigurasi PYTHONPATH yang tepat
             cat << 'EOF' > Dockerfile
             FROM python:3.11-slim
             WORKDIR /app
             COPY requirements.txt .
             RUN pip install --no-cache-dir -r requirements.txt
             COPY . .
+            
+            # Tambahkan direktori kerja ke dalam Python Path agar modul saling mengenali
+            ENV PYTHONPATH=/app
+            
             EXPOSE 8000
-            # MEMPERBAIKI PATH PANGGILAN UVICORN
-            CMD ["uvicorn", "apiSEC.main:app", "--host", "0.0.0.0", "--port", "8000"]
+            # Eksekusi langsung ke main:app karena semua file berada di root /app
+            CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
             EOF
 
-            # 3. Build ulang menggunakan Dockerfile yang baru dibuat
+            # 3. Build ulang menggunakan Dockerfile yang diperbarui
             docker build -t apisec-api .
 
-            # 4. Hentikan dan hapus kontainer lama
+            # 4. Hentikan dan hapus kontainer lama yang bootloop
             docker stop ayshe_api || true
             docker rm ayshe_api || true
 
-            # 5. JALANKAN DENGAN VOLUME MOUNT KE LOG UFW SERVER
+            # 5. Jalankan kontainer baru secara bersih
             docker run -d \
               --name ayshe_api \
               -p 8069:8000 \
-              -v /var/log:/var/log:ro \
               --restart unless-stopped \
               apisec-api
 
