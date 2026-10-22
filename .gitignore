@@ -1,8 +1,7 @@
 # Virtual environment
 venv/
 
-# Python cache
-__pycache__/
+
 
 # Build and metadata directories
 *.egg-info/
@@ -14,3 +13,7 @@ ayshed_auth.db
 
 # Configuration files containing credentials/secrets
 config.py
+
+__pycache__/
+*.pyc
+*.db

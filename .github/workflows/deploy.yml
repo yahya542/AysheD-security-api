@@ -21,16 +21,20 @@ jobs:
           port: 2269
           script: |
             cd /var/www/AysheD/apiSEC
-            
+
             # 1. Tarik kode terbaru dari GitHub
             git pull origin main
-            
-            # 2. Build ulang image Docker dengan nama apisec-api
-            docker build -t apisec-api .
-            
-            # 3. Hentikan dan hapus container lama jika sedang berjalan
+
+            # 2. Hentikan dan hapus container lama yang membeku
             docker stop ayshe_api || true
             docker rm ayshe_api || true
-            
-            # 4. Jalankan container baru dengan port yang sama (8069)
-            docker run -d --name ayshe_api -p 8069:8000 apisec-api
+
+            # 3. Jalankan container baru menggunakan base image Python bawaan tanpa perlu Dockerfile
+            docker run -d \
+              --name ayshe_api \
+              -p 8069:8000 \
+              -v /var/www/AysheD/apiSEC:/app \
+              -w /app \
+              python:3.11-slim \
+              bash -c "pip install -r requirements.txt && uvicorn main:app --host 0.0.0.0 --port 8000"
+
