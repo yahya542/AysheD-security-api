@@ -22,13 +22,18 @@ from apiSEC.schemas import (
     RegisterRequest, RegisterResponse,
     LoginRequest, LoginResponse,
     HealthResponse, ThreatLogsResponse, ThreatLogEntry,
-    SuspendUserRequest, SuspendUserResponse, UFWLogsResponse, UserResponse,
-    LoginLogResponse ,
-    LogoutRequest, LogoutResponse, 
+    SuspendUserRequest, SuspendUserResponse, UserResponse,
+    LoginLogResponse,
+    LogoutRequest, LogoutResponse,
     UFWLogsResponse, UFWLogEntry
 )
 from apiSEC.dependencies import get_current_user, get_current_admin
 from fastapi import APIRouter
+
+
+ufw_pattern = re.compile(
+    r'(\w{3}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}).*?\[UFW\s+(BLOCK|ALLOW)\].*?SRC=(\d+\.\d+\.\d+\.\d+).*?IN=(\w+)'
+)
 
 
 """ def get_wib_time():

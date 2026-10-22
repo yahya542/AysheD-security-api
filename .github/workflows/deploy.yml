@@ -27,6 +27,9 @@ jobs:
             echo "=== Pulling latest code ==="
             git pull origin main
 
+            echo "=== Sanitizing database (remove legacy failure_reason values) ==="
+            sqlite3 ayshed_auth.db "DELETE FROM login_logs WHERE failure_reason NOT IN ('bad_password', 'unknown_user', 'locked', 'admin_suspended');" 2>/dev/null || true
+
             echo "=== Building Docker image ==="
             cat << 'DOCKERFILE' > Dockerfile
             FROM python:3.11-slim

@@ -30,9 +30,9 @@ class Settings(BaseSettings):
     
     # Fail2ban log path
     fail2ban_log_path: str = Field(default="/var/log/fail2ban.log", alias="FAIL2BAN_LOG_PATH")
-
+    
     # UFW log path
-    ufw_log_path: str = Field(default="/var/log/ufw.log", alias="UFW_LOG_PATH")     
+    ufw_log_path: str = Field(default="/var/log/ufw.log", alias="UFW_LOG_PATH")
     
     # Account lockout
     max_login_attempts: int = Field(default=5, alias="MAX_LOGIN_ATTEMPTS")
