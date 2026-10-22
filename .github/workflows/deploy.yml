@@ -1,4 +1,4 @@
-name: kalinanas
+name: kalinanas-deploy
 
 on:
   push:
@@ -12,53 +12,45 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up SSH
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Pull & Deploy to VPS
+        uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.VPS_IP }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: 2269
           script: |
+            set -e
+
             cd /var/www/AysheD/apiSEC
 
-            # 1. Tarik kode terbaru dari GitHub
+            echo "=== Pulling latest code ==="
             git pull origin main
 
-                      script: |
-            cd /var/www/AysheD/apiSEC
-
-            # 1. Tarik kode terbaru dari GitHub
-            git pull origin main
-
-            # 2. Buat ulang Dockerfile dengan konfigurasi PYTHONPATH yang tepat
-            cat << 'EOF' > Dockerfile
+            echo "=== Building Docker image ==="
+            cat << 'DOCKERFILE' > Dockerfile
             FROM python:3.11-slim
             WORKDIR /app
             COPY requirements.txt .
             RUN pip install --no-cache-dir -r requirements.txt
             COPY . .
-            
-            # Tambahkan direktori kerja ke dalam Python Path agar modul saling mengenali
-            ENV PYTHONPATH=/app
-            
-            EXPOSE 8000
-            # Eksekusi langsung ke main:app karena semua file berada di root /app
-            CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
-            EOF
 
-            # 3. Build ulang menggunakan Dockerfile yang diperbarui
+            ENV PYTHONPATH=/app
+
+            EXPOSE 8000
+            CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+            DOCKERFILE
+
             docker build -t apisec-api .
 
-            # 4. Hentikan dan hapus kontainer lama yang bootloop
+            echo "=== Restarting container ==="
             docker stop ayshe_api || true
             docker rm ayshe_api || true
 
-            # 5. Jalankan kontainer baru secara bersih
             docker run -d \
               --name ayshe_api \
               -p 8069:8000 \
               --restart unless-stopped \
               apisec-api
 
-
+            echo "=== Deployment complete ==="
