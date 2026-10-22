@@ -1,0 +1,7 @@
+# Database files (keep image clean, DB mounted as volume)
+*.db
+__pycache__/
+*.pyc
+*.egg-info/
+.git/
+.gitignore

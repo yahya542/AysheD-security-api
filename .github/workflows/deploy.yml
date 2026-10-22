@@ -37,7 +37,7 @@ jobs:
             COPY requirements.txt .
             RUN pip install --no-cache-dir -r requirements.txt
 
-            # Letakkan semua file ke dalam package directory apiSEC
+            # Letakkan semua file kode ke dalam package directory apiSEC
             # karena main.py & __init__.py memakai import absolut "from apiSEC.*"
             RUN mkdir -p apiSEC
             COPY . ./apiSEC/
@@ -54,10 +54,14 @@ jobs:
             docker stop ayshe_api || true
             docker rm ayshe_api || true
 
+            # Volume mount database agar persisten antar deploy
+            # Host: /var/www/AysheD/apiSEC/ayshed_auth.db
+            # Container: /app/apiSEC/ayshed_auth.db
             docker run -d \
               --name ayshe_api \
               -p 8069:8000 \
               --restart unless-stopped \
+              -v /var/www/AysheD/apiSEC/ayshed_auth.db:/app/apiSEC/ayshed_auth.db \
               apisec-api
 
             echo "=== Deployment complete ==="
