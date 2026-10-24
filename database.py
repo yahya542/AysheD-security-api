@@ -1,5 +1,5 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import DeclarativeBase, inspect
 from sqlalchemy import Column, String, Boolean, DateTime, Enum as SQLEnum, Integer, select, delete
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 import uuid
@@ -40,9 +40,11 @@ class LoginLog(Base):
     __tablename__ = "login_logs"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    email = Column(String(255), nullable=False, index=True)
+    user_id = Column(_uuid_type(), ForeignKey("users.id"), nullable=False, index=True)
     ip_address = Column(String(45), nullable=True)
     user_agent = Column(String(500), nullable=True)
+    device_id = Column(String(255), nullable=True, index=True)
+    request_id = Column(String(255), nullable=True, index=True)
     success = Column(Boolean, nullable=False)
     failure_reason = Column(SQLEnum(LoginFailureReason), nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -51,7 +53,7 @@ class AccountLock(Base):
     __tablename__ = "account_locks"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    email = Column(String(255), nullable=False, index=True)
+    user_id = Column(_uuid_type(), ForeignKey("users.id"), nullable=False, index=True)
     failed_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -69,13 +71,25 @@ async def get_db():
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_auto_migrate)
 
-async def get_active_account_lock(db: AsyncSession, email: str) -> Optional[AccountLock]:
-    """Return an active (non-expired) account lock for the given email, or None."""
+
+def _auto_migrate(conn):
+    """Auto-migrate: tambahkan kolom yang mungkin ada di model tapi belum di DB."""
+    inspector = inspect(conn)
+    columns = {col["name"] for col in inspector.get_columns("login_logs")}
+
+    if "device_id" not in columns:
+        conn.exec_driver_sql("ALTER TABLE login_logs ADD COLUMN device_id VARCHAR(255)")
+    if "request_id" not in columns:
+        conn.exec_driver_sql("ALTER TABLE login_logs ADD COLUMN request_id VARCHAR(255)")
+
+async def get_active_account_lock(db: AsyncSession, user_id: str) -> Optional[AccountLock]:
+    """Return an active (non-expired) account lock for the given user ID, or None."""
     now = datetime.utcnow()
     result = await db.execute(
         select(AccountLock)
-        .where(AccountLock.email == email)
+        .where(AccountLock.user_id == user_id)
         .where(AccountLock.locked_until.isnot(None))
         .where(AccountLock.locked_until > now)
         .order_by(AccountLock.id.desc())
@@ -83,7 +97,7 @@ async def get_active_account_lock(db: AsyncSession, email: str) -> Optional[Acco
     )
     return result.scalar_one_or_none()
 
-async def record_failed_attempt(db: AsyncSession, email: str) -> Optional[AccountLock]:
+async def record_failed_attempt(db: AsyncSession, user_id: str) -> Optional[AccountLock]:
     """Record a failed login attempt.
     
     If the threshold (settings.max_login_attempts) is reached, locks the account
@@ -93,7 +107,7 @@ async def record_failed_attempt(db: AsyncSession, email: str) -> Optional[Accoun
     now = datetime.utcnow()
     result = await db.execute(
         select(AccountLock)
-        .where(AccountLock.email == email)
+        .where(AccountLock.user_id == user_id)
         .order_by(AccountLock.id.desc())
         .limit(1)
     )
@@ -112,7 +126,7 @@ async def record_failed_attempt(db: AsyncSession, email: str) -> Optional[Accoun
             lock.failed_attempts = (lock.failed_attempts or 0) + 1
         else:
             lock = AccountLock(
-                email=email,
+                user_id=user_id,
                 failed_attempts=1,
                 locked_until=None
             )
@@ -131,9 +145,9 @@ async def record_failed_attempt(db: AsyncSession, email: str) -> Optional[Accoun
     
     return None
 
-async def clear_account_lock(db: AsyncSession, email: str):
-    """Clear all account locks for the given email (on successful login)."""
+async def clear_account_lock(db: AsyncSession, user_id: str):
+    """Clear all account locks for the given user ID (on successful login)."""
     await db.execute(
-        delete(AccountLock).where(AccountLock.email == email)
+        delete(AccountLock).where(AccountLock.user_id == user_id)
     )
     await db.commit()

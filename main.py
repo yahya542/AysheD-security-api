@@ -124,7 +124,7 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
     password_valid = verify_password(payload.password, stored_hash)
 
     # Check for active account lock (temporary lockout)
-    active_lock = await get_active_account_lock(db, payload.email)
+    active_lock = await get_active_account_lock(db, str(user.id) if user else None)
 
     failure_reason = None
     if active_lock:
@@ -138,16 +138,19 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
 
     if failure_reason is not None:
         login_log = LoginLog(
+            user_id=str(user.id) if user else None,
             email=payload.email,
             ip_address=ip,
             user_agent=ua,
             success=False,
+            device_id = request.headers.get('x-device-id') if request else None,
+            request_id = request.headers.get('x-request-id') if request else None,
             failure_reason=failure_reason,
             timestamp=get_utc_time()
         )
         db.add(login_log)
         await db.commit()
-        await record_failed_attempt(db, payload.email)
+        await record_failed_attempt(db, str(user.id) if user else None)
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -156,9 +159,11 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
         )
 
     # Login successful - clear any previous failed attempt lock
-    await clear_account_lock(db, payload.email)
+    await clear_account_lock(db, str(user.id)) 
 
     login_log = LoginLog(
+   
+        user_id=str(user.id) if user else None,
         email=payload.email,
         ip_address=ip,
         user_agent=ua,
