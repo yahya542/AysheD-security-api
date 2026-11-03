@@ -77,3 +77,7 @@ PostgreSQL table `users`:
   - Memperbaiki penanganan transaksi `db.commit()` pada fungsi `login()` (`apiSEC/main.py`):
     - Jalur gagal: kegagalan commit log ditangkap secara elegan dengan `rollback()`, pesan dicatat ke `stderr`, dan tetap memberikan kesempatan fungsi pencatatan lock (`record_failed_attempt`) untuk berjalan.
     - Jalur sukses: penulisan audit log dan pembersihan lock dibungkus `try/except` dengan `rollback()`, sehingga pengguna sah dengan kredensial valid tidak mengalami HTTP 500 crash jika terjadi kesibukan penulisan database.
+- **Granularitas Logging Percobaan & Anti Timing Leak**:
+  - Menambahkan enum `rate_limited` pada `LoginFailureReason` untuk menandai request yang terhambat periode delay progresif secara presisi (membedakannya dari `bad_password` dan `locked`).
+  - Pencatatan log (`LoginLog`) pada request `locked` dan `rate_limited` dipindahkan **sebelum** pemanggilan `asyncio.sleep()`, memastikan timestamp log mencerminkan waktu nyata saat paket request diterima server (tidak bias oleh durasi sleep).
+  - Mengisolasi penghitungan `count_recent_failures()` dan `get_last_failure_time()` khusus pada percobaan `bad_password` agar akumulasi delay progresif dihitung berdasarkan upaya verifikasi password aktual.

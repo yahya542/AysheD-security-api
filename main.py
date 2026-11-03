@@ -128,9 +128,36 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalar_one_or_none()
 
+    # 2. Cek FULL LOCK (account_locks)
     active_lock = await get_active_account_lock(db, str(user.id) if user else None)
+    if active_lock:
+        login_log = LoginLog(
+            user_id=str(user.id) if user else None,
+            email=payload.email,
+            ip_address=ip,
+            user_agent=ua,
+            success=False,
+            device_id=request.headers.get('x-device-id') if request else None,
+            request_id=request.headers.get('x-request-id') if request else None,
+            failure_reason=LoginFailureReason.locked,
+            timestamp=get_utc_time()
+        )
+        db.add(login_log)
+        try:
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            print(f"[SYSTEM-WARN] Failed to write locked log to DB: {e}", file=sys.stderr)
 
-    if user and not active_lock:
+        await asyncio.sleep(get_bcrypt_time())
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 3. Cek DELAY PROGRESIF (rate_limited)
+    if user:
         failure_count = await count_recent_failures(db, str(user.id), settings.THRESHOLD_WINDOW_MINUTES)
         required_delay = calculate_delay(failure_count)
         if required_delay > 0:
@@ -140,6 +167,24 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
                     last_failure = last_failure.replace(tzinfo=timezone.utc)
                 elapsed = (get_utc_time() - last_failure).total_seconds()
                 if elapsed < required_delay:
+                    login_log = LoginLog(
+                        user_id=str(user.id),
+                        email=payload.email,
+                        ip_address=ip,
+                        user_agent=ua,
+                        success=False,
+                        device_id=request.headers.get('x-device-id') if request else None,
+                        request_id=request.headers.get('x-request-id') if request else None,
+                        failure_reason=LoginFailureReason.rate_limited,
+                        timestamp=get_utc_time()
+                    )
+                    db.add(login_log)
+                    try:
+                        await db.commit()
+                    except Exception as e:
+                        await db.rollback()
+                        print(f"[SYSTEM-WARN] Failed to write rate_limited log to DB: {e}", file=sys.stderr)
+
                     await asyncio.sleep(get_bcrypt_time())
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -147,14 +192,12 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
                         headers={"WWW-Authenticate": "Bearer"},
                     )
 
+    # 4. Verifikasi password (timing-safe jika user tidak ada)
     stored_hash = user.password_hash if user else DUMMY_HASH
     password_valid = await verify_password_async(payload.password, stored_hash)
 
     failure_reason = None
-    if active_lock:
-        await asyncio.sleep(get_bcrypt_time())
-        failure_reason = LoginFailureReason.locked
-    elif user and not user.is_active:
+    if user and not user.is_active:
         failure_reason = LoginFailureReason.admin_suspended
     elif not user:
         failure_reason = LoginFailureReason.unknown_user

@@ -20,6 +20,7 @@ class LoginFailureReason(str, enum.Enum):
     unknown_user = "unknown_user"
     locked = "locked"
     admin_suspended = "admin_suspended"
+    rate_limited = "rate_limited"
 
 def _uuid_type():
     if settings.database_url.startswith("sqlite"):
@@ -108,7 +109,7 @@ def _auto_migrate(conn):
     # --- Data Cleanup (Sanitize legacy enum values) ---
     conn.exec_driver_sql(
         "UPDATE login_logs SET failure_reason = 'bad_password' "
-        "WHERE failure_reason NOT IN ('bad_password', 'unknown_user', 'locked', 'admin_suspended') "
+        "WHERE failure_reason NOT IN ('bad_password', 'unknown_user', 'locked', 'admin_suspended', 'rate_limited') "
         "AND failure_reason IS NOT NULL"
     )
 
@@ -187,23 +188,25 @@ async def clear_account_lock(db: AsyncSession, user_id: str):
     await db.commit()
 
 async def count_recent_failures(db, user_id: str, window_minutes: int) -> int:
-    """Hitung jumlah kegagalan login dalam window_minutes terakhir."""
+    """Hitung jumlah kegagalan password dalam window_minutes terakhir."""
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
     result = await db.execute(
         select(LoginLog)
         .where(LoginLog.user_id == user_id)
         .where(LoginLog.success == False)
+        .where(LoginLog.failure_reason == LoginFailureReason.bad_password)
         .where(LoginLog.timestamp >= cutoff)
         .order_by(LoginLog.timestamp.desc())
     )
     return len(result.scalars().all())
 
 async def get_last_failure_time(db, user_id: str):
-    """Ambil timestamp kegagalan terakhir, atau None."""
+    """Ambil timestamp kegagalan password terakhir, atau None."""
     result = await db.execute(
         select(LoginLog.timestamp)
         .where(LoginLog.user_id == user_id)
         .where(LoginLog.success == False)
+        .where(LoginLog.failure_reason == LoginFailureReason.bad_password)
         .order_by(LoginLog.timestamp.desc())
         .limit(1)
     )
