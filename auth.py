@@ -1,3 +1,5 @@
+import os
+import time as _time
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional
@@ -5,6 +7,11 @@ import jwt
 from apiSEC.config import settings
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=settings.bcrypt_rounds)
+
+
+async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
+    import asyncio
+    return await asyncio.to_thread(verify_password, plain_password, hashed_password)
 
 def _truncate_password(password: str) -> str:
     data = password.encode("utf-8")
@@ -36,3 +43,22 @@ def decode_access_token(token: str) -> Optional[dict]:
         return None
 
 DUMMY_HASH = hash_password("dummy_password_for_timing_safety")
+
+_BCRYPT_CALIBRATED_TIME: Optional[float] = None
+
+
+def calibrate_bcrypt_time(samples: int = 5) -> None:
+    global _BCRYPT_CALIBRATED_TIME
+    env_override = os.getenv("BCRYPT_TIME_SECONDS")
+    if env_override:
+        _BCRYPT_CALIBRATED_TIME = float(env_override)
+        return
+    durations = []
+    for _ in range(samples):
+        start = _time.perf_counter()
+        verify_password("dummy_password_for_timing_safety", DUMMY_HASH)
+        durations.append(_time.perf_counter() - start)
+    _BCRYPT_CALIBRATED_TIME = sum(durations) / len(durations)
+
+def get_bcrypt_time() -> float:
+    return _BCRYPT_CALIBRATED_TIME if _BCRYPT_CALIBRATED_TIME is not None else 0.25

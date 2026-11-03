@@ -1,9 +1,12 @@
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_serializer
 from typing import Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 import uuid
 from apiSEC.database import UserRole
 from pydantic import BaseModel
+
+WIB = ZoneInfo("Asia/Jakarta")
 
 class RegisterRequest(BaseModel):
     email: EmailStr = Field(description="User email address")
@@ -171,6 +174,18 @@ class LoginLogResponse(BaseModel):
     success: bool
     failure_reason: Optional[str] = None
     timestamp: datetime
+    user_id: Optional[str] = None
+    device_id: Optional[str] = None
+    request_id: Optional[str] = None
+
+
+    @field_serializer("timestamp")
+    def serialize_timestamp_wib(self, dt: datetime, _info) -> str:
+        # Jika naive dari SQLite, tetapkan sebagai UTC dulu, lalu konversi ke WIB
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(WIB).isoformat()
+
     
     class Config:
         from_attributes = True

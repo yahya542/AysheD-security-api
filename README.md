@@ -58,3 +58,17 @@ PostgreSQL table `users`:
 - role (user/admin)
 - is_active (boolean)
 - created_at (timestamp)
+
+## Catatan Perubahan (Changelog)
+
+### [2026-11-03]
+- **Kalibrasi Bcrypt**: Dipindahkan dari pemanggilan lazy ke fase startup `lifespan()`, dengan dukungan env override `BCRYPT_TIME_SECONDS` dan rata-rata 5 sampel untuk kestabilan event loop.
+- **Async Password Verification**: Implementasi `verify_password_async` berbasis `asyncio.to_thread` agar proses hashing bcrypt tidak memblokir async event loop.
+- **Alur Login & Timing Safety**:
+  - Urutan evaluasi: Cek Full Lock (`account_locks`) -> Cek Delay Progresif (`count_recent_failures`) -> Verifikasi Password (dummy hash fallback untuk email tidak dikenal).
+  - Delay progresif menggunakan `asyncio.sleep(get_bcrypt_time())` saat throttled sebelum melempar HTTP 401.
+- **Perbaikan Timezone**:
+  - Standardisasi timezone-aware UTC (`datetime.now(timezone.utc)`) pada cutoff query `count_recent_failures()` dan timestamp log.
+  - Normalisasi naive datetime dari SQLite sebelum pengurangan selisih waktu (`elapsed = (get_utc_time() - last_failure).total_seconds()`) untuk mencegah crash `TypeError` (HTTP 500).
+- **Serialisasi WIB**: Penambahan serializer `serialize_timestamp_wib` pada `LoginLogResponse` (`apiSEC/schemas.py`) untuk menampilkan timestamp dalam format zona waktu `Asia/Jakarta` (WIB, `+07:00`).
+- **Migrasi Database**: Hapus kolom legacy `email NOT NULL` pada tabel `account_locks` dan sesuaikan foreign key berbasis `user_id`.

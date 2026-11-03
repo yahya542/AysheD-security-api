@@ -5,7 +5,6 @@ from pydantic import Field
 from typing import Optional
 
 BASE_DIR = Path(__file__).resolve().parent
-
 class Settings(BaseSettings):
     # Database
     database_url: str = Field(
@@ -37,6 +36,12 @@ class Settings(BaseSettings):
     # Account lockout
     max_login_attempts: int = Field(default=5, alias="MAX_LOGIN_ATTEMPTS")
     lockout_duration_minutes: int = Field(default=1, alias="LOCKOUT_DURATION_MINUTES")
+
+    # Progressive delay
+    BASE_DELAY_SECONDS: int = Field(default=5, alias="BASE_DELAY_SECONDS")
+    THRESHOLD_FAILURES: int = Field(default=3, alias="THRESHOLD_FAILURES")
+    MAX_DELAY_SECONDS: int = Field(default=60, alias="MAX_DELAY_SECONDS")
+    THRESHOLD_WINDOW_MINUTES: int = Field(default=15, alias="THRESHOLD_WINDOW_MINUTES")
 
     class Config:
         env_file = ".env"

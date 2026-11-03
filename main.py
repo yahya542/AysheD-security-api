@@ -1,23 +1,26 @@
 import time
 import psutil
 import re
-from datetime import datetime, timezone 
-from fastapi import FastAPI, Depends, HTTPException, status, Request 
+import asyncio
+from datetime import datetime, timezone
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from contextlib import asynccontextmanager
 from apiSEC.config import settings
 from zoneinfo import ZoneInfo
 
-
-# 💡 1. Pastikan LoginLog sudah dimasukkan ke dalam daftar import di bawah ini
 from apiSEC.database import (
     init_db, get_db, User, UserRole, LoginLog,
     LoginFailureReason, AccountLock,
     get_active_account_lock, record_failed_attempt, clear_account_lock,
+    count_recent_failures, get_last_failure_time,
 )
 
-from apiSEC.auth import hash_password, verify_password, create_access_token, DUMMY_HASH
+from apiSEC.auth import (
+    hash_password, verify_password, create_access_token, DUMMY_HASH,
+    calibrate_bcrypt_time, get_bcrypt_time,
+)
 from apiSEC.schemas import (
     RegisterRequest, RegisterResponse,
     LoginRequest, LoginResponse,
@@ -36,9 +39,6 @@ ufw_pattern = re.compile(
 )
 
 
-""" def get_wib_time():
-    return datetime.now(ZoneInfo("Asia/Jakarta")) """
-
 def get_utc_time():
     return datetime.now(timezone.utc)
 
@@ -47,6 +47,7 @@ start_time = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    calibrate_bcrypt_time()
     yield
 
 app = FastAPI(
@@ -63,7 +64,6 @@ app = FastAPI(
     ],
 )
 
-# --- KONFIGURASI ROUTER ---
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 admin_router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -88,10 +88,6 @@ def read_root():
     return {"message": "Welcome to AysheD Security Gateway (apiSEC)", "version": "1.0.0"}
 
 
-# ==========================================
-# 🔑 AUTHENTICATION ROUTER (Prefix: /auth)
-# ==========================================
-
 @auth_router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
 async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.email == payload.email))
@@ -111,23 +107,51 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     
     return RegisterResponse(message="Registration successful")
 
+
+def calculate_delay(failure_count: int) -> int:
+    if failure_count <= 0:
+        return 0
+    delay = settings.BASE_DELAY_SECONDS * (2 ** (failure_count - 1))
+    return min(delay, settings.MAX_DELAY_SECONDS)
+
+
+async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
+    return await asyncio.to_thread(verify_password, plain_password, hashed_password)
+
+
 @auth_router.post("/login", response_model=LoginResponse)
 async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), request: Request = None):
     ip = request.client.host if request and request.client else None
     ua = request.headers.get('user-agent') if request else None
 
-    # Timing-safe: always run verify_password even when user doesn't exist
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalar_one_or_none()
 
-    stored_hash = user.password_hash if user else DUMMY_HASH
-    password_valid = verify_password(payload.password, stored_hash)
-
-    # Check for active account lock (temporary lockout)
     active_lock = await get_active_account_lock(db, str(user.id) if user else None)
+
+    if user and not active_lock:
+        failure_count = await count_recent_failures(db, str(user.id), settings.THRESHOLD_WINDOW_MINUTES)
+        required_delay = calculate_delay(failure_count)
+        if required_delay > 0:
+            last_failure = await get_last_failure_time(db, str(user.id))
+            if last_failure:
+                if last_failure.tzinfo is None:
+                    last_failure = last_failure.replace(tzinfo=timezone.utc)
+                elapsed = (get_utc_time() - last_failure).total_seconds()
+                if elapsed < required_delay:
+                    await asyncio.sleep(get_bcrypt_time())
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Invalid credentials",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+
+    stored_hash = user.password_hash if user else DUMMY_HASH
+    password_valid = await verify_password_async(payload.password, stored_hash)
 
     failure_reason = None
     if active_lock:
+        await asyncio.sleep(get_bcrypt_time())
         failure_reason = LoginFailureReason.locked
     elif user and not user.is_active:
         failure_reason = LoginFailureReason.admin_suspended
@@ -143,14 +167,26 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
             ip_address=ip,
             user_agent=ua,
             success=False,
-            device_id = request.headers.get('x-device-id') if request else None,
-            request_id = request.headers.get('x-request-id') if request else None,
+            device_id=request.headers.get('x-device-id') if request else None,
+            request_id=request.headers.get('x-request-id') if request else None,
             failure_reason=failure_reason,
             timestamp=get_utc_time()
         )
         db.add(login_log)
-        await db.commit()
-        await record_failed_attempt(db, str(user.id) if user else None)
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        try:
+            await record_failed_attempt(db, str(user.id) if user else None)
+        except Exception:
+            pass
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -158,16 +194,17 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Login successful - clear any previous failed attempt lock
-    await clear_account_lock(db, str(user.id)) 
+    if user:
+        await clear_account_lock(db, str(user.id))
 
     login_log = LoginLog(
-   
         user_id=str(user.id) if user else None,
         email=payload.email,
         ip_address=ip,
         user_agent=ua,
         success=True,
+        device_id=request.headers.get('x-device-id') if request else None,
+        request_id=request.headers.get('x-request-id') if request else None,
         timestamp=get_utc_time()
     )
     db.add(login_log)
@@ -179,11 +216,12 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
 
     return LoginResponse(access_token=access_token, token_type="bearer")
 
+
 @auth_router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
 
-@auth_router.get ("/users", response_model=list[UserResponse])
+@auth_router.get("/users", response_model=list[UserResponse])
 async def get_users(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -194,17 +232,10 @@ async def get_users(
 
 @auth_router.post("/logout", response_model=LogoutResponse)
 async def logout(current_user: User = Depends(get_current_user)):
-    # Implement logout logic here (e.g., invalidate token)
     return LogoutResponse(message="Logged out successfully")
 
 
-# ==========================================
-# 🛡️ ADMIN ROUTER (Prefix: /admin)
-# ==========================================
-
-# 💡 2. Pindahkan ke admin_router, potong prefix-nya, dan tambahkan dependency 'db'
-# 💡 Ganti response_model dari list[LoginResponse] menjadi list[LoginLogResponse]
-@admin_router.get("/logs", response_model=list[LoginLogResponse], tags=["Admin"]) 
+@admin_router.get("/logs", response_model=list[LoginLogResponse], tags=["Admin"])
 async def get_login_logs(
     limit: int = 100,
     db: AsyncSession = Depends(get_db),
@@ -302,7 +333,6 @@ async def get_ufw_logs(current_user: User = Depends(get_current_admin)):
     return UFWLogsResponse(logs=logs, total=len(logs))
 
 
-
 @admin_router.post("/suspend-user", response_model=SuspendUserResponse)
 async def suspend_user(
     payload: SuspendUserRequest,
@@ -333,7 +363,6 @@ async def suspend_user(
     )
 
 
-# --- REGISTER ROUTERS ---
 app.include_router(auth_router)
 app.include_router(admin_router)
 

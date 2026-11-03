@@ -1,9 +1,9 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, inspect
-from sqlalchemy import Column, String, Boolean, DateTime, Enum as SQLEnum, Integer, select, delete
+from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy import inspect, Column, String, Boolean, DateTime, Enum as SQLEnum, Integer, ForeignKey, select, delete
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 import enum
 from apiSEC.config import settings
@@ -34,29 +34,30 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(SQLEnum(UserRole), default=UserRole.user, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 class LoginLog(Base):
     __tablename__ = "login_logs"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(_uuid_type(), ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(_uuid_type(), ForeignKey("users.id"), nullable=True, index=True)
+    email = Column(String(255), nullable=True, index=True)
     ip_address = Column(String(45), nullable=True)
     user_agent = Column(String(500), nullable=True)
     device_id = Column(String(255), nullable=True, index=True)
     request_id = Column(String(255), nullable=True, index=True)
     success = Column(Boolean, nullable=False)
     failure_reason = Column(SQLEnum(LoginFailureReason), nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 class AccountLock(Base):
     __tablename__ = "account_locks"
-    
+
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(_uuid_type(), ForeignKey("users.id"), nullable=False, index=True)
+    user_id = Column(_uuid_type(), ForeignKey("users.id"), nullable=True, index=True)
     failed_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 engine = create_async_engine(settings.database_url, echo=False, pool_pre_ping=True)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -76,17 +77,36 @@ async def init_db():
 
 def _auto_migrate(conn):
     """Auto-migrate: tambahkan kolom yang mungkin ada di model tapi belum di DB."""
-    inspector = inspect(conn)
-    columns = {col["name"] for col in inspector.get_columns("login_logs")}
-
-    if "device_id" not in columns:
+    # --- login_logs ---
+    cols = {c["name"] for c in inspect(conn).get_columns("login_logs")}
+    if "user_id" not in cols:
+        conn.exec_driver_sql("ALTER TABLE login_logs ADD COLUMN user_id VARCHAR(36)")
+    if "device_id" not in cols:
         conn.exec_driver_sql("ALTER TABLE login_logs ADD COLUMN device_id VARCHAR(255)")
-    if "request_id" not in columns:
+    if "request_id" not in cols:
         conn.exec_driver_sql("ALTER TABLE login_logs ADD COLUMN request_id VARCHAR(255)")
+
+    # --- account_locks ---
+    cols = {c["name"] for c in inspect(conn).get_columns("account_locks")}
+    if "user_id" not in cols:
+        conn.exec_driver_sql("ALTER TABLE account_locks ADD COLUMN user_id VARCHAR(36)")
+
+    # --- Data Cleanup (Sanitize legacy enum values) ---
+    conn.exec_driver_sql(
+        "UPDATE login_logs SET failure_reason = 'bad_password' "
+        "WHERE failure_reason NOT IN ('bad_password', 'unknown_user', 'locked', 'admin_suspended') "
+        "AND failure_reason IS NOT NULL"
+    )
+
+    # --- Sync user_id for legacy data (based on email) ---
+    conn.exec_driver_sql(
+        "UPDATE login_logs SET user_id = (SELECT id FROM users WHERE users.email = login_logs.email) "
+        "WHERE user_id IS NULL AND email IS NOT NULL"
+    )
 
 async def get_active_account_lock(db: AsyncSession, user_id: str) -> Optional[AccountLock]:
     """Return an active (non-expired) account lock for the given user ID, or None."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     result = await db.execute(
         select(AccountLock)
         .where(AccountLock.user_id == user_id)
@@ -104,7 +124,7 @@ async def record_failed_attempt(db: AsyncSession, user_id: str) -> Optional[Acco
     for settings.lockout_duration_minutes and returns the AccountLock.
     Otherwise returns None.
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     result = await db.execute(
         select(AccountLock)
         .where(AccountLock.user_id == user_id)
@@ -151,3 +171,26 @@ async def clear_account_lock(db: AsyncSession, user_id: str):
         delete(AccountLock).where(AccountLock.user_id == user_id)
     )
     await db.commit()
+
+async def count_recent_failures(db, user_id: str, window_minutes: int) -> int:
+    """Hitung jumlah kegagalan login dalam window_minutes terakhir."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    result = await db.execute(
+        select(LoginLog)
+        .where(LoginLog.user_id == user_id)
+        .where(LoginLog.success == False)
+        .where(LoginLog.timestamp >= cutoff)
+        .order_by(LoginLog.timestamp.desc())
+    )
+    return len(result.scalars().all())
+
+async def get_last_failure_time(db, user_id: str):
+    """Ambil timestamp kegagalan terakhir, atau None."""
+    result = await db.execute(
+        select(LoginLog.timestamp)
+        .where(LoginLog.user_id == user_id)
+        .where(LoginLog.success == False)
+        .order_by(LoginLog.timestamp.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
