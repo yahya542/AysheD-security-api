@@ -72,3 +72,8 @@ PostgreSQL table `users`:
   - Normalisasi naive datetime dari SQLite sebelum pengurangan selisih waktu (`elapsed = (get_utc_time() - last_failure).total_seconds()`) untuk mencegah crash `TypeError` (HTTP 500).
 - **Serialisasi WIB**: Penambahan serializer `serialize_timestamp_wib` pada `LoginLogResponse` (`apiSEC/schemas.py`) untuk menampilkan timestamp dalam format zona waktu `Asia/Jakarta` (WIB, `+07:00`).
 - **Migrasi Database**: Hapus kolom legacy `email NOT NULL` pada tabel `account_locks` dan sesuaikan foreign key berbasis `user_id`.
+- **Konkurensi & Resiliensi SQLite (Langkah 1)**:
+  - Mengaktifkan `PRAGMA journal_mode=WAL;` dan `PRAGMA busy_timeout=5000;` pada engine SQLite (`apiSEC/database.py`) untuk mengatasi lock contention (`database is locked`) pada pengujian beban konkurensi tinggi.
+  - Memperbaiki penanganan transaksi `db.commit()` pada fungsi `login()` (`apiSEC/main.py`):
+    - Jalur gagal: kegagalan commit log ditangkap secara elegan dengan `rollback()`, pesan dicatat ke `stderr`, dan tetap memberikan kesempatan fungsi pencatatan lock (`record_failed_attempt`) untuk berjalan.
+    - Jalur sukses: penulisan audit log dan pembersihan lock dibungkus `try/except` dengan `rollback()`, sehingga pengguna sah dengan kredensial valid tidak mengalami HTTP 500 crash jika terjadi kesibukan penulisan database.

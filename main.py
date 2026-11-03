@@ -2,6 +2,7 @@ import time
 import psutil
 import re
 import asyncio
+import sys
 from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -175,18 +176,16 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
         db.add(login_log)
         try:
             await db.commit()
-        except Exception:
+        except Exception as e:
             await db.rollback()
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+            print(f"[SYSTEM-WARN] Failed to write failed login_log to DB: {e}", file=sys.stderr)
 
-        try:
-            await record_failed_attempt(db, str(user.id) if user else None)
-        except Exception:
-            pass
+        if user:
+            try:
+                await record_failed_attempt(db, str(user.id))
+            except Exception as e:
+                await db.rollback()
+                print(f"[SYSTEM-WARN] Failed to record_failed_attempt: {e}", file=sys.stderr)
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -195,7 +194,11 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
         )
 
     if user:
-        await clear_account_lock(db, str(user.id))
+        try:
+            await clear_account_lock(db, str(user.id))
+        except Exception as e:
+            await db.rollback()
+            print(f"[SYSTEM-WARN] Failed to clear account lock: {e}", file=sys.stderr)
 
     login_log = LoginLog(
         user_id=str(user.id) if user else None,
@@ -208,7 +211,11 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db), reque
         timestamp=get_utc_time()
     )
     db.add(login_log)
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as e:
+        await db.rollback()
+        print(f"[SYSTEM-WARN] Failed to write success login_log to DB: {e}", file=sys.stderr)
 
     access_token = create_access_token(
         data={"sub": str(user.id), "role": user.role.value}

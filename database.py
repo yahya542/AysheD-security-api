@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import inspect, Column, String, Boolean, DateTime, Enum as SQLEnum, Integer, ForeignKey, select, delete
+from sqlalchemy import event, inspect, Column, String, Boolean, DateTime, Enum as SQLEnum, Integer, ForeignKey, select, delete
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -60,6 +60,16 @@ class AccountLock(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 engine = create_async_engine(settings.database_url, echo=False, pool_pre_ping=True)
+
+if settings.database_url.startswith("sqlite"):
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA busy_timeout=5000;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.close()
+
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def get_db():
@@ -71,6 +81,10 @@ async def get_db():
 
 async def init_db():
     async with engine.begin() as conn:
+        if settings.database_url.startswith("sqlite"):
+            await conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+            await conn.exec_driver_sql("PRAGMA busy_timeout=5000;")
+            await conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_auto_migrate)
 

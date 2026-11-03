@@ -8,6 +8,8 @@ venv/
 
 # Database files (SQLite)
 *.db
+*.db-shm
+*.db-wal
 ayshe_auth.db
 ayshed_auth.db
 
