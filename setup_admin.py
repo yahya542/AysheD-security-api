@@ -6,7 +6,7 @@ import asyncio
 import uuid
 from passlib.context import CryptContext
 from apiSEC.database import AsyncSessionLocal, User, UserRole, init_db
-from sqlalchemy import delete
+from sqlalchemy import select
 from datetime import datetime
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
@@ -16,7 +16,10 @@ async def main():
     password_hash = pwd_context.hash("superadmin123")
     
     async with AsyncSessionLocal() as db:
-        await db.execute(delete(User))
+        existing = await db.execute(select(User).where(User.email == "superadmin@ayshed.biz.id"))
+        if existing.scalar_one_or_none():
+            print("Admin already exists")
+            return
         admin = User(
             id=str(uuid.uuid4()),
             email="superadmin@ayshed.biz.id",
