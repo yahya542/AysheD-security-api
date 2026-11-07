@@ -30,6 +30,20 @@ class RegisterResponse(BaseModel):
             }
         }
 
+class AddUserRequest(BaseModel):
+    email: EmailStr = Field(description="User email address")
+    password: str = Field(min_length=8, max_length=128, description="Password (min 8 characters)")
+    role: UserRole = Field(default=UserRole.user, description="User role: user, admin, or superadmin")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "email": "newuser@example.com",
+                "password": "securepassword123",
+                "role": "user"
+            }
+        }
+
 class LoginRequest(BaseModel):
     email: EmailStr = Field(description="Registered email address")
     password: str = Field(description="User password")
@@ -94,6 +108,24 @@ class UserResponse(BaseModel):
                 "role": "user",
                 "is_active": True,
                 "created_at": "2026-09-16T09:00:00"
+            }
+        }
+
+class AddUserResponse(BaseModel):
+    message: str = "User created successfully"
+    user: Optional[UserResponse] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "message": "User created successfully",
+                "user": {
+                    "id": "550e8400-e29b-41d4-a716-446655440000",
+                    "email": "newuser@example.com",
+                    "role": "user",
+                    "is_active": True,
+                    "created_at": "2026-09-16T09:00:00"
+                }
             }
         }
 

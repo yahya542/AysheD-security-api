@@ -14,6 +14,7 @@ class Base(DeclarativeBase):
 class UserRole(str, enum.Enum):
     user = "user"
     admin = "admin"
+    superadmin = "superadmin"
 
 class LoginFailureReason(str, enum.Enum):
     bad_password = "bad_password"

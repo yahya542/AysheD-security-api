@@ -24,6 +24,7 @@ from apiSEC.auth import (
 )
 from apiSEC.schemas import (
     RegisterRequest, RegisterResponse,
+    AddUserRequest, AddUserResponse,
     LoginRequest, LoginResponse,
     HealthResponse, ThreatLogsResponse, ThreatLogEntry,
     SuspendUserRequest, SuspendUserResponse, UserResponse,
@@ -31,7 +32,7 @@ from apiSEC.schemas import (
     LogoutRequest, LogoutResponse,
     UFWLogsResponse, UFWLogEntry
 )
-from apiSEC.dependencies import get_current_user, get_current_admin
+from apiSEC.dependencies import get_current_user, get_current_admin, get_current_superadmin
 from fastapi import APIRouter
 
 
@@ -107,6 +108,25 @@ async def register(payload: RegisterRequest, db: AsyncSession = Depends(get_db))
     await db.commit()
     
     return RegisterResponse(message="Registration successful")
+
+
+@auth_router.post("/add-user", response_model=AddUserResponse, status_code=status.HTTP_201_CREATED)
+async def add_user(payload: AddUserRequest, db: AsyncSession = Depends(get_db),
+                   current_user: User = Depends(get_current_superadmin)):
+    result = await db.execute(select(User).where(User.email == payload.email))
+    if result.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+
+    user = User(
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        role=payload.role,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+
+    return AddUserResponse(message="User created successfully", user=user)
 
 
 def calculate_delay(failure_count: int) -> int:
