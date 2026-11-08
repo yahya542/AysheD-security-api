@@ -436,8 +436,61 @@ async def suspend_user(
     )
 
 
-app.include_router(auth_router)
-app.include_router(admin_router)
+CHART_DATA = {"daily": [], "weekly": [], "monthly": []}
+
+async def compute_chart_data():
+    global CHART_DATA
+    from datetime import datetime, timedelta, time
+    from collections import defaultdict
+    from apiSEC.database import AsyncSessionLocal
+    db = AsyncSessionLocal()
+    try:
+        now = datetime.now()
+        today_midnight = datetime.combine(now.date(), time.min)
+        thirty_days_ago = today_midnight - timedelta(days=30)
+        result = await db.execute(
+            select(LoginLog.timestamp).where(
+                LoginLog.timestamp >= thirty_days_ago,
+                LoginLog.timestamp < today_midnight
+            )
+        )
+        timestamps = [r[0] for r in result.all()]
+        if not timestamps:
+            CHART_DATA = {"daily": [], "weekly": [], "monthly": []}
+            return
+
+        yesterday = today_midnight - timedelta(days=1)
+        seven_days_ago = today_midnight - timedelta(days=7)
+
+        daily_map = defaultdict(int)
+        weekly_map = defaultdict(int)
+        monthly_map = defaultdict(int)
+
+        for ts in timestamps:
+            if ts.tzinfo is None:
+                # treat as UTC? keep naive
+                pass
+            if yesterday <= ts < today_midnight:
+                daily_map[ts.strftime("%H:00")] += 1
+            if ts >= seven_days_ago:
+                weekly_map[ts.strftime("%d %b")] += 1
+            monthly_map[ts.strftime("%d %b")] += 1
+
+        CHART_DATA = {
+            "daily": [{"x": k, "y": v} for k, v in sorted(daily_map.items())],
+            "weekly": [{"x": k, "y": v} for k, v in weekly_map.items()],
+            "monthly": [{"x": k, "y": v} for k, v in monthly_map.items()],
+        }
+    finally:
+        await db.close()
+
+@app.on_event("startup")
+async def startup_chart():
+    await compute_chart_data()
+
+@app.get("/api/charts/login-summary")
+async def get_login_summary():
+    return CHART_DATA
 
 if __name__ == "__main__":
     import uvicorn
