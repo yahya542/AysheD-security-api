@@ -448,11 +448,11 @@ async def compute_chart_data():
         today_midnight = datetime.combine(now.date(), time.min)
         thirty_days_ago = today_midnight - timedelta(days=30)
         result = await db.execute(
-            select(LoginLog.timestamp).where(
+            select(LoginLog.timestamp, LoginLog.success).where(
                 LoginLog.timestamp >= thirty_days_ago,
             )
         )
-        timestamps = [r[0] for r in result.all()]
+        timestamps = result.all()
         if not timestamps:
             CHART_DATA = {"daily": [], "weekly": [], "monthly": []}
             return
@@ -460,24 +460,28 @@ async def compute_chart_data():
         yesterday = today_midnight - timedelta(days=1)
         seven_days_ago = today_midnight - timedelta(days=7)
 
-        daily_map = defaultdict(int)
-        weekly_map = defaultdict(int)
-        monthly_map = defaultdict(int)
+        daily_map = defaultdict(lambda: {"success":0,"fail":0})
+        weekly_map = defaultdict(lambda: {"success":0,"fail":0})
+        monthly_map = defaultdict(lambda: {"success":0,"fail":0})
 
-        for ts in timestamps:
-            if ts.tzinfo is None:
-                # treat as UTC? keep naive
-                pass
+        for ts, success in timestamps:
+            ...
             if yesterday <= ts < today_midnight:
-                daily_map[ts.strftime("%H:00")] += 1
+                key = ts.strftime("%H:00")
+                if success: daily_map[key]["success"] += 1
+                else: daily_map[key]["fail"] += 1
             if ts >= seven_days_ago:
-                weekly_map[ts.strftime("%d %b")] += 1
-            monthly_map[ts.strftime("%d %b")] += 1
+                key = ts.strftime("%d %b")
+                if success: weekly_map[key]["success"] += 1
+                else: weekly_map[key]["fail"] += 1
+            key = ts.strftime("%d %b")
+            if success: monthly_map[key]["success"] += 1
+            else: monthly_map[key]["fail"] += 1
 
         CHART_DATA = {
-            "daily": [{"x": k, "y": v} for k, v in sorted(daily_map.items())],
-            "weekly": [{"x": k, "y": v} for k, v in weekly_map.items()],
-            "monthly": [{"x": k, "y": v} for k, v in monthly_map.items()],
+            "daily": [{"x": k, "success": v["success"], "fail": v["fail"]} for k, v in sorted(daily_map.items())],
+            "weekly": [{"x": k, "success": v["success"], "fail": v["fail"]} for k, v in weekly_map.items()],
+            "monthly": [{"x": k, "success": v["success"], "fail": v["fail"]} for k, v in monthly_map.items()],
         }
     finally:
         await db.close()
