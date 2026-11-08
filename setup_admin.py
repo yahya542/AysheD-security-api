@@ -24,7 +24,7 @@ async def main():
             id=str(uuid.uuid4()),
             email="superadmin@ayshed.biz.id",
             password_hash=password_hash,
-            role=UserRole.admin,
+            role=UserRole.superadmin,
             is_active=True,
             created_at=datetime.utcnow(),
         )
