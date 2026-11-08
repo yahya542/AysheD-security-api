@@ -451,7 +451,6 @@ async def compute_chart_data():
         result = await db.execute(
             select(LoginLog.timestamp).where(
                 LoginLog.timestamp >= thirty_days_ago,
-                LoginLog.timestamp < today_midnight
             )
         )
         timestamps = [r[0] for r in result.all()]
