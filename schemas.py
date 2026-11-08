@@ -11,6 +11,9 @@ WIB = ZoneInfo("Asia/Jakarta")
 class RegisterRequest(BaseModel):
     email: EmailStr = Field(description="User email address")
     password: str = Field(min_length=8, max_length=128, description="Password (min 8 characters)")
+    full_name: Optional[str] = Field(default=None, description="Full name")
+    birth_place: Optional[str] = Field(default=None, description="Birth place")
+    birth_date: Optional[datetime] = Field(default=None, description="Birth date (ISO date)")
 
     class Config:
         json_schema_extra = {
@@ -97,6 +100,9 @@ class UserResponse(BaseModel):
     email: str = Field(description="User email address")
     role: UserRole = Field(description="User role: user or admin")
     is_active: bool = Field(description="Account status")
+    full_name: Optional[str] = Field(default=None, description="Full name")
+    birth_place: Optional[str] = Field(default=None, description="Birth place")
+    birth_date: Optional[datetime] = Field(default=None, description="Birth date")
     created_at: datetime = Field(description="Account creation timestamp")
 
     class Config:

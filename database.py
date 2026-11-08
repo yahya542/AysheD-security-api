@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import event, inspect, Column, String, Boolean, DateTime, Enum as SQLEnum, Integer, ForeignKey, select, delete
+from sqlalchemy import event, inspect, Column, String, Boolean, DateTime, Enum as SQLEnum, Integer, ForeignKey, select, delete, Date
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -36,6 +36,9 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(SQLEnum(UserRole), default=UserRole.user, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    full_name = Column(String(255), nullable=True)
+    birth_place = Column(String(255), nullable=True)
+    birth_date = Column(Date, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 class LoginLog(Base):
@@ -93,7 +96,14 @@ async def init_db():
 
 def _auto_migrate(conn):
     """Auto-migrate: tambahkan kolom yang mungkin ada di model tapi belum di DB."""
-    # --- login_logs ---
+    # --- users ---
+    cols = {c["name"] for c in inspect(conn).get_columns("users")}
+    if "full_name" not in cols:
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN full_name VARCHAR(255)")
+    if "birth_place" not in cols:
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN birth_place VARCHAR(255)")
+    if "birth_date" not in cols:
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN birth_date DATE")
     cols = {c["name"] for c in inspect(conn).get_columns("login_logs")}
     if "user_id" not in cols:
         conn.exec_driver_sql("ALTER TABLE login_logs ADD COLUMN user_id VARCHAR(36)")
