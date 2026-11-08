@@ -492,6 +492,9 @@ async def startup_chart():
 async def get_login_summary():
     return CHART_DATA
 
+app.include_router(auth_router)
+app.include_router(admin_router)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host=settings.host, port=settings.port)
