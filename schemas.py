@@ -19,7 +19,10 @@ class RegisterRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "email": "user@example.com",
-                "password": "securepassword123"
+                "password": "securepassword123",
+                "full_name": "John Doe",
+                "birth_place": "Jakarta",
+                "birth_date": "2000-01-01T00:00:00"
             }
         }
 
