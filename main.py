@@ -489,6 +489,8 @@ async def startup_chart():
 
 @app.get("/api/charts/login-summary")
 async def get_login_summary():
+    if not CHART_DATA.get("monthly"):
+        await compute_chart_data()
     return CHART_DATA
 
 app.include_router(auth_router)
