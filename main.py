@@ -429,7 +429,6 @@ async def suspend_user(
     
     user.is_active = False
     await db.commit()
-    
     return SuspendUserResponse(
         message=f"User {user.email} suspended",
         user_id=user.id
@@ -492,6 +491,20 @@ async def get_login_summary():
     if not CHART_DATA.get("monthly"):
         await compute_chart_data()
     return CHART_DATA
+
+@admin_router.post("/unsuspend-user", response_model=SuspendUserResponse)
+async def unsuspend_user(
+    payload: SuspendUserRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_admin)
+):
+    result = await db.execute(select(User).where(User.id == str(payload.user_id)))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.is_active = True
+    await db.commit()
+    return SuspendUserResponse(message=f"User {user.email} unsuspended", user_id=user.id)
 
 app.include_router(auth_router)
 app.include_router(admin_router)
