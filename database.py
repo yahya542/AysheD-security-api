@@ -177,7 +177,7 @@ async def seed_default_permissions(db: AsyncSession):
     perms = {p.name: p.id for p in (await db.execute(select(Permission))).scalars().all()}
     mapping = {
         UserRole.user: ["user:read"],
-        UserRole.admin: ["user:read", "user:suspend", "user:unsuspend", "user:add", "log:read", "chart:read"],
+        UserRole.admin: ["user:read", "user:suspend", "user:unsuspend", "user:add", "user:delete", "log:read", "chart:read"],
         UserRole.superadmin: list(perms.keys()),
     }
     for role, perm_names in mapping.items():
