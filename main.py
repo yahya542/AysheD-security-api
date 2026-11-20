@@ -14,7 +14,7 @@ from apiSEC.config import settings
 from zoneinfo import ZoneInfo
 
 from apiSEC.database import (
-    init_db, get_db, User, UserRole, LoginLog, AsyncSessionLocal,
+    Permission, RolePermission, init_db, get_db, User, UserRole, LoginLog, AsyncSessionLocal,
     LoginFailureReason, AccountLock,
     get_active_account_lock, record_failed_attempt, clear_account_lock,
     count_recent_failures, get_last_failure_time, seed_default_permissions,
@@ -81,7 +81,6 @@ app.add_middleware(
 
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 admin_router = APIRouter(prefix="/admin", tags=["Admin"])
-rbac_router = APIRouter(prefix="/rbac", tags=["RBAC"])
 super_admin_router = APIRouter(prefix="/super-admin", tags=["Super Admin"])
 
 bearer_scheme = {
@@ -557,7 +556,7 @@ async def update_role(payload: UpdateRoleRequest, db=Depends(get_db), current_us
 #super admin ##
 
 
-@rbac_router.put("/role-permissions", response_model=UpdateRolePermissionsResponse)
+@super_admin_router.put("/role-permissions", response_model=UpdateRolePermissionsResponse)
 async def update_role_permissions(
     payload: UpdateRolePermissionsRequest,
     db: AsyncSession = Depends(get_db),
@@ -586,7 +585,7 @@ async def update_role_permissions(
         permissions=payload.permissions,
     )
 
-@rbac_router.get("/role-permissions/{role}", response_model=UpdateRolePermissionsResponse)
+@super_admin_router.get("/role-permissions/{role}", response_model=UpdateRolePermissionsResponse)
 async def get_role_permissions(
     role: UserRole,
     db: AsyncSession = Depends(get_db),
@@ -604,7 +603,7 @@ async def get_role_permissions(
         permissions=perms,
     )
 
-@rbac_router.get("/permissions", response_model=List[str])
+@super_admin_router.get("/permissions", response_model=List[str])
 async def list_permissions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_superadmin),
@@ -615,7 +614,6 @@ async def list_permissions(
 
 app.include_router(auth_router)
 app.include_router(admin_router)
-app.include_router(rbac_router)
 app.include_router(super_admin_router)
 
 if __name__ == "__main__":
