@@ -324,7 +324,7 @@ async def logout(current_user: User = Depends(get_current_user)):
 
 @admin_router.get("/logs", response_model=list[LoginLogResponse], tags=["Admin"])
 async def get_login_logs(
-    limit: int = 100,
+    limit: int = 5000,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_admin)
 ):
