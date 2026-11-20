@@ -1,8 +1,8 @@
 # Hasil Testing apiSEC
 
 ## Ringkasan
-- **Total test:** 21
-- **Lulus:** 21
+- **Total test:** 26
+- **Lulus:** 26
 - **Gagal:** 0
 - **Status:** SEMUA TEST LULUS
 
@@ -42,9 +42,21 @@
 | 3 | Chart data structure valid (daily/weekly/monthly dengan success/fail) | PASS |
 | 4 | Role-based access control diterapkan | PASS |
 
+### RBAC Tests (test_rbac.py) - 5 test
+| No | Test Case | Status |
+|----|-----------|--------|
+| 1 | Seed default permissions (8+ permission) | PASS |
+| 2 | Role-permission mapping (superadmin=all, user=1) | PASS |
+| 3 | Get user permissions untuk superadmin | PASS |
+| 4 | has_permission check (True/False) | PASS |
+| 5 | User role memiliki permission terbatas | PASS |
+
 ## Perbaikan yang Dilakukan Sebelum Testing
-1. **dependencies.py:** `get_current_admin` diperbarui untuk mengizinkan role `superadmin` selain `admin` (sebelumnya hanya `admin`).
-2. **Test menggunakan email unik** (uuid4) untuk menghindari konflik 409 antar run.
+1. **dependencies.py:** `get_current_admin` diperbarui untuk mengizinkan role `superadmin` selain `admin`.
+2. **database.py:** Ditambahkan model `Permission`, `RolePermission`, `UserPermission` untuk RBAC.
+3. **database.py:** Ditambahkan fungsi `seed_default_permissions` untuk inisialisasi permission default.
+4. **schemas.py:** Ditambahkan `DeleteUserRequest` dan `DeleteUserResponse`.
+5. **Test menggunakan email unik** (uuid4) untuk menghindari konflik 409 antar run.
 
 ## Environment
 - Python: 3.12.7
@@ -58,3 +70,4 @@
 - Semua pengujian dilakukan menggunakan FastAPI TestClient (tidak membutuhkan server eksternal).
 - Database test menggunakan file `ayshed_auth.db` yang sama dengan development.
 - User `superadmin@ayshed.biz.id` dengan password `superadmin123` digunakan untuk tes admin.
+- RBAC tests memverifikasi seed permission, role mapping, dan permission check.

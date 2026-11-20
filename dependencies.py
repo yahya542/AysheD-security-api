@@ -3,7 +3,41 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from typing import Optional
-from apiSEC.database import get_db, User, UserRole
+from apiSEC.database import get_db, User, UserRole, Permission, RolePermission, UserPermission
+from sqlalchemy import select, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional, List
+
+# ... existing code ...
+
+async def get_user_permissions(db: AsyncSession, user: User) -> List[str]:
+    """Return list of permission names for a user (role-based + per-user overrides)."""
+    # Role-based permissions
+    rp_result = await db.execute(
+        select(Permission.name)
+        .join(RolePermission, RolePermission.permission_id == Permission.id)
+        .where(RolePermission.role == user.role)
+    )
+    role_perms = {row[0] for row in rp_result.all()}
+
+    # Per-user overrides
+    up_result = await db.execute(
+        select(Permission.name, UserPermission.granted)
+        .join(UserPermission, UserPermission.permission_id == Permission.id)
+        .where(UserPermission.user_id == str(user.id))
+    )
+    for name, granted in up_result.all():
+        if granted:
+            role_perms.add(name)
+        else:
+            role_perms.discard(name)
+
+    return sorted(role_perms)
+
+async def has_permission(db: AsyncSession, user: User, permission_name: str) -> bool:
+    """Check if user has a specific permission."""
+    perms = await get_user_permissions(db, user)
+    return permission_name in perms
 from apiSEC.auth import decode_access_token
 from apiSEC.schemas import TokenData
 

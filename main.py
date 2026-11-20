@@ -5,6 +5,7 @@ import asyncio
 import sys
 from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from contextlib import asynccontextmanager
@@ -12,10 +13,10 @@ from apiSEC.config import settings
 from zoneinfo import ZoneInfo
 
 from apiSEC.database import (
-    init_db, get_db, User, UserRole, LoginLog,
+    init_db, get_db, User, UserRole, LoginLog, AsyncSessionLocal,
     LoginFailureReason, AccountLock,
     get_active_account_lock, record_failed_attempt, clear_account_lock,
-    count_recent_failures, get_last_failure_time,
+    count_recent_failures, get_last_failure_time, seed_default_permissions,
 )
 
 from apiSEC.auth import (
@@ -49,6 +50,8 @@ start_time = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    async with AsyncSessionLocal() as db:
+        await seed_default_permissions(db)
     calibrate_bcrypt_time()
     yield
 
@@ -64,6 +67,14 @@ app = FastAPI(
         {"name": "Authentication", "description": "User registration and login endpoints"},
         {"name": "Admin", "description": "Admin-only endpoints for monitoring and management"},
     ],
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])

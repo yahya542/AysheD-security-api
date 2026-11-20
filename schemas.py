@@ -138,7 +138,27 @@ class AddUserResponse(BaseModel):
             }
         }
 
-class HealthResponse(BaseModel):
+class DeleteUserRequest(BaseModel):
+    user_id: str = Field(description="UUID of user to delete (string format)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id": "550e8400-e29b-41d4-a716-446655440000"
+            }
+        }
+
+class DeleteUserResponse(BaseModel):
+    message: str = "User deleted successfully"
+    user_id: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "message": "User deleted successfully",
+                "user_id": "550e8400-e29b-41d4-a716-446655440000"
+            }
+        }
     status: str = Field(description="Server health status")
     uptime_seconds: float = Field(description="Server uptime in seconds")
     cpu_percent: float = Field(description="CPU usage percentage")
@@ -231,6 +251,16 @@ class LoginLogResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class HealthResponse(BaseModel):
+    status: str = Field(description="Server health status")
+    uptime_seconds: float = Field(description="Server uptime in seconds")
+    cpu_percent: float = Field(description="CPU usage percentage")
+    memory_percent: float = Field(description="Memory usage percentage")
+    memory_available_mb: float = Field(description="Available memory in MB")
+
+    class Config:
+        from_attributes = True
+
 class UFWLogEntry(BaseModel):
     timestamp: str = Field(description="Event timestamp")
     ip: str = Field(description="Source IP")
@@ -241,4 +271,3 @@ class UFWLogsResponse(BaseModel):
     logs: List[UFWLogEntry]
     total: int
 
-    

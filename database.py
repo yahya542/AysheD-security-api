@@ -55,6 +55,31 @@ class LoginLog(Base):
     failure_reason = Column(SQLEnum(LoginFailureReason), nullable=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
+class Permission(Base):
+    __tablename__ = "permissions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), unique=True, nullable=False, index=True)
+    description = Column(String(255), nullable=True)
+
+
+class RolePermission(Base):
+    __tablename__ = "role_permissions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    role = Column(SQLEnum(UserRole), nullable=False, index=True)
+    permission_id = Column(Integer, ForeignKey("permissions.id"), nullable=False)
+
+
+class UserPermission(Base):
+    __tablename__ = "user_permissions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(_uuid_type(), ForeignKey("users.id"), nullable=False, index=True)
+    permission_id = Column(Integer, ForeignKey("permissions.id"), nullable=False)
+    granted = Column(Boolean, default=True, nullable=False)
+
+
 class AccountLock(Base):
     __tablename__ = "account_locks"
 
@@ -129,6 +154,47 @@ def _auto_migrate(conn):
         "UPDATE login_logs SET user_id = (SELECT id FROM users WHERE users.email = login_logs.email) "
         "WHERE user_id IS NULL AND email IS NOT NULL"
     )
+
+async def seed_default_permissions(db: AsyncSession):
+    """Seed default permissions and role-permission mappings."""
+    default_perms = [
+        ("user:read", "Baca data user"),
+        ("user:suspend", "Suspend user"),
+        ("user:unsuspend", "Unsuspend user"),
+        ("user:delete", "Hapus user"),
+        ("user:add", "Tambah user"),
+        ("role:manage", "Kelola role & RBAC"),
+        ("log:read", "Baca login logs"),
+        ("chart:read", "Baca chart statistik"),
+    ]
+    for name, desc in default_perms:
+        result = await db.execute(select(Permission).where(Permission.name == name))
+        if not result.scalar_one_or_none():
+            db.add(Permission(name=name, description=desc))
+    await db.commit()
+
+    # Role-permission mapping
+    perms = {p.name: p.id for p in (await db.execute(select(Permission))).scalars().all()}
+    mapping = {
+        UserRole.user: ["user:read"],
+        UserRole.admin: ["user:read", "user:suspend", "user:unsuspend", "user:add", "log:read", "chart:read"],
+        UserRole.superadmin: list(perms.keys()),
+    }
+    for role, perm_names in mapping.items():
+        for pname in perm_names:
+            pid = perms.get(pname)
+            if not pid:
+                continue
+            exists = await db.execute(
+                select(RolePermission).where(
+                    RolePermission.role == role,
+                    RolePermission.permission_id == pid,
+                )
+            )
+            if not exists.scalar_one_or_none():
+                db.add(RolePermission(role=role, permission_id=pid))
+    await db.commit()
+
 
 async def get_active_account_lock(db: AsyncSession, user_id: str) -> Optional[AccountLock]:
     """Return an active (non-expired) account lock for the given user ID, or None."""
