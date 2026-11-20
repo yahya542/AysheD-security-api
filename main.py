@@ -34,7 +34,7 @@ from apiSEC.schemas import (
     LogoutRequest, LogoutResponse,
     UFWLogsResponse, UFWLogEntry
 )
-from apiSEC.dependencies import get_current_user, get_current_admin, get_current_superadmin, get_current_admin_or_superadmin
+from apiSEC.dependencies import get_current_user, get_current_admin, get_current_superadmin, get_current_admin_or_superadmin, has_permission
 from fastapi import APIRouter
 
 
@@ -346,10 +346,9 @@ async def delete_user(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    # Admin (non-superadmin) tidak boleh hapus admin/superadmin
-    if current_user.role == UserRole.admin and user.role in (UserRole.admin, UserRole.superadmin):
-        raise HTTPException(status_code=403, detail="Admin cannot delete admin or superadmin")
-    if user.role == UserRole.superadmin and user.id == str(current_user.id):
+    if not await has_permission(db, current_user, "user:delete"):
+        raise HTTPException(status_code=403, detail="Permission 'user:delete' required")
+    if user.id == str(current_user.id):
         raise HTTPException(status_code=400, detail="Cannot delete yourself")
     await db.delete(user)
     await db.commit()
