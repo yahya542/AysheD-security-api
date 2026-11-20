@@ -3,11 +3,12 @@ import psutil
 import re
 import asyncio
 import sys
+from typing import List
 from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from contextlib import asynccontextmanager
 from apiSEC.config import settings
 from zoneinfo import ZoneInfo
@@ -28,8 +29,8 @@ from apiSEC.schemas import (
     AddUserRequest, AddUserResponse,
     LoginRequest, LoginResponse,
     HealthResponse, ThreatLogsResponse, ThreatLogEntry,
-    SuspendUserRequest, SuspendUserResponse, UserResponse,
-    LoginLogResponse,
+    SuspendUserRequest, SuspendUserResponse, UserResponse, DeleteUserRequest, DeleteUserResponse, UpdateRolePermissionsRequest, UpdateRolePermissionsResponse,
+    LoginLogResponse, UpdateRoleRequest, 
     LogoutRequest, LogoutResponse,
     UFWLogsResponse, UFWLogEntry
 )
@@ -66,6 +67,7 @@ app = FastAPI(
     openapi_tags=[
         {"name": "Authentication", "description": "User registration and login endpoints"},
         {"name": "Admin", "description": "Admin-only endpoints for monitoring and management"},
+        {"name": "Super Admin", "description": "Super admin-only endpoints for system management"},
     ],
 )
 
@@ -79,6 +81,8 @@ app.add_middleware(
 
 auth_router = APIRouter(prefix="/auth", tags=["Authentication"])
 admin_router = APIRouter(prefix="/admin", tags=["Admin"])
+rbac_router = APIRouter(prefix="/rbac", tags=["RBAC"])
+super_admin_router = APIRouter(prefix="/super-admin", tags=["Super Admin"])
 
 bearer_scheme = {
     "type": "http",
@@ -333,6 +337,22 @@ async def get_login_logs(
     logs = result.scalars().all()
     return logs
 
+@admin_router.delete("/delete-user", response_model=DeleteUserResponse)
+async def delete_user(
+    payload: DeleteUserRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_superadmin)
+):
+    result = await db.execute(select(User).where(User.id == str(payload.user_id)))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.role == UserRole.superadmin and user.id == str(current_user.id):
+        raise HTTPException(status_code=400, detail="Cannot delete yourself")
+    await db.delete(user)
+    await db.commit()
+    return DeleteUserResponse(message=f"User {user.email} deleted", user_id=str(user.id))
+
 
 @admin_router.get("/health", response_model=HealthResponse)
 async def health_check(current_user: User = Depends(get_current_admin)):
@@ -521,8 +541,82 @@ async def unsuspend_user(
     await db.commit()
     return SuspendUserResponse(message=f"User {user.email} unsuspended", user_id=user.id)
 
+## super admin ##
+@super_admin_router.put("/update-role")
+async def update_role(payload: UpdateRoleRequest, db=Depends(get_db), current_user=Depends(get_current_superadmin)):
+    result = await db.execute(select(User).where(User.id == str(payload.user_id)))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Cannot change your own role")
+    user.role = payload.new_role
+    await db.commit()
+    return {"message": f"User {user.email} role updated to {payload.new_role}"}
+
+#super admin ##
+
+
+@rbac_router.put("/role-permissions", response_model=UpdateRolePermissionsResponse)
+async def update_role_permissions(
+    payload: UpdateRolePermissionsRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_superadmin),
+):
+    # Validasi permission names
+    result = await db.execute(select(Permission))
+    valid_perms = {p.name: p.id for p in result.scalars().all()}
+    for pname in payload.permissions:
+        if pname not in valid_perms:
+            raise HTTPException(status_code=400, detail=f"Permission '{pname}' tidak ditemukan")
+
+    # Hapus mapping lama untuk role ini
+    await db.execute(
+        delete(RolePermission).where(RolePermission.role == payload.role)
+    )
+
+    # Tambah mapping baru
+    for pname in payload.permissions:
+        db.add(RolePermission(role=payload.role, permission_id=valid_perms[pname]))
+    await db.commit()
+
+    return UpdateRolePermissionsResponse(
+        message="Role permissions updated",
+        role=payload.role,
+        permissions=payload.permissions,
+    )
+
+@rbac_router.get("/role-permissions/{role}", response_model=UpdateRolePermissionsResponse)
+async def get_role_permissions(
+    role: UserRole,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_superadmin),
+):
+    result = await db.execute(
+        select(Permission.name)
+        .join(RolePermission, RolePermission.permission_id == Permission.id)
+        .where(RolePermission.role == role)
+    )
+    perms = [row[0] for row in result.all()]
+    return UpdateRolePermissionsResponse(
+        message="Role permissions retrieved",
+        role=role,
+        permissions=perms,
+    )
+
+@rbac_router.get("/permissions", response_model=List[str])
+async def list_permissions(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_superadmin),
+):
+    result = await db.execute(select(Permission.name))
+    return [row[0] for row in result.all()]
+
+
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(rbac_router)
+app.include_router(super_admin_router)
 
 if __name__ == "__main__":
     import uvicorn

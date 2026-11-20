@@ -148,7 +148,31 @@ class DeleteUserRequest(BaseModel):
             }
         }
 
-class DeleteUserResponse(BaseModel):
+class UpdateRolePermissionsRequest(BaseModel):
+    role: UserRole = Field(description="Role to update permissions for")
+    permissions: List[str] = Field(description="List of permission names to assign")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "role": "admin",
+                "permissions": ["user:read", "user:suspend", "log:read"]
+            }
+        }
+
+class UpdateRolePermissionsResponse(BaseModel):
+    message: str = "Role permissions updated"
+    role: UserRole
+    permissions: List[str]
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "message": "Role permissions updated",
+                "role": "admin",
+                "permissions": ["user:read", "user:suspend", "log:read"]
+            }
+        }
     message: str = "User deleted successfully"
     user_id: str
 
@@ -271,3 +295,27 @@ class UFWLogsResponse(BaseModel):
     logs: List[UFWLogEntry]
     total: int
 
+class UpdateRoleRequest(BaseModel):
+    user_id: str = Field(description="UUID of user to update role (string format)")
+    new_role: UserRole = Field(description="New role for the user")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id": "disini id nya",
+                "new_role": "admin"
+            }
+        }
+
+class DeleteUserResponse(BaseModel):
+    message: str = "User deleted successfully"
+    user_id: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "message": "User deleted successfully",
+                "user_id": "550e8400-e29b-41d4-a716-446655440000"
+            }
+        }
+    status: str = Field(description="Server health status")
