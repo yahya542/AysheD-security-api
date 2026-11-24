@@ -476,12 +476,13 @@ async def compute_chart_data():
     from apiSEC.database import AsyncSessionLocal
     db = AsyncSessionLocal()
     try:
-        now = datetime.now()
+        now = datetime.now(timezone.utc) + timedelta(hours=7)
+        now = now.replace(tzinfo=None)
         today_midnight = datetime.combine(now.date(), time.min)
         thirty_days_ago = today_midnight - timedelta(days=30)
         result = await db.execute(
             select(LoginLog.timestamp, LoginLog.success).where(
-                LoginLog.timestamp >= thirty_days_ago,
+                LoginLog.timestamp >= thirty_days_ago - timedelta(hours=7),
             )
         )
         timestamps = result.all()
@@ -497,8 +498,8 @@ async def compute_chart_data():
         monthly_map = defaultdict(lambda: {"success":0,"fail":0})
 
         for ts, success in timestamps:
-            ...
-            if yesterday <= ts < today_midnight:
+            ts = ts + timedelta(hours=7)
+            if ts >= today_midnight:
                 key = ts.strftime("%H:00")
                 if success: daily_map[key]["success"] += 1
                 else: daily_map[key]["fail"] += 1
